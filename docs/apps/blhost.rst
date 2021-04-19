@@ -10,9 +10,9 @@ This user’s guide describes how to interface with the *MCU bootloader* using *
 
 The *blhost* application is a command-line utility used on the host computer to initiate communication and issue commands to the *MCU bootloader*. The application only sends one command per invocation.
 
--------------
-Communication
--------------
+----------------------
+blhost - Communication
+----------------------
 
 The *blhost* application can communicate directly with the *MCU bootloader* over the host computer’s UART (Serial Port) or USB connections.
 
@@ -29,7 +29,7 @@ To obtain VID and PID from connected device following command could be used:
 
     nxpdevscan
 
-.. figure:: nxpdevscan/nxpdevscan_usb_detect.png
+.. figure:: ../_static/images/nxpdevscan_usb_detect.png
     :scale: 50 %
     :align: center
     
@@ -46,7 +46,7 @@ To detect connected devices following command could be used:
 
     nxpdevscan
 
-.. figure:: nxpdevscan/nxpdevscan_uart_detect.png
+.. figure:: ../_static/images/nxpdevscan_uart_detect.png
     :scale: 50 %
     :align: center
     
@@ -151,7 +151,7 @@ MCU Bootloader operation
 
 The correct use of blhost program requires a connection to a MCU device running the MCU bootloader command interface. The diagram shows a simplified view of the MCU bootloader state machine that shows the states relevant to blhost application.
 
-.. figure:: blhost/mcu_bootloader_state_diagram.png
+.. figure:: ../_static/images/mcu_bootloader_state_diagram.png
     :scale: 50 %
     :align: center
     
@@ -168,23 +168,24 @@ If the ``-p COMx`` option is used, the UART is the active peripheral and all fut
 .. note::
     After the MCU bootloader is in the “Process Commands” state, the device has to be reset to communicate over a different peripheral or at a different baud rate over the same UART peripheral.
 
----------
-Arguments 
----------
+---------------------
+blhost - Sub-commands
+---------------------
 
-The arguments for blhost consist of a set of options followed a command description. The options and the command are separatedwith a ‘--’.
+blhost consist of a set of sub-commands followed by options and arguments. 
+The options and the sub-command are separatedwith a ‘--’.
 
 .. code:: bash
     
     blhost [options] -- [command]
 
-The "help" guide of blhost lists all of the options and commands supported by the blhost utility. 
+The "help" guide of blhost lists all of the options and sub-commands supported by the blhost utility. 
 
 .. code:: bash
     
     blhost --help
 
-All commands are not supported on all MCU bootloader platforms. If a command is not supported by the MCU bootloader, it returns ``k_StatusUnkownCommand``.
+All sub-commands are not supported on all MCU bootloader platforms. If a sub-command is not supported by the MCU bootloader, it returns ``k_StatusUnkownCommand``.
 
 When flash security is enabled, only the ``get-property``, ``set-property``, ``reset``, ``flash-security-disable``, and ``flash-erase-all-unsecure`` commands are supported. The MCU bootloader returns ``kStatus_SecurityViolation`` if a command is received that is not supporteddue to flash security settings.
 
@@ -199,7 +200,7 @@ When flash security is enabled, only the ``get-property``, ``set-property``, ``r
 After the reset the device boots from flash and user image is programmed successfully using ROM bootloader. 
 
 .. note::
-    After issuing the reset command, allow 5 seconds for the user application to start running from flash.
+    After issuing the reset sub-command, allow 5 seconds for the user application to start running from flash.
 
 .. click:: spsdk.apps.blhost:get_property
     :prog: blhost get-property
@@ -261,18 +262,18 @@ After the reset the device boots from flash and user image is programmed success
     :nested: full
 
 .. note::
-    If the VerifyWrites property is enabled, the command performs a flash verify erase operation.
+    If the VerifyWrites property is enabled, the sub-command performs a flash verify erase operation.
 
 .. click:: spsdk.apps.blhost:flash_erase_all
     :prog: blhost flash-erase-all
     :nested: full
 
 .. note::
-    If any flash regions are protected, the command fails with an error. 
+    If any flash regions are protected, the sub-command fails with an error. 
     
     If any flash regions are reserved by the bootloader, they are ignored (not erased).
 
-    If the VerifyWrites property is enabled, the flash-erase-all command performs a flash verify erase all operation, or multiple flash verify erase options if decomposed due to reserved regions.
+    If the VerifyWrites property is enabled, the flash-erase-all sub-command performs a flash verify erase all operation, or multiple flash verify erase options if decomposed due to reserved regions.
 
 .. click:: spsdk.apps.blhost:flash_erase_all_unsecure
     :prog: blhost flash-erase-all-unsecure
@@ -283,7 +284,7 @@ After the reset the device boots from flash and user image is programmed success
     :nested: full
 
 .. note::
-    This command can read any region of memory accessible by the CPU and not protected by security. 
+    This sub-command can read any region of memory accessible by the CPU and not protected by security. 
     This includes flash, RAM, and peripheral registers. 
     
     Note that the minimum profile does not support reading the peripheral register space.
@@ -295,7 +296,7 @@ After the reset the device boots from flash and user image is programmed success
 .. note::
     Can write to all accessible memory, including flash, RAM, and peripheral registers. However, if flash protection is enabled, writes to protected sectors fails. Data specified by file is treated as binary data.
     
-    Any flash sector written to must be previously erased with either a flash-erase-all, flash-erase-region, or flash-erase-allunsecure command.
+    Any flash sector written to must be previously erased with either a flash-erase-all, flash-erase-region, or flash-erase-allunsecure sub-command.
     
     Writing to flash requires the start address to be word aligned. The byte count is rounded up to a multiple of the word size, and trailing bytes are filled with the flash erase pattern (0xff).
     
@@ -314,7 +315,7 @@ After the reset the device boots from flash and user image is programmed success
     The SB file format is described in the document elftosb User's Guide (document MCUELFTOSBUG) and can
     be created using the elftosb tool.
 
-    Note that if the SB file contains a JUMP command, the receive-sb-file command is aborted at the point of the jump, and a status of kStatus_AbortDataPhase is returned.
+    Note that if the SB file contains a JUMP command, the receive-sb-file sub-command is aborted at the point of the jump, and a status of kStatus_AbortDataPhase is returned.
 
 .. click:: spsdk.apps.blhost:execute
     :prog: blhost execute

@@ -1,4 +1,6 @@
-.. This is SPSDK links definition block
+.. SPSDK links definition block
+
+.. NXP Devices location
 
 .. _LPC55S6x_link: https://www.nxp.com/products/processors-and-microcontrollers/arm-microcontrollers/general-purpose-mcus/lpc5500-cortex-m33/high-efficiency-arm-cortex-m33-based-microcontroller-family:LPC55S6x
 .. _LPC55S2x_link: https://www.nxp.com/products/processors-and-microcontrollers/arm-microcontrollers/general-purpose-mcus/lpc5500-cortex-m33/lpc552x-s2x-mainstream-arm-cortex-m33-based-microcontroller-family:LPC552x-S2x
@@ -11,6 +13,12 @@
 .. _RT600_link: https://www.nxp.com/products/processors-and-microcontrollers/arm-microcontrollers/i-mx-rt-crossover-mcus/i-mx-rt600-crossover-mcu-with-arm-cortex-m33-and-dsp-cores:i.MX-RT600 
 .. _RT500_link: https://www.nxp.com/products/processors-and-microcontrollers/arm-microcontrollers/i-mx-rt-crossover-mcus/i-mx-rt500-crossover-mcu-with-arm-cortex-m33-core:i.MX-RT500
 
+.. Project location
+
+.. _github_loc: https://github.com/NXPmicro/spsdk
+.. _pypi_loc: https://pypi.org/project/spsdk/
+.. _rdd_loc: https://spsdk.readthedocs.io
+
 .. Start of SPSDK document
 
 ============
@@ -21,101 +29,63 @@ Introduction
 
 .. figure:: _static/images/SPSDK-Architecture.png
     :align: center
+    :scale: 50 %
 
     SPSDK Simple Diagram
 
-=====
-Links
-=====
-    
---------------
-Internal Links
---------------
+Project source code could be found at those locations:
 
-- `Documentation <http://spsdk.nxp.com/>`__
-- `BitBucket <https://bitbucket.sw.nxp.com/projects/SPSDK/repos/spsdk/browse>`__
-- `Confluence <https://confluence.sw.nxp.com/display/SPSDK>`__
-- `SharePoint <https://nxp1.sharepoint.com/sites/BSDKCommunity>`__
-
--------------
-External Link
--------------
-
-- `GitHub <https://github.com/NXPmicro/spsdk>`__
-- `PyPi <https://pypi.org/project/spsdk/>`__
-- `Documentation <https://spsdk.readthedocs.io>`__
+- `GitHub <github_loc_>`__
+- `PyPi <pypi_loc_>`__
 
 =================
 Supported Devices
 =================
-
+    
 - LPC55 `S6x <LPC55S6x_link_>`_ / `S2x <LPC55S2x_link_>`_ / `S1x <LPC55S1x_link_>`_ / `S0x <LPC55S0x_link_>`_
 - i.MX RT `1060 <RT1060_link_>`_ / `1050 <RT1050_link_>`_ / `1020 <RT1020_link_>`_ / `1010 <RT1010_link_>`_
 - i.MX RT `600 <RT600_link_>`_ / `500 <RT500_link_>`_
-
+    
 ==============
 Supported OSes
 ==============
-
+    
 - Windows 10, 64bit
 - Ubuntu 16.04 or above, 64bit
 - Mac OS 10.13 or above, x64
-
+    
 ====================
 Supported Enviroment
 ====================
-    
-SPSDK is tested on Python >3.5 interpreter, old version 2.x is not supported.
+        
+SPSDK is tested on Python 3.6+ interpreter, old version 2.x is not supported.
 
 ============
 Installation
 ============
 
-- Make sure to have `Python <https://www.python.org>`_ 3.6+ installed
+- Make sure to have `Python <https://www.python.org>`_ installed
 - Create a virtual environment (``venv``, ``pipenv``, etc.)
 
---------------------
-INTERNAL - BitBucket
---------------------
-
-.. code:: bash
-
-    $ pip install -U https://bitbucket.sw.nxp.com/rest/api/latest/projects/spsdk/repos/spsdk/archive?format=zip
-
-.. note::
-
-    If you will be asked for credentials, use your NXP login and password
-
------------------------------------------
-INTERNAL - SPSDK from sources - BitBucket
------------------------------------------
-
-.. code:: bash
-
-    $ git clone ssh://git@bitbucket.sw.nxp.com/spsdk/spsdk.git
-    $ cd spsdk
-    $ pip install -r requirements-develop.txt
-    $ pip install -U -e .
-
----------------
-EXTERNAL - PyPi
----------------
+----
+PyPi
+----
 
 .. code:: bash
 
     pip install spsdk
 
------------------
-EXTERNAL - GitHub
------------------
+------
+GitHub
+------
 
 .. code:: bash
 
     $ pip install -U https://github.com/NXPmicro/spsdk/archive/master.zip
 
----------------------------
-EXTERNAL - Sources - GitHub
----------------------------
+---------------------
+From sources - GitHub
+---------------------
 
 .. code:: bash
 
@@ -123,6 +93,7 @@ EXTERNAL - Sources - GitHub
     $ cd spsdk
     $ pip install -r requirements-develop.txt
     $ pip install -U -e .
+
 
 .. note::
 

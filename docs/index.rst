@@ -3,9 +3,12 @@
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
+================================
+Secure Provisioning SDK (SPSDK)
+================================
 
 .. toctree::
-    :caption: SPSDK
+    :caption: Project overview
     :maxdepth: 1
 
     spsdk.rst
@@ -14,6 +17,7 @@
     :caption: Application User Guides
     :maxdepth: 1
 
+    ../spsdk/apps/README.md
     apps/blhost
     apps/sdphost
 
