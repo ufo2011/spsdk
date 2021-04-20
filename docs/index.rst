@@ -17,7 +17,7 @@ Secure Provisioning SDK (SPSDK)
     :caption: Application User Guides
     :maxdepth: 1
 
-    ../spsdk/apps/README.md
+    apps/overview
     apps/blhost
     apps/sdphost
 
