@@ -8,10 +8,10 @@ Command line applications shipped with SPSDK are available in ``PATH`` after act
 
     If you don't use virtual environments, the availability is not guaranteed (you'd need to add Python's Scripts folder to PATH first).
 
-SPSDK has a special application called ``spsdk``. It holds references to all available applications. To see the list run: 
+SPSDK has a special application called ``spsdk``. It holds references to all available applications. To see the list run:
 
 .. code:: bash
-    
+
     spsdk --help
 
 Each application could be executed separately or via spsdk (e.g. running ``pfr`` is equal to running ``spsdk pfr``).
@@ -46,7 +46,7 @@ It allows user to:
 - invoke code
 
 .. code:: bash
-    
+
     blhost --help
 
 **elftosb**
@@ -58,17 +58,17 @@ The tool for generating TrustZone, MasterBootImage and SecureBinary images.
 - generate SecureBinary
 
 .. code:: bash
-    
+
     elftosb --help
 
 **nxpcertgen**
 
 The nxpcertgen application allows user to generate the self-signed x.509 certificate
-with properties given in json configuration file. The certificates are self-signed 
+with properties given in json configuration file. The certificates are self-signed
 and support only BasicConstrains (ca, path_length).
 
 .. code:: bash
-        
+
     nxpcertgen --help
 
 **nxpdebugmbox**
@@ -81,7 +81,7 @@ The nxpkeygen application allows user to:
 - set Fault Analysis Mode
 
 .. code:: bash
-    
+
     nxpdebugmbox --help
 
 **nxpdevscan**
@@ -89,7 +89,7 @@ The nxpkeygen application allows user to:
 The nxpdevscan application allows user to list all connected USB and UART devices.
 
 .. code:: bash
-    
+
     nxpdevscan --help
 
 **nxpkeygen**
@@ -100,7 +100,7 @@ The nxpkeygen application allows user to:
 - generate debug credential files based on YAML configuration file
 
 .. code:: bash
-    
+
     nxpkeygen --help
 
 **pfr**
@@ -116,7 +116,7 @@ It allows user to:
 - list supported devices
 
 .. code:: bash
-    
+
     pfr --help
 
 **pfrc**
@@ -126,7 +126,7 @@ The pfrc application is a utility for searching for brick-conditions in PFR sett
 Note: THIS IS AN EXPERIMENTAL UTILITY! USE WITH CAUTION !!!
 
 .. code:: bash
-    
+
     pfrc --help
 
 **sdphost**
@@ -141,7 +141,7 @@ It allows user to:
 - read one or more registers
 
 .. code:: bash
-    
+
     sdphost --help
 
 **sdpshost**
@@ -153,12 +153,12 @@ It allows user to write boot image data from provided binary file.
 Note: THIS IS AN EXPERIMENTAL UTILITY! USE WITH CAUTION !!!
 
 .. code:: bash
-    
-    sdphosts --help
+
+    sdphost --help
 
 **shadowregs**
 
-The shadowreg application is a utility for Shadow Registers controlling.
+The shadowregs application is a utility for Shadow Registers controlling.
 
 It allows user to:
 
@@ -171,5 +171,5 @@ It allows user to:
 - print a list of supported devices
 
 .. code:: bash
-    
+
     shadowregs --help

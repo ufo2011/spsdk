@@ -94,7 +94,6 @@ From sources - GitHub
     $ pip install -r requirements-develop.txt
     $ pip install -U -e .
 
-
 .. note::
 
     In **Windows OS** you need to install `Microsoft Visual C++ Build Tools <https://www.scivision.dev/python-windows-visual-c-14-required/>`_

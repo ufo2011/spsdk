@@ -6,7 +6,7 @@
 blhost - User Guide
 ===================
 
-This user’s guide describes how to interface with the *MCU bootloader* using *blhost* application. 
+This user’s guide describes how to interface with the *MCU bootloader* using *blhost* application.
 
 The *blhost* application is a command-line utility used on the host computer to initiate communication and issue commands to the *MCU bootloader*. The application only sends one command per invocation.
 
@@ -18,10 +18,10 @@ The *blhost* application can communicate directly with the *MCU bootloader* over
 
 *MCU bootloader* typically supports other peripherals such as I2C, SPI, and CAN. However, the *blhost* application cannot interface with the MCU bootloader over these transports without external hardware.
 
-USB
-===
+blhost - USB
+============
 
-blhost could be connected to MCU Bootloader over USB HID. In order to communicate with the device on USB port, VID and PID needs to be identified. 
+*blhost* could be connected to MCU Bootloader over USB HID. In order to communicate with the device on USB port, VID and PID needs to be identified.
 
 To obtain VID and PID from connected device following command could be used:
 
@@ -32,13 +32,13 @@ To obtain VID and PID from connected device following command could be used:
 .. figure:: ../_static/images/nxpdevscan_usb_detect.png
     :scale: 50 %
     :align: center
-    
+
     nxpdevscan USB device detection
 
-UART
-====
+blhost - UART
+=============
 
-blhost could be connected to MCU bootloader over UART. 
+*blhost* could be connected to MCU bootloader over UART.
 
 To detect connected devices following command could be used:
 
@@ -49,34 +49,34 @@ To detect connected devices following command could be used:
 .. figure:: ../_static/images/nxpdevscan_uart_detect.png
     :scale: 50 %
     :align: center
-    
+
     nxpdevscan UART device detection
 
-BUSPAL
-======
+blhost - BUSPAL
+===============
 
 .. warning::
     BUSPAL is not supported in SPSDK
 
-The BusPal acts as a bus translator running on selected platforms. BusPal assists blhost in carrying out commands and responses from the target device through an established connection with blhost over UART, and the target device over I2C, SPI, or CAN.
+The BusPal acts as a bus translator running on selected platforms. BusPal assists *blhost* in carrying out commands and responses from the target device through an established connection with *blhost* over UART, and the target device over I2C, SPI, or CAN.
 
-LPCUSBSIO
-=========
+blhost - LPCUSBSIO
+==================
 
 .. warning::
     LPCUSBSIO is not supported in SPSDK
 
-LPCUSBSIO - LPC USB Serial I/O(LPCUSBSIO), a firmware built in LPC Link2. The LPCUSBSIO acts as a bus translator, and establishes connection with blhost over USB-HID, and the MCU bootloader device over I2C and SPI.
+LPCUSBSIO - LPC USB Serial I/O(LPCUSBSIO), a firmware built in LPC Link2. The LPCUSBSIO acts as a bus translator, and establishes connection with *blhost* over USB-HID, and the MCU bootloader device over I2C and SPI.
 
---------------
-MCU bootloader
---------------
+-----------------------
+blhost - MCU bootloader
+-----------------------
 
 The MCU bootloader is intended to be the standard bootloader for all MCU devices. It provides a standard interface to the device using any of the peripherals supported by the bootloader on a given NXP MCU device.
 
 The MCU bootloader is available as source code for customer and flash-based implementations. There are example applications in the package which demonstrates how to interface with the MCU bootloader.
 
-`MCUBOOT: MCU Bootloader for NXP microcontrollers <https://www.nxp.com/design/software/development-software/mcuxpresso-software-and-tools-/mcuboot-mcu-bootloader-for-nxp-microcontrollers:MCUBOOT>`_
+`MCU Bootloader for NXP Microcontrollers <https://www.nxp.com/design/software/development-software/mcuxpresso-software-and-tools-/mcuboot-mcu-bootloader-for-nxp-microcontrollers:MCUBOOT>`_
 
 MCU bootloader properties
 =========================
@@ -103,7 +103,7 @@ The value of this property is a one-word bitfield that lists the peripherals sup
     :align: left
 
     =============== =============== =============== =============== =============== =============== ===============
-    Bit             5               4               3               2               1               0        
+    Bit             5               4               3               2               1               0
     Peripheral      Reserved        USB HID         CAN             SPI Slave       I2C Slave       UART
     =============== =============== =============== =============== =============== =============== ===============
 
@@ -112,7 +112,7 @@ Available commands
 
 This property value is a bitfield with bits set corresponding to commands enabled in the bootloader.
 
-The bit number that identifies whether a command is present is the command's tag value minus 1. To get the bit mask for a given command, use this expression 
+The bit number that identifies whether a command is present is the command's tag value minus 1. To get the bit mask for a given command, use this expression
 
 .. code:: c
 
@@ -149,21 +149,21 @@ The bit number that identifies whether a command is present is the command's tag
 MCU Bootloader operation
 ========================
 
-The correct use of blhost program requires a connection to a MCU device running the MCU bootloader command interface. The diagram shows a simplified view of the MCU bootloader state machine that shows the states relevant to blhost application.
+The correct use of *blhost* program requires a connection to a MCU device running the MCU bootloader command interface. The diagram shows a simplified view of the MCU bootloader state machine that shows the states relevant to *blhost* application.
 
 .. figure:: ../_static/images/mcu_bootloader_state_diagram.png
     :scale: 50 %
     :align: center
-    
+
     Simplified MCU Bootloader state diagram
 
 After reset, the bootloader monitors all enabled peripheral devices, UART, I2C, SPI, CAN, USB-HID, and USB-MSC for active communication. After communication is established, all peripherals except the active peripheral are shut down, and the bootloader enters the command processing state.
 
-If the bootloader is in the “Detect Active Peripheral” state, the first use of blhost application establishes the active peripheral and the bootloader transitions to the “Process Commands” state. The active peripheral is established according to the transport used by the initial blhost invocation.
+If the bootloader is in the “Detect Active Peripheral” state, the first use of *blhost* application establishes the active peripheral and the bootloader transitions to the “Process Commands” state. The active peripheral is established according to the transport used by the initial *blhost* invocation.
 
-For example, if the -u option was successfully used to send the initial command, the USB-HID is the active peripheral and all future commands must use the ``-u`` option unless the bootloader is reset. 
- 
-If the ``-p COMx`` option is used, the UART is the active peripheral and all future commands must use the ``–p COMx`` option unless the bootloader is reset. For the UART peripheral, the baud rate is automatically determined by the bootloader when processing the initial ping. Therefore, subsequent blhost invocations must specify the same baud rate as was used for the initial invocation unless the bootloader is reset. If the baud rate is not specified using the ``-p COMx,<baudrate>`` option, the UART baud rate is set to 57600.
+For example, if the -u option was successfully used to send the initial command, the USB-HID is the active peripheral and all future commands must use the ``-u`` option unless the bootloader is reset.
+
+If the ``-p COMx`` option is used, the UART is the active peripheral and all future commands must use the ``–p COMx`` option unless the bootloader is reset. For the UART peripheral, the baud rate is automatically determined by the bootloader when processing the initial ping. Therefore, subsequent *blhost* invocations must specify the same baud rate as was used for the initial invocation unless the bootloader is reset. If the baud rate is not specified using the ``-p COMx,<baudrate>`` option, the UART baud rate is set to 57600.
 
 .. note::
     After the MCU bootloader is in the “Process Commands” state, the device has to be reset to communicate over a different peripheral or at a different baud rate over the same UART peripheral.
@@ -172,22 +172,22 @@ If the ``-p COMx`` option is used, the UART is the active peripheral and all fut
 blhost - Sub-commands
 ---------------------
 
-blhost consist of a set of sub-commands followed by options and arguments. 
-The options and the sub-command are separatedwith a ‘--’.
+*blhost* consist of a set of sub-commands followed by options and arguments.
+The options and the sub-command are separated with a ‘--’.
 
 .. code:: bash
-    
-    blhost [options] -- [command]
 
-The "help" guide of blhost lists all of the options and sub-commands supported by the blhost utility. 
+    blhost [options] -- [sub-command]
+
+The "help" guide of *blhost* lists all of the options and sub-commands supported by the *blhost* utility.
 
 .. code:: bash
-    
+
     blhost --help
 
-All sub-commands are not supported on all MCU bootloader platforms. If a sub-command is not supported by the MCU bootloader, it returns ``k_StatusUnkownCommand``.
+All sub-commands are not supported on all MCU bootloader platforms. If a sub-command is not supported by the MCU bootloader, it returns ``k_StatusUnknownCommand``.
 
-When flash security is enabled, only the ``get-property``, ``set-property``, ``reset``, ``flash-security-disable``, and ``flash-erase-all-unsecure`` commands are supported. The MCU bootloader returns ``kStatus_SecurityViolation`` if a command is received that is not supporteddue to flash security settings.
+When flash security is enabled, only the ``get-property``, ``set-property``, ``reset``, ``flash-security-disable``, and ``flash-erase-all-unsecure`` sub-commands are supported. The MCU bootloader returns ``kStatus_SecurityViolation`` if a sub-command is received that is not supported due to flash security settings.
 
 .. click:: spsdk.apps.blhost:main
     :prog: blhost
@@ -197,7 +197,7 @@ When flash security is enabled, only the ``get-property``, ``set-property``, ``r
     :prog: blhost reset
     :nested: full
 
-After the reset the device boots from flash and user image is programmed successfully using ROM bootloader. 
+After the reset the device boots from flash and user image is programmed successfully using ROM bootloader.
 
 .. note::
     After issuing the reset sub-command, allow 5 seconds for the user application to start running from flash.
@@ -269,13 +269,14 @@ After the reset the device boots from flash and user image is programmed success
     :nested: full
 
 .. note::
-    If any flash regions are protected, the sub-command fails with an error. 
-    
+    If any flash regions are protected, the sub-command fails with an error.
+
     If any flash regions are reserved by the bootloader, they are ignored (not erased).
 
     If the VerifyWrites property is enabled, the flash-erase-all sub-command performs a flash verify erase all operation, or multiple flash verify erase options if decomposed due to reserved regions.
 
-.. click:: spsdk.apps.blhost:flash_erase_all_unsecure
+..  Not supported
+    .. click:: spsdk.apps.blhost:flash_erase_all_unsecure
     :prog: blhost flash-erase-all-unsecure
     :nested: full
 
@@ -284,9 +285,9 @@ After the reset the device boots from flash and user image is programmed success
     :nested: full
 
 .. note::
-    This sub-command can read any region of memory accessible by the CPU and not protected by security. 
-    This includes flash, RAM, and peripheral registers. 
-    
+    This sub-command can read any region of memory accessible by the CPU and not protected by security.
+    This includes flash, RAM, and peripheral registers.
+
     Note that the minimum profile does not support reading the peripheral register space.
 
 .. click:: spsdk.apps.blhost:write_memory
@@ -295,25 +296,28 @@ After the reset the device boots from flash and user image is programmed success
 
 .. note::
     Can write to all accessible memory, including flash, RAM, and peripheral registers. However, if flash protection is enabled, writes to protected sectors fails. Data specified by file is treated as binary data.
-    
+
     Any flash sector written to must be previously erased with either a flash-erase-all, flash-erase-region, or flash-erase-allunsecure sub-command.
-    
+
     Writing to flash requires the start address to be word aligned. The byte count is rounded up to a multiple of the word size, and trailing bytes are filled with the flash erase pattern (0xff).
-    
-    Word and halfword-aligned and sized writes to RAM and peripheral registers use appropriately sized writes. This enables writing to registers larger than a byte in a single bus transaction. 
-    
+
+    Word and half-word-aligned and sized writes to RAM and peripheral registers use appropriately sized writes. This enables writing to registers larger than a byte in a single bus transaction.
+
     Note that the minimum profile does not support writing to the peripheral register space.
-    
+
     If the VerifyWrites property is enabled, writes to flash performs a flash verify program operation.
 
+..  Not supported
+    .. click:: spsdk.apps.blhost:list_memory
+    :prog: blhost list-memory
+    :nested: full
 
 .. click:: spsdk.apps.blhost:receive_sb_file
     :prog: blhost receive-sb-file
     :nested: full
 
 .. note::
-    The SB file format is described in the document elftosb User's Guide (document MCUELFTOSBUG) and can
-    be created using the elftosb tool.
+    The SB file format is described in the document *elftosb* User's Guide and can be created using the *elftosb* tool.
 
     Note that if the SB file contains a JUMP command, the receive-sb-file sub-command is aborted at the point of the jump, and a status of kStatus_AbortDataPhase is returned.
 
@@ -323,9 +327,9 @@ After the reset the device boots from flash and user image is programmed success
 
 .. note::
     The effective prototype of the called function is:
-        
+
     .. code:: C
-        
+
         void function(uint32_t arg);
 
 .. click:: spsdk.apps.blhost:call
@@ -333,13 +337,16 @@ After the reset the device boots from flash and user image is programmed success
     :nested: full
 
 .. note::
+    The function that is called has the same prototype as for the one called by the execute command.
+
     Because the intention is to return to the bootloader after the function executes, the function must not perform any action that would interfere with the bootloader operation. In particular, the following restrictions apply:
 
     - Do not use interrupts because the interrupt vectors are still owned by the bootloader.
     - Do not modify any memory locations used by the bootloader (use "get-property 12" to determine reserved regions).
     - Do not modify any pin mux or clock settings used by bootloader peripherals.
 
-.. click:: spsdk.apps.blhost:flash_security_disable
+..  Not supported
+    .. click:: spsdk.apps.blhost:flash_security_disable
     :prog: blhost flash-security-disable
     :nested: full
 
@@ -365,7 +372,8 @@ After the reset the device boots from flash and user image is programmed success
     :prog: blhost efuse-read-once
     :nested: full
 
-.. click:: spsdk.apps.blhost:flash_read_resource
+..  Not supported
+    .. click:: spsdk.apps.blhost:flash_read_resource
     :prog: blhost flash-read-resource
     :nested: full
 
@@ -374,9 +382,10 @@ After the reset the device boots from flash and user image is programmed success
     :nested: full
 
 .. note::
-    The format of the configuration block is described in the MCU Bootloader v2.5.0 Reference Manual document MCUBOOTRM).
+    The format of the configuration block is described in the MCU Bootloader Reference Manual document.
 
-.. click:: spsdk.apps.blhost:flash_image
+..  Not supported
+    .. click:: spsdk.apps.blhost:flash_image
     :prog: blhost flash-image
     :nested: full
 
@@ -388,6 +397,7 @@ After the reset the device boots from flash and user image is programmed success
     :prog: blhost key-provisioning
     :nested: full
 
-.. click:: spsdk.apps.blhost:program_aeskey
+..  Not supported
+    .. click:: spsdk.apps.blhost:program_aeskey
     :prog: blhost program-aeskey
     :nested: full
