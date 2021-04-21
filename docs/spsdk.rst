@@ -6,18 +6,18 @@
 .. _LPC55S2x_link: https://www.nxp.com/products/processors-and-microcontrollers/arm-microcontrollers/general-purpose-mcus/lpc5500-cortex-m33/lpc552x-s2x-mainstream-arm-cortex-m33-based-microcontroller-family:LPC552x-S2x
 .. _LPC55S1x_link: https://www.nxp.com/products/processors-and-microcontrollers/arm-microcontrollers/general-purpose-mcus/lpc5500-cortex-m33/lpc551x-s1x-baseline-arm-cortex-m33-based-microcontroller-family:LPC551X-S1X
 .. _LPC55S0x_link: https://www.nxp.com/products/processors-and-microcontrollers/arm-microcontrollers/general-purpose-mcus/lpc5500-cortex-m33/lpc550x-s0x-baseline-arm-cortex-m33-based-microcontroller-family:LPC550x
+.. _RT1170_link: https://www.nxp.com/products/processors-and-microcontrollers/arm-microcontrollers/i-mx-rt-crossover-mcus/i-mx-rt1170-crossover-mcu-family-first-ghz-mcu-with-arm-cortex-m7-and-cortex-m4-cores:i.MX-RT1170
 .. _RT1060_link: https://www.nxp.com/products/processors-and-microcontrollers/arm-microcontrollers/i-mx-rt-crossover-mcus/i-mx-rt1060-crossover-mcu-with-arm-cortex-m7-core:i.MX-RT1060
 .. _RT1050_link: https://www.nxp.com/products/processors-and-microcontrollers/arm-microcontrollers/i-mx-rt-crossover-mcus/i-mx-rt1050-crossover-mcu-with-arm-cortex-m7-core:i.MX-RT1050
 .. _RT1020_link: https://www.nxp.com/products/processors-and-microcontrollers/arm-microcontrollers/i-mx-rt-crossover-mcus/i-mx-rt1020-crossover-mcu-with-arm-cortex-m7-core:i.MX-RT1020
 .. _RT1010_link: https://www.nxp.com/products/processors-and-microcontrollers/arm-microcontrollers/i-mx-rt-crossover-mcus/i-mx-rt1010-crossover-mcu-with-arm-cortex-m7-core:i.MX-RT1010
-.. _RT600_link: https://www.nxp.com/products/processors-and-microcontrollers/arm-microcontrollers/i-mx-rt-crossover-mcus/i-mx-rt600-crossover-mcu-with-arm-cortex-m33-and-dsp-cores:i.MX-RT600 
+.. _RT600_link: https://www.nxp.com/products/processors-and-microcontrollers/arm-microcontrollers/i-mx-rt-crossover-mcus/i-mx-rt600-crossover-mcu-with-arm-cortex-m33-and-dsp-cores:i.MX-RT600
 .. _RT500_link: https://www.nxp.com/products/processors-and-microcontrollers/arm-microcontrollers/i-mx-rt-crossover-mcus/i-mx-rt500-crossover-mcu-with-arm-cortex-m33-core:i.MX-RT500
 
 .. Project location
 
 .. _github_loc: https://github.com/NXPmicro/spsdk
 .. _pypi_loc: https://pypi.org/project/spsdk/
-.. _rdd_loc: https://spsdk.readthedocs.io
 
 .. Start of SPSDK document
 
@@ -41,23 +41,24 @@ Project source code could be found at those locations:
 =================
 Supported Devices
 =================
-    
-- LPC55 `S6x <LPC55S6x_link_>`_ / `S2x <LPC55S2x_link_>`_ / `S1x <LPC55S1x_link_>`_ / `S0x <LPC55S0x_link_>`_
-- i.MX RT `1060 <RT1060_link_>`_ / `1050 <RT1050_link_>`_ / `1020 <RT1020_link_>`_ / `1010 <RT1010_link_>`_
-- i.MX RT `600 <RT600_link_>`_ / `500 <RT500_link_>`_
-    
+
+- LPC55 `S6x <LPC55S6x_link_>`__ / `S2x <LPC55S2x_link_>`__ / `S1x <LPC55S1x_link_>`__ / `S0x <LPC55S0x_link_>`__
+- i.MX RT `600 <RT600_link_>`__ / `500 <RT500_link_>`__
+- i.MX RT `1060 <RT1060_link_>`__ / `1050 <RT1050_link_>`__ / `1020 <RT1020_link_>`__ / `1010 <RT1010_link_>`__
+- i.Mx RT `1170 <RT1170_link_>`__ / 1160 (blhost)
+
 ==============
 Supported OSes
 ==============
-    
+
 - Windows 10, 64bit
 - Ubuntu 16.04 or above, 64bit
 - Mac OS 10.13 or above, x64
-    
-====================
-Supported Enviroment
-====================
-        
+
+=====================
+Supported Environment
+=====================
+
 SPSDK is tested on Python 3.6+ interpreter, old version 2.x is not supported.
 
 ============
@@ -97,15 +98,14 @@ From sources - GitHub
 .. note::
 
     In **Windows OS** you need to install `Microsoft Visual C++ Build Tools <https://www.scivision.dev/python-windows-visual-c-14-required/>`_
- 
+
 .. note::
- 
-    In case of problems during instalation, please make sure that you have the latest pip version.
-    You can upgrade pip using this command: 
-    
+
+    In case of problems during installation, please make sure that you have the latest pip version.
+    You can upgrade pip using this command:
+
     .. code:: bash
 
         pip install --upgrade pip
 
- 
- 
+
