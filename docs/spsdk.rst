@@ -85,7 +85,7 @@ GitHub
     $ pip install -U https://github.com/NXPmicro/spsdk/archive/master.zip
 
 ---------------------
-From sources - GitHub
+GitHub - from sources
 ---------------------
 
 .. code:: bash

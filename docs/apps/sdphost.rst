@@ -1,3 +1,5 @@
+.. TODO: [SPSDK-686] Add missing sub-commands into sdphost user guide when available
+
 ====================
 sdphost - User Guide
 ====================
@@ -46,6 +48,14 @@ To obtain VID and PID from connected device following command could be used:
     :align: center
 
     nxpdevscan USB device detection
+
+.. note::
+
+    Windows, Linux and Mac identify USB device names differently.
+
+    - **Windows** - The *device instance path* is in device manager under Windows OS.
+    - **Linux** - Use *Bus* and *Device* ID observed using ``lsusb`` as <bus>#<device>, e.g. '3#2'.
+    - **Mac** - Use *device name* and *location ID* from *System report* as <device_name> <location id>, e.g. 'SE Blank RT Family @14100000'
 
 sdphost - UART
 ==============

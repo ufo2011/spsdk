@@ -1,3 +1,5 @@
+.. TODO: [SPSDK-685] Add missing sub-commands into blhost user guide when available
+
 .. |br| raw:: html
 
    <br/>
@@ -34,6 +36,14 @@ To obtain VID and PID from connected device following command could be used:
     :align: center
 
     nxpdevscan USB device detection
+
+.. note::
+
+    Windows, Linux and Mac identify USB device names differently.
+
+    - **Windows** - The *device instance path* is in device manager under Windows OS.
+    - **Linux** - Use *Bus* and *Device* ID observed using ``lsusb`` as <bus>#<device>, e.g. '3#2'.
+    - **Mac** - Use *device name* and *location ID* from *System report* as <device_name> <location id>, e.g. 'SE Blank RT Family @14100000'
 
 blhost - UART
 =============
@@ -307,8 +317,7 @@ After the reset the device boots from flash and user image is programmed success
 
     If the VerifyWrites property is enabled, writes to flash performs a flash verify program operation.
 
-..  Not supported
-    .. click:: spsdk.apps.blhost:list_memory
+.. click:: spsdk.apps.blhost:list_memory
     :prog: blhost list-memory
     :nested: full
 

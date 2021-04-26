@@ -1,3 +1,6 @@
+.. TODO: [SPSDK-673] Describe SPSDK apps and add instruction how to install and use them into the overview
+.. TODO: [SPSDK-674] Write user guide for nxpdevscan and include it into blhost and sdphost communication chapter
+
 ====================
 Application Overview
 ====================

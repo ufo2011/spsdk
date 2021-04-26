@@ -44,7 +44,7 @@ Following NXP devices are supported:
     $ pip install -U https://github.com/NXPmicro/spsdk/archive/master.zip
 ```
 
-### Sources - GitHub:
+### GitHub - from sources:
 
 ``` bash
     $ git clone https://github.com/NXPmicro/spsdk.git
