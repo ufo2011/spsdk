@@ -20,6 +20,15 @@ Secure Provisioning SDK (SPSDK)
     apps/overview
     apps/blhost
     apps/sdphost
+    apps/nxpdevscan
+    apps/pfr
+    apps/pfrc
+    apps/elftosb
+    apps/nxpkeygen
+    apps/nxpcertgen
+    apps/nxpdebugmbox
+    apps/shadowregs
+
 
 .. toctree::
     :caption: API Development Guide

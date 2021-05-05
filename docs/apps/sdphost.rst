@@ -35,44 +35,22 @@ The *sdphost* tool communicates with NXP i.MX RT devices connected on the host P
 sdphost - USB
 =============
 
-*sdphost* could be connected to MCU over USB HID. In order to communicate with the device on USB port, VID and PID needs to be identified.
+*sdphost* could be connected to MCU over USB HID.
 
-To obtain VID and PID from connected device following command could be used:
+.. toctree::
+    :maxdepth: 1
 
-.. code:: bash
-
-    nxpdevscan
-
-.. figure:: ../_static/images/nxpdevscan_usb_detect.png
-    :scale: 50 %
-    :align: center
-
-    nxpdevscan USB device detection
-
-.. note::
-
-    Windows, Linux and Mac identify USB device names differently.
-
-    - **Windows** - The *device instance path* is in device manager under Windows OS.
-    - **Linux** - Use *Bus* and *Device* ID observed using ``lsusb`` as <bus>#<device>, e.g. '3#2'.
-    - **Mac** - Use *device name* and *location ID* from *System report* as <device_name> <location id>, e.g. 'SE Blank RT Family @14100000'
+    usb
 
 sdphost - UART
 ==============
 
 *sdphost* could be connected to MCU over UART.
 
-To detect connected devices following command could be used:
+.. toctree::
+    :maxdepth: 1
 
-.. code:: bash
-
-    nxpdevscan
-
-.. figure:: ../_static/images/nxpdevscan_uart_detect.png
-    :scale: 50 %
-    :align: center
-
-    nxpdevscan UART device detection
+    uart
 
 ----------------------
 sdphost - Sub-commands

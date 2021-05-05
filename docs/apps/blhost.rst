@@ -23,44 +23,23 @@ The *blhost* application can communicate directly with the *MCU bootloader* over
 blhost - USB
 ============
 
-*blhost* could be connected to MCU Bootloader over USB HID. In order to communicate with the device on USB port, VID and PID needs to be identified.
+*blhost* could be connected to MCU Bootloader over USB HID.
 
-To obtain VID and PID from connected device following command could be used:
+.. toctree::
+    :maxdepth: 1
 
-.. code:: bash
+    usb
 
-    nxpdevscan
-
-.. figure:: ../_static/images/nxpdevscan_usb_detect.png
-    :scale: 50 %
-    :align: center
-
-    nxpdevscan USB device detection
-
-.. note::
-
-    Windows, Linux and Mac identify USB device names differently.
-
-    - **Windows** - The *device instance path* is in device manager under Windows OS.
-    - **Linux** - Use *Bus* and *Device* ID observed using ``lsusb`` as <bus>#<device>, e.g. '3#2'.
-    - **Mac** - Use *device name* and *location ID* from *System report* as <device_name> <location id>, e.g. 'SE Blank RT Family @14100000'
 
 blhost - UART
 =============
 
 *blhost* could be connected to MCU bootloader over UART.
 
-To detect connected devices following command could be used:
+.. toctree::
+    :maxdepth: 1
 
-.. code:: bash
-
-    nxpdevscan
-
-.. figure:: ../_static/images/nxpdevscan_uart_detect.png
-    :scale: 50 %
-    :align: center
-
-    nxpdevscan UART device detection
+    uart
 
 blhost - BUSPAL
 ===============
@@ -285,10 +264,18 @@ After the reset the device boots from flash and user image is programmed success
 
     If the VerifyWrites property is enabled, the flash-erase-all sub-command performs a flash verify erase all operation, or multiple flash verify erase options if decomposed due to reserved regions.
 
-..  Not supported
-    .. click:: spsdk.apps.blhost:flash_erase_all_unsecure
-    :prog: blhost flash-erase-all-unsecure
+.. click:: spsdk.apps.blhost:flash_security_disable
+    :prog: blhost flash_security_disable
     :nested: full
+
+.. note::
+    Performs the flash security disable operation by comparing the provided 8-byte backdoor key against the backdoor key stored in
+    the Flash Configuration Field at address 0x400 in flash.
+
+    If the backdoor key comparison fails, further attempts to disable security with this command fails until the system is reset.
+
+    Backdoor key access must be enabled by setting the KEYEN bitfield of the FSEC byte in the Flash Configuration Field to 0b10. It
+    is disabled by default. The backdoor key in the Flash Configuration Field must also be set to a value other than all zeros or all ones.
 
 .. click:: spsdk.apps.blhost:read_memory
     :prog: blhost read-memory
