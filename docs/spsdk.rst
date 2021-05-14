@@ -6,6 +6,7 @@
 .. _LPC55S2x_link: https://www.nxp.com/products/processors-and-microcontrollers/arm-microcontrollers/general-purpose-mcus/lpc5500-cortex-m33/lpc552x-s2x-mainstream-arm-cortex-m33-based-microcontroller-family:LPC552x-S2x
 .. _LPC55S1x_link: https://www.nxp.com/products/processors-and-microcontrollers/arm-microcontrollers/general-purpose-mcus/lpc5500-cortex-m33/lpc551x-s1x-baseline-arm-cortex-m33-based-microcontroller-family:LPC551X-S1X
 .. _LPC55S0x_link: https://www.nxp.com/products/processors-and-microcontrollers/arm-microcontrollers/general-purpose-mcus/lpc5500-cortex-m33/lpc550x-s0x-baseline-arm-cortex-m33-based-microcontroller-family:LPC550x
+.. _RT1160_link: https://www.nxp.com/design/development-boards/i-mx-evaluation-and-development-boards/mimxrt1060-evk-i-mx-rt1060-evaluation-kit:MIMXRT1060-EVK
 .. _RT1170_link: https://www.nxp.com/products/processors-and-microcontrollers/arm-microcontrollers/i-mx-rt-crossover-mcus/i-mx-rt1170-crossover-mcu-family-first-ghz-mcu-with-arm-cortex-m7-and-cortex-m4-cores:i.MX-RT1170
 .. _RT1060_link: https://www.nxp.com/products/processors-and-microcontrollers/arm-microcontrollers/i-mx-rt-crossover-mcus/i-mx-rt1060-crossover-mcu-with-arm-cortex-m7-core:i.MX-RT1060
 .. _RT1050_link: https://www.nxp.com/products/processors-and-microcontrollers/arm-microcontrollers/i-mx-rt-crossover-mcus/i-mx-rt1050-crossover-mcu-with-arm-cortex-m7-core:i.MX-RT1050
@@ -45,7 +46,7 @@ Supported Devices
 - LPC55 `S6x <LPC55S6x_link_>`__ / `S2x <LPC55S2x_link_>`__ / `S1x <LPC55S1x_link_>`__ / `S0x <LPC55S0x_link_>`__
 - i.MX RT `600 <RT600_link_>`__ / `500 <RT500_link_>`__
 - i.MX RT `1060 <RT1060_link_>`__ / `1050 <RT1050_link_>`__ / `1020 <RT1020_link_>`__ / `1010 <RT1010_link_>`__
-- i.Mx RT `1170 <RT1170_link_>`__ / 1160 (blhost)
+- i.Mx RT `1170 <RT1170_link_>`__ / `1160 <RT1160_link_>`__ (blhost)
 
 ==============
 Supported OSes
@@ -66,7 +67,26 @@ Installation
 ============
 
 - Make sure to have `Python <https://www.python.org>`_ installed
-- Create a virtual environment (``venv``, ``pipenv``, etc.)
+- Create and activate a virtual environment (``venv``, ``pipenv``, etc.)
+- Upgrade PiPy to latest version
+
+.. note::
+
+    **Windows** virtual environment installation, its activation and pip upgrade to latest version.
+
+    .. code-block:: bat
+
+        python -m venv venv
+        venv\Scripts\activate
+        python -m pip install --upgrade pip
+
+    **Linux/Mac** virtual environment installation, its activation and pip upgrade to latest version.
+
+    .. code-block:: bash
+
+        python3 -m venv venv
+        source venv/bin/activate
+        python -m pip install --upgrade pip
 
 ----
 PyPi
@@ -92,7 +112,6 @@ GitHub - from sources
 
     $ git clone https://github.com/NXPmicro/spsdk.git
     $ cd spsdk
-    $ pip install -r requirements-develop.txt
     $ pip install -U -e .
 
 .. note::
@@ -107,5 +126,4 @@ GitHub - from sources
     .. code:: bash
 
         pip install --upgrade pip
-
 

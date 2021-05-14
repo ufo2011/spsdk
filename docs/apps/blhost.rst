@@ -5,7 +5,7 @@
    <br/>
 
 ===================
-blhost - User Guide
+User Guide - blhost
 ===================
 
 This user’s guide describes how to interface with the *MCU bootloader* using *blhost* application.
@@ -25,21 +25,14 @@ blhost - USB
 
 *blhost* could be connected to MCU Bootloader over USB HID.
 
-.. toctree::
-    :maxdepth: 1
-
-    usb
-
+:ref:`USB device identification in SPSDK`
 
 blhost - UART
 =============
 
 *blhost* could be connected to MCU bootloader over UART.
 
-.. toctree::
-    :maxdepth: 1
-
-    uart
+:ref:`UART device identification in SPSDK`
 
 blhost - BUSPAL
 ===============
@@ -368,8 +361,7 @@ After the reset the device boots from flash and user image is programmed success
     :prog: blhost efuse-read-once
     :nested: full
 
-..  Not supported
-    .. click:: spsdk.apps.blhost:flash_read_resource
+.. click:: spsdk.apps.blhost:flash_read_resource
     :prog: blhost flash-read-resource
     :nested: full
 
@@ -396,4 +388,42 @@ After the reset the device boots from flash and user image is programmed success
 ..  Not supported
     .. click:: spsdk.apps.blhost:program_aeskey
     :prog: blhost program-aeskey
+    :nested: full
+
+.. click:: spsdk.apps.blhost:flash_erase_all_unsecure
+    :prog: blhost flash-erase-all-unsecure
+    :nested: full
+
+.. note::
+
+    This command is only supported in new versions of the flash controller. Most MCU devices do not support this command, and the
+    bootloader sends a kStatus_UnknownCommand error in response.
+
+    Performs a mass erase of the flash memory, including protected sectors and any reserved regions in flash. Flash security is
+    immediately disabled if it was enabled and the FSEC byte in the Flash Configuration Field at address 0x40C is programmed
+    to 0xFE.
+
+    The Mass Erase Enable option in the FSEC field is honored by this command. If mass erase is disabled, then this command fails.
+
+    This command is only useful and only present in ROM configurations of the bootloader because it erases reserved regions in flash.
+
+.. click:: spsdk.apps.blhost:reliable_update
+    :prog: blhost reliable-update
+    :nested: full
+
+.. note::
+    For software implementation:
+    Checks the validity of backup application at <addr>, then copies the contents of backup application from <addr> to main
+    application region.
+
+    For hardware implementation:
+    Verifies if the provided <addr> is a valid swap indicator address for flash swap system, then checks the validity of backup
+    application resided in upper flash block. After that, it swaps the flash system.
+
+.. click:: spsdk.apps.blhost:fuse_program
+    :prog: blhost fuse-program
+    :nested: full
+
+.. click:: spsdk.apps.blhost:fuse_read
+    :prog: blhost fuse-read
     :nested: full

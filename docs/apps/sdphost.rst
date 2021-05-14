@@ -1,7 +1,7 @@
 .. TODO: [SPSDK-686] Add missing sub-commands into sdphost user guide when available
 
 ====================
-sdphost - User Guide
+User Guide - sdphost
 ====================
 
 This document describes the usage of *Serial Download Protocol* Host (*sdphost*), a PC host application.
@@ -37,20 +37,14 @@ sdphost - USB
 
 *sdphost* could be connected to MCU over USB HID.
 
-.. toctree::
-    :maxdepth: 1
-
-    usb
+:ref:`USB device identification in SPSDK`
 
 sdphost - UART
 ==============
 
 *sdphost* could be connected to MCU over UART.
 
-.. toctree::
-    :maxdepth: 1
-
-    uart
+:ref:`UART device identification in SPSDK`
 
 ----------------------
 sdphost - Sub-commands

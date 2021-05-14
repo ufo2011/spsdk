@@ -18,9 +18,9 @@ Secure Provisioning SDK (SPSDK)
     :maxdepth: 1
 
     apps/overview
-    apps/blhost
-    apps/sdphost
     apps/nxpdevscan
+    apps/sdphost
+    apps/blhost
     apps/pfr
     apps/pfrc
     apps/elftosb
@@ -28,7 +28,7 @@ Secure Provisioning SDK (SPSDK)
     apps/nxpcertgen
     apps/nxpdebugmbox
     apps/shadowregs
-
+    apps/sdpshost
 
 .. toctree::
     :caption: API Development Guide

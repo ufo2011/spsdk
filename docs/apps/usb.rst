@@ -1,3 +1,6 @@
+.. TODO: [SPSDK-722] Check reference in rst for usb and uart using include not toctree
+
+
 ==================================
 USB device identification in SPSDK
 ==================================
@@ -13,9 +16,10 @@ USB - VID & PID
 ---------------
 
 NXP devices could have those VIDs:
-- 0d28
-- 1fc9
-- 15a2
+
+- *0d28*
+- *1fc9*
+- *15a2*
 
 Devices in *SPSDK* could be identified either by *VID only* or a combination of *VID/PID*.
 
@@ -66,6 +70,26 @@ The *Bus:Device* can be listed using 'lsusb' command. The interface can be obser
     :align: center
 
     Device Path location using `lsusb` or `nxpdevscan`
+
+.. note::
+
+    For ``nxpdevscan`` to list connected devices, it is necessary to configure ``udev`` rules so the app to access them. For NXP VIDs see :ref:`USB - VID & PID`.
+
+    1. Create a file for example ``50-nxp.rules`` containing following rules:
+
+    .. code::
+
+        SUBSYSTEM=="usb", ATTRS\{idVendor}=="0d28", MODE="0666"
+        SUBSYSTEM=="usb", ATTRS\{idVendor}=="1fc9", MODE="0666"
+        SUBSYSTEM=="usb", ATTRS\{idVendor}=="15a2", MODE="0666"
+
+    2. To install rules copy the file to ``/etc/udev/rules.d``:
+
+    .. code-block:: bash
+
+        sudo cp 50-nxp.rules /etc/udev/rules.d
+
+    3. Plug your NXP device(s) and call ``nxpdevscan``.
 
 USB - Device Path - Mac
 =======================

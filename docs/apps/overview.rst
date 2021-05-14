@@ -1,11 +1,10 @@
-.. TODO: [SPSDK-673] Describe SPSDK apps and add instruction how to install and use them into the overview
-.. TODO: [SPSDK-674] Write user guide for nxpdevscan and include it into blhost and sdphost communication chapter
-
 ====================
 Application Overview
 ====================
 
-Command line applications shipped with SPSDK are available in ``PATH`` after activating a virtual environment with SPSDK installed in it.
+Command line applications shipped with *SPSDK* are available in ``PATH`` after activating a virtual environment with SPSDK installed in it.
+
+See how to install *SPSDK* in :ref:`Installation` chapter.
 
 .. note::
 
@@ -17,15 +16,23 @@ SPSDK has a special application called ``spsdk``. It holds references to all ava
 
     spsdk --help
 
-Each application could be executed separately or via spsdk (e.g. running ``pfr`` is equal to running ``spsdk pfr``).
+Each application could be executed separately or via ``spsdk`` (e.g. running ``pfr`` is equal to running ``spsdk pfr``).
 
 Options and flags for each application and their respective sub-commands are available using ``--help`` flag.
+
+Some application communicate with NXP devices connected to host PC. Details how to identify those devices could be found in following chapters:
+
+.. toctree::
+    :maxdepth: 1
+
+    uart
+    usb
 
 --------------------
 List of applications
 --------------------
 
-**blhost**
+:ref:`User Guide - blhost`
 
 The blhost application  is  a utility for communication with bootloader on target.
 
@@ -52,7 +59,7 @@ It allows user to:
 
     blhost --help
 
-**elftosb**
+:ref:`User Guide - elftosb`
 
 The tool for generating TrustZone, MasterBootImage and SecureBinary images.
 
@@ -64,7 +71,7 @@ The tool for generating TrustZone, MasterBootImage and SecureBinary images.
 
     elftosb --help
 
-**nxpcertgen**
+:ref:`User Guide - nxpcertgen`
 
 The nxpcertgen application allows user to generate the self-signed x.509 certificate
 with properties given in json configuration file. The certificates are self-signed
@@ -74,7 +81,7 @@ and support only BasicConstrains (ca, path_length).
 
     nxpcertgen --help
 
-**nxpdebugmbox**
+:ref:`User Guide - nxpdebugmbox`
 
 The nxpkeygen application allows user to:
 
@@ -87,7 +94,7 @@ The nxpkeygen application allows user to:
 
     nxpdebugmbox --help
 
-**nxpdevscan**
+:ref:`User Guide - nxpdevscan`
 
 The nxpdevscan application allows user to list all connected USB and UART devices.
 
@@ -95,7 +102,7 @@ The nxpdevscan application allows user to list all connected USB and UART device
 
     nxpdevscan --help
 
-**nxpkeygen**
+:ref:`User Guide - nxpkeygen`
 
 The nxpkeygen application allows user to:
 
@@ -106,7 +113,7 @@ The nxpkeygen application allows user to:
 
     nxpkeygen --help
 
-**pfr**
+:ref:`User Guide - pfr`
 
 The pfr application is  a utility for generating and parsing Protected Flash Region data (CMPA, CFPA).
 
@@ -122,7 +129,7 @@ It allows user to:
 
     pfr --help
 
-**pfrc**
+:ref:`User Guide - pfrc`
 
 The pfrc application is a utility for searching for brick-conditions in PFR settings.
 
@@ -132,7 +139,7 @@ Note: THIS IS AN EXPERIMENTAL UTILITY! USE WITH CAUTION !!!
 
     pfrc --help
 
-**sdphost**
+:ref:`User Guide - sdphost`
 
 The sdphost application is a utility for communication with ROM on i.MX targets.
 
@@ -147,7 +154,7 @@ It allows user to:
 
     sdphost --help
 
-**sdpshost**
+:ref:`User Guide - sdpshost`
 
 The sdpshost application is a utility for communication with ROM on i.MX targets.
 
@@ -159,7 +166,7 @@ Note: THIS IS AN EXPERIMENTAL UTILITY! USE WITH CAUTION !!!
 
     sdphost --help
 
-**shadowregs**
+:ref:`User Guide - shadowregs`
 
 The shadowregs application is a utility for Shadow Registers controlling.
 

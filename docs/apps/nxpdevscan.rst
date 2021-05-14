@@ -1,5 +1,5 @@
 =======================
-nxpdevscan - User Guide
+User Guide - nxpdevscan
 =======================
 
 This user’s guide describes how to use *nxpdevscan* application which detects NXP devices connected to the host PC over USB and UART connections.
@@ -37,10 +37,7 @@ nxpdevscan - UART
 
 *nxpdevscan* lists all devices connected using UART to the host PC in section *Connected NXP UART Devices*
 
-.. toctree::
-    :maxdepth: 1
-
-    uart
+:ref:`UART device identification in SPSDK`
 
 ----------------
 nxpdevscan - USB
@@ -48,7 +45,4 @@ nxpdevscan - USB
 
 *nxpdevscan* lists all devices connected using USB to host PC in section *Connected NXP USB Devices*.
 
-.. toctree::
-    :maxdepth: 1
-
-    usb
+:ref:`USB device identification in SPSDK`

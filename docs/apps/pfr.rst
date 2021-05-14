@@ -1,11 +1,29 @@
 ================
-pfr - User Guide
+User Guide - pfr
 ================
+
+This user’s guide describes how to use *pfr* application.
 
 .. click:: spsdk.apps.pfr:main
     :prog: pfr
     :nested: none
 
+------------------
+pfr - Sub-commands
+------------------
+
+*pfr* consist of a set of sub-commands followed by options and arguments.
+The options and the sub-command are separated with a ‘--’.
+
+.. code:: bash
+
+    pfr [options] -- [sub-command]
+
+The "help" guide of *pfr* lists all of the options and sub-commands supported by the *pfr* utility.
+
+.. code:: bash
+
+    pfr --help
 
 .. click:: spsdk.apps.pfr:devices
     :prog: pfr devices
