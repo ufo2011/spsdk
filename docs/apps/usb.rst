@@ -79,15 +79,17 @@ The *Bus:Device* can be listed using 'lsusb' command. The interface can be obser
 
     .. code::
 
-        SUBSYSTEM=="usb", ATTRS\{idVendor}=="0d28", MODE="0666"
-        SUBSYSTEM=="usb", ATTRS\{idVendor}=="1fc9", MODE="0666"
-        SUBSYSTEM=="usb", ATTRS\{idVendor}=="15a2", MODE="0666"
+        SUBSYSTEM=="usb", ATTRS{idVendor}=="0d28", MODE="0660"
+        SUBSYSTEM=="usb", ATTRS{idVendor}=="1fc9", MODE="0660"
+        SUBSYSTEM=="usb", ATTRS{idVendor}=="15a2", MODE="0660"
 
     2. To install rules copy the file to ``/etc/udev/rules.d``:
 
     .. code-block:: bash
 
         sudo cp 50-nxp.rules /etc/udev/rules.d
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger
 
     3. Plug your NXP device(s) and call ``nxpdevscan``.
 
