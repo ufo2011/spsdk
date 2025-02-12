@@ -1,20 +1,23 @@
-"""This module contains generic implementation of image segment."""
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2022-2023 NXP
+# Copyright 2022-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
+"""This module contains generic implementation of image segment."""
 import abc
-from typing import Any, Dict
+from typing import Any, Optional
 
-from spsdk.exceptions import SPSDKValueError
-from spsdk.utils.database import Database
+from spsdk.image.mem_type import MemoryType
+from spsdk.utils.abstract import BaseClass
+from spsdk.utils.database import DatabaseManager, get_db, get_families
 from spsdk.utils.registers import Registers
 
 
-class SegmentBase:
+class SegmentBase(BaseClass):
     """Base class for image segment."""
+
+    FEATURE = "unknown"
 
     def __init__(self, family: str, revision: str) -> None:
         """Segment base Constructor.
@@ -23,12 +26,9 @@ class SegmentBase:
         :param revision: Optional Chip family revision.
         :raises SPSDKValueError: Unsupported family.
         """
-        if family not in self.get_supported_families():
-            raise SPSDKValueError(
-                f"Unsupported chip family:{family}. {family} not in {self.get_supported_families()}"
-            )
         self.family = family
         self.revision = revision
+        self.db = get_db(family, revision)
 
     @property
     @abc.abstractmethod
@@ -42,27 +42,12 @@ class SegmentBase:
         """
         return self.registers.image_info().export()
 
-    def parse(self, binary: bytes) -> None:
-        """Parse binary block into segment object.
-
-        :param binary: binary image.
-        :raises SPSDKValueError: Invalid input binary length.
-        """
-        if len(binary) != len(self.registers.image_info()):
-            raise SPSDKValueError(
-                f"Invalid length of input binary: {len(binary)} != {len(self.registers.image_info())}"
-            )
-        for reg in self.registers.get_registers():
-            reg.set_value(
-                int.from_bytes(binary[reg.offset // 8 : reg.offset // 8 + reg.width // 8], "little")
-            )
-
     @staticmethod
     @abc.abstractmethod
-    def load_from_config(config: Dict) -> Any:
+    def load_from_config(config: dict) -> Any:
         """Load configuration file.
 
-        :param config: XMCD configuration file.
+        :param config: Segment configuration file.
         :return: Segment object.
         """
 
@@ -79,27 +64,32 @@ class SegmentBase:
 
         :return: List of supported families.
         """
-        return cls.get_database().devices.device_names
+        return get_families(cls.FEATURE)
 
     @classmethod
-    def get_memory_types(cls, family: str, revision: str = "latest") -> dict:
+    def get_memory_types_config(cls, family: str, revision: str = "latest") -> dict[str, dict]:
         """Get memory types data from database.
 
         :param family: Chip family.
         :param revision: Optional Chip family revision.
         """
-        return cls.get_database().get_device_value("mem_types", family, revision, default={})
+        return get_db(family, revision).get_dict(cls.FEATURE, "mem_types", default={})
 
     @classmethod
-    def get_supported_memory_types(cls, family: str, revision: str = "latest") -> list:
+    def get_supported_memory_types(
+        cls, family: Optional[str] = None, revision: str = "latest"
+    ) -> list[MemoryType]:
         """Get list of supported memory types data from database.
 
         :param family: Chip family.
         :param revision: Optional Chip family revision.
         """
-        return list(cls.get_memory_types(family, revision).keys())
-
-    @staticmethod
-    @abc.abstractmethod
-    def get_database() -> Database:
-        """Get the devices database."""
+        if family:
+            return [
+                MemoryType.from_label(mem_type)
+                for mem_type in cls.get_memory_types_config(family, revision).keys()
+            ]
+        return [
+            MemoryType.from_label(memory)
+            for memory in DatabaseManager().quick_info.features_data.get_mem_types(cls.FEATURE)
+        ]

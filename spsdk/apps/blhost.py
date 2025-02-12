@@ -1,54 +1,56 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2020-2023 NXP
+# Copyright 2020-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
 """Console script for MBoot module aka BLHost."""
 
-import inspect
-import json
 import logging
 import os
 import shlex
 import sys
-from typing import Optional
 
 import click
 
-from spsdk import SPSDKError
 from spsdk.apps.blhost_helper import (
-    PROPERTIES_OVERRIDE,
     OemGenMasterShareHelp,
     OemSetMasterShareHelp,
+    display_output,
     parse_key_prov_key_type,
     parse_property_tag,
     parse_trust_prov_key_type,
     parse_trust_prov_oem_key_type,
-    progress_bar,
 )
+from spsdk.apps.utils import spsdk_logger
 from spsdk.apps.utils.common_cli_options import (
     CommandsTreeGroup,
-    isp_interfaces,
+    SpsdkClickGroup,
     spsdk_apps_common_options,
+    spsdk_family_option,
+    spsdk_mboot_interface,
+    spsdk_use_json_option,
 )
 from spsdk.apps.utils.utils import (
     INT,
     SPSDKAppError,
     catch_spsdk_error,
     format_raw_data,
-    get_interface,
     parse_file_and_size,
     parse_hex_data,
+    progress_bar,
 )
-from spsdk.mboot import GenerateKeyBlobSelect, McuBoot, StatusCode, parse_property_value
-from spsdk.mboot.error_codes import stringify_status_code
-from spsdk.utils.images import BinaryImage
+from spsdk.exceptions import SPSDKError
+from spsdk.mboot.mcuboot import GenerateKeyBlobSelect, McuBoot, StatusCode, parse_property_value
+from spsdk.mboot.protocol.base import MbootProtocolBase
+from spsdk.utils.database import DatabaseManager, get_families
+from spsdk.utils.misc import Endianness, load_hex_string
 
 
 @click.group(name="blhost", no_args_is_help=True, cls=CommandsTreeGroup)
-@isp_interfaces(uart=True, usb=True, lpcusbsio=True, buspal=True)
+@spsdk_mboot_interface()
+@spsdk_use_json_option
 @spsdk_apps_common_options
 @click.option(
     "-s",
@@ -59,48 +61,39 @@ from spsdk.utils.images import BinaryImage
 @click.pass_context
 def main(
     ctx: click.Context,
-    port: str,
-    usb: str,
-    buspal: str,
-    lpcusbsio: str,
+    interface: MbootProtocolBase,
     use_json: bool,
     log_level: int,
-    timeout: int,
     silent: bool,
 ) -> int:
     """Utility for communication with the bootloader on target."""
     log_level = log_level or logging.WARNING
-    logging.basicConfig(level=log_level)
+    spsdk_logger.install(level=log_level)
 
     # print help for get-property if property tag is 0 or 'list-properties'
     if ctx.invoked_subcommand == "get-property":
         args = sys.argv[1:]
         # running this via pytest changes the args to a single arg, in that case skip
         if len(args) > 1 and "get-property" in args:
-            tag_str = args[args.index("get-property") + 1]
-            if parse_property_tag(tag_str) == 0:
-                click.echo(ctx.command.commands["get-property"].help)  # type: ignore
-                ctx.exit(0)
+            try:
+                tag_str = args[args.index("get-property") + 1]
+                if parse_property_tag(tag_str) == 0:
+                    click.echo(ctx.command.commands["get-property"].help)  # type: ignore
+                    ctx.exit(0)
+            except IndexError:
+                click.echo("Invalid index for get-property", err=True)
+                ctx.exit(1)
 
-    # if --help is provided anywhere on command line, skip interface lookup and display help message
-    if "--help" not in sys.argv[1:]:
-        ctx.obj = {
-            "interface": get_interface(
-                module="mboot",
-                port=port,
-                usb=usb,
-                timeout=timeout,
-                buspal=buspal,
-                lpcusbsio=lpcusbsio,
-            ),
-            "use_json": use_json,
-            "suppress_progress_bar": use_json or silent or log_level < logging.WARNING,
-            "silent": silent,
-        }
+    ctx.obj = {
+        "interface": interface,
+        "use_json": use_json,
+        "suppress_progress_bar": use_json or silent or log_level < logging.WARNING,
+        "silent": silent,
+    }
     return 0
 
 
-@main.command()
+@main.command(no_args_is_help=True)
 @click.argument("command_file", type=click.Path(file_okay=True))
 @click.pass_context
 def batch(ctx: click.Context, command_file: str) -> None:
@@ -110,16 +103,14 @@ def batch(ctx: click.Context, command_file: str) -> None:
     example: "read-memory 0 4096 memory.bin"
     example: "get-property 24 # read target version"
 
-    Comment are supported. Everything after '#' is a comment (just like in Python/Shell)
+    Comments are supported. Everything after '#' is a comment (just like in Python/Shell)
 
     Note: This is an early experimental format, it may change at any time.
 
     \b
     COMMAND_FILE    - path to blhost command file
     """
-    click.secho("This is an experimental command. Use at your own risk!", fg="yellow")
-
-    with open(command_file) as f:
+    with open(command_file, encoding="utf-8") as f:
         for line in f.readlines():
             tokes = shlex.split(line, comments=True)
             if len(tokes) < 1:
@@ -152,7 +143,7 @@ def call(ctx: click.Context, address: int, argument: int) -> None:
         display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
 
 
-@main.command()
+@main.command(no_args_is_help=True)
 @click.argument("memory_id", type=INT(), required=True)
 @click.argument("address", type=INT(), required=True)
 @click.pass_context
@@ -166,25 +157,25 @@ def configure_memory(ctx: click.Context, address: int, memory_id: int) -> None:
     ADDRESS     - starting address
     """
     with McuBoot(ctx.obj["interface"]) as mboot:
-        mboot.configure_memory(address, memory_id)  # type: ignore
+        mboot.configure_memory(address, memory_id)
         display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
 
 
-@main.command()
+@main.command(no_args_is_help=True)
 @click.argument("address", type=INT(), required=True)
 @click.argument("data", type=INT(base=16), required=True)
 @click.argument(
     "lock",
     metavar="[nolock/lock]",
-    type=click.Choice(["nolock", "lock"]),
+    type=click.Choice(["nolock", "lock"], case_sensitive=False),
     default="nolock",
 )
 @click.option(
     "-v / ",
     "--verify/--no-verify",
     is_flag=True,
-    default=True,
-    help="Verify write operation (verify by default)",
+    default=False,
+    help="Verify write operation (don't verify by default)",
 )
 @click.pass_context
 def efuse_program_once(
@@ -205,7 +196,7 @@ def efuse_program_once(
         display_output([response], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
 
 
-@main.command()
+@main.command(no_args_is_help=True)
 @click.argument("address", type=INT(), required=True)
 @click.pass_context
 def efuse_read_once(ctx: click.Context, address: int) -> None:
@@ -224,7 +215,7 @@ def efuse_read_once(ctx: click.Context, address: int) -> None:
         )
 
 
-@main.command()
+@main.command(no_args_is_help=True)
 @click.argument("address", type=INT(), required=True)
 @click.argument("argument", type=INT(), required=True)
 @click.argument("stackpointer", type=INT(), required=True)
@@ -248,7 +239,7 @@ def execute(ctx: click.Context, address: int, argument: int, stackpointer: int) 
         display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
 
 
-@main.command()
+@main.command(no_args_is_help=True)
 @click.argument("address", type=INT(), required=True)
 @click.argument("byte_count", type=INT(), required=True)
 @click.argument("memory_id", type=INT(), required=False, default="0")
@@ -295,7 +286,7 @@ def flash_erase_all_unsecure(ctx: click.Context) -> None:
         display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
 
 
-@main.command()
+@main.command(no_args_is_help=True)
 @click.argument("image_file_path", metavar="FILE", type=str, required=True)
 @click.argument("erase", type=str, required=False, default="none")
 @click.argument("memory_id", type=INT(), required=False, default="0")
@@ -308,6 +299,8 @@ def flash_image(ctx: click.Context, image_file_path: str, erase: str, memory_id:
     ERASE      - string 'erase' determines if flash is erased before writing
     MEMORY_ID  - id of memory to erase (default: 0)
     """
+    from spsdk.utils.images import BinaryImage
+
     ALIGNMENT = 1024
 
     if not os.path.isfile(image_file_path):
@@ -326,7 +319,6 @@ def flash_image(ctx: click.Context, image_file_path: str, erase: str, memory_id:
     with McuBoot(ctx.obj["interface"]) as mboot:
         if erase == "erase":
             for segment in bin_image.sub_images:
-
                 mboot.flash_erase_region(
                     address=segment.aligned_start(ALIGNMENT),
                     length=segment.aligned_length(ALIGNMENT),
@@ -348,14 +340,14 @@ def flash_image(ctx: click.Context, image_file_path: str, erase: str, memory_id:
             display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
 
 
-@main.command()
+@main.command(no_args_is_help=True)
 @click.argument("index", type=INT(), required=True)
-@click.argument("byte_count", type=click.Choice(["4", "8"]), required=True)
+@click.argument("byte_count", type=click.Choice(["4", "8"], case_sensitive=False), required=True)
 @click.argument("data", type=INT(base=16), required=True)
 @click.argument(
     "endianness",
     metavar="[LSB|MSB]",
-    type=click.Choice(["LSB", "MSB"]),
+    type=click.Choice(["LSB", "MSB"], case_sensitive=False),
     default="LSB",
     required=False,
 )
@@ -371,16 +363,18 @@ def flash_program_once(
     DATA        - 4 or 8-byte-hex according to <byte_count>
     ENDIANNESS   - output sequence is specified by LSB (Default) or MSB
     """
-    byte_order = "big" if endianness == "MSB" else "little"
-    input_data = data.to_bytes(int(byte_count), byteorder=byte_order)  # type: ignore[arg-type]
+    byte_order = Endianness.BIG if endianness == "MSB" else Endianness.LITTLE
+    input_data = data.to_bytes(int(byte_count), byteorder=byte_order.value)
     with McuBoot(ctx.obj["interface"]) as mboot:
         mboot.flash_program_once(index=index, data=input_data)
         display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
 
 
-@main.command()
+@main.command(no_args_is_help=True)
 @click.argument("index", type=INT(), required=True)
-@click.argument("byte_count", type=click.Choice(["4", "8"]), required=True, default=4)
+@click.argument(
+    "byte_count", type=click.Choice(["4", "8"], case_sensitive=False), required=True, default="4"
+)
 @click.pass_context
 def flash_read_once(ctx: click.Context, index: int, byte_count: str) -> None:
     """Returns the contents of a specific program once field.
@@ -392,14 +386,18 @@ def flash_read_once(ctx: click.Context, index: int, byte_count: str) -> None:
     with McuBoot(ctx.obj["interface"]) as mboot:
         response = mboot.flash_read_once(index=index, count=int(byte_count))
         display_output(
-            None if response is None else [len(response), int.from_bytes(response, "little")],
+            (
+                None
+                if response is None
+                else [len(response), int.from_bytes(response, Endianness.LITTLE.value)]
+            ),
             mboot.status_code,
             ctx.obj["use_json"],
             ctx.obj["silent"],
         )
 
 
-@main.command()
+@main.command(no_args_is_help=True)
 @click.argument("key", type=str, required=True)
 @click.pass_context
 def flash_security_disable(ctx: click.Context, key: str) -> None:
@@ -419,10 +417,10 @@ def flash_security_disable(ctx: click.Context, key: str) -> None:
         display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
 
 
-@main.command()
+@main.command(no_args_is_help=True)
 @click.argument("address", type=INT(), required=True)
 @click.argument("length", type=INT(), required=True)
-@click.argument("option", type=click.Choice(["0", "1"]), required=True)
+@click.argument("option", type=click.Choice(["0", "1"], case_sensitive=False), required=True)
 @click.argument("out_file", metavar="FILE", type=click.File("wb"), required=False)
 @click.option("-h", "--use-hexdump", is_flag=True, default=False, help="Use hexdump format")
 @click.pass_context
@@ -463,14 +461,14 @@ def flash_read_resource(
         )
 
 
-@main.command()
+@main.command(no_args_is_help=True)
 @click.argument("address", type=INT(), required=True)
 @click.argument("byte_count", type=INT(), required=True)
 @click.argument("pattern", type=INT(), required=True)
 @click.argument(
     "pattern_format",
     metavar="format",
-    type=click.Choice(["word", "short", "byte"]),
+    type=click.Choice(["word", "short", "byte"], case_sensitive=False),
     required=False,
     default="word",
 )
@@ -492,7 +490,7 @@ def fill_memory(
         display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
 
 
-@main.command()
+@main.command(no_args_is_help=True)
 @click.argument("address", type=INT(), required=True)
 @click.argument("data_source", metavar="FILE[,BYTE_COUNT] | {{HEX-DATA}}", type=str, required=True)
 @click.argument("memory_id", type=INT(), required=False, default="0")
@@ -525,7 +523,7 @@ def fuse_program(ctx: click.Context, address: int, data_source: str, memory_id: 
         )
 
 
-@main.command()
+@main.command(no_args_is_help=True)
 @click.argument("address", type=INT(), required=True)
 @click.argument("byte_count", type=INT(), required=True)
 @click.argument("out_file", metavar="FILE", type=click.File("wb"), required=False)
@@ -587,7 +585,7 @@ def list_memory(ctx: click.Context) -> None:
             print(f"{(mem.name)}:\n  {mem}")
 
 
-@main.command()
+@main.command(no_args_is_help=True)
 @click.argument("boot_file", metavar="FILE", type=click.File("rb"))
 @click.pass_context
 def load_image(ctx: click.Context, boot_file: click.File) -> None:
@@ -608,14 +606,11 @@ def load_image(ctx: click.Context, boot_file: click.File) -> None:
         display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
 
 
-@main.command()
+@main.command(no_args_is_help=True)
 @click.argument("property_tag", type=str, required=True)
 @click.argument("index", type=INT(), default="0")
-@click.option(
-    "-f",
-    "--family",
-    type=click.Choice(list(PROPERTIES_OVERRIDE.keys())),
-    help="Provide family. So far supported 'kw45xx' and 'k32w1xx'",
+@spsdk_family_option(
+    families=get_families(DatabaseManager.BLHOST, "overridden_properties"), required=False
 )
 @click.pass_context
 def get_property(
@@ -666,6 +661,10 @@ def get_property(
     29 or 'pfr-keystore_update-opt'     PFR key store update option
     30 or 'byte-write-timeout-ms'       Byte write timeout in ms
     31 or 'fuse-locked-status'          Fuse Locked Status
+    32 or 'boot status'                 Value of Boot Status Register
+    33 or 'loadable-fw-version'         LoadableFWVersion
+
+    \b
     for kw45xx/k32w1xx devices:
     10 or 'verify-erases'               Verify Erases flag
     20 or 'boot status'                 Value of Boot Status Register
@@ -673,11 +672,22 @@ def get_property(
     22 or 'fuse-program-voltage'        Fuse Program Voltage
 
     \b
+    for kw47xx devices:
+    10 or 'verify-erases'               Verify Erases flag
+    20 or 'boot status'                 Value of Boot Status Register
+    21 or 'loadable-fw-version'         LoadableFWVersion
+    34 or 'fuse-program-voltage'        Fuse Program Voltage
+
+    \b
+    for mcxa1xx devices:
+    17 or 'life-cycle'                  Life Cycle
+
+    \b
     Note: Not all the properties are available for all devices.
     """
     property_tag_int = parse_property_tag(property_tag, family)
     with McuBoot(ctx.obj["interface"]) as mboot:
-        response = mboot.get_property(property_tag_int, index=index)  # type: ignore
+        response = mboot.get_property(property_tag_int, index=index)
         property_text = (
             str(parse_property_value(property_tag_int, response, None, family))
             if response
@@ -688,14 +698,11 @@ def get_property(
         )
 
 
-@main.command()
+@main.command(no_args_is_help=True)
 @click.argument("property_tag", type=str, required=True)
 @click.argument("value", type=INT(), required=True)
-@click.option(
-    "-f",
-    "--family",
-    type=click.Choice(list(PROPERTIES_OVERRIDE.keys())),
-    help="Provide family. So far supported 'kw45xx' and 'k32w1xx'",
+@spsdk_family_option(
+    families=get_families(DatabaseManager.BLHOST, "overridden_properties"), required=False
 )
 @click.pass_context
 def set_property(
@@ -720,20 +727,27 @@ def set_property(
     28 or 'irq-notify-pin'              Interrupt notifier pin
     29 or 'pfr-keystore_update-opt'     PFR key store update option
     30 or 'byte-write-timeout-ms'       Byte write timeout in ms
+
+    \b
     for kw45xx/k32w1xx devices:
     10 or 'verify-erases'               Verify Erases flag
     22 or 'fuse-program-voltage'        Fuse Program Voltage
+
+    \b
+    for kw47xx devices:
+    10 or 'verify-erases'               Verify Erases flag
+    34 or 'fuse-program-voltage'        Fuse Program Voltage
 
     \b
     Note: Not all properties can be set on all devices.
     """
     property_tag_int = parse_property_tag(property_tag, family)
     with McuBoot(ctx.obj["interface"]) as mboot:
-        mboot.set_property(prop_tag=property_tag_int, value=value)  # type: ignore
+        mboot.set_property(prop_tag=property_tag_int, value=value)
         display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
 
 
-@main.command()
+@main.command(no_args_is_help=True)
 @click.argument("address", type=INT(), required=True)
 @click.argument("byte_count", type=INT(), required=True)
 @click.argument("out_file", metavar="FILE", type=click.File("wb"), required=False)
@@ -791,7 +805,7 @@ def read_memory(
     )
 
 
-@main.command()
+@main.command(no_args_is_help=True)
 @click.argument("sb_file", metavar="FILE", type=click.File("rb"), required=True)
 @click.option(
     "-c",
@@ -825,7 +839,7 @@ def receive_sb_file(ctx: click.Context, sb_file: click.File, check_errors: bool)
         display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
 
 
-@main.command()
+@main.command(no_args_is_help=True)
 @click.argument("address", type=INT(), required=True)
 @click.pass_context
 def reliable_update(ctx: click.Context, address: int) -> None:
@@ -851,7 +865,7 @@ def reset(ctx: click.Context) -> None:
     display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
 
 
-@main.command()
+@main.command(no_args_is_help=True)
 @click.argument("address", type=INT(), required=True)
 @click.argument("data_source", metavar="FILE[,BYTE_COUNT] | {{HEX-DATA}}", type=str, required=True)
 @click.argument("memory_id", type=INT(), required=False, default="0")
@@ -890,13 +904,13 @@ def write_memory(ctx: click.Context, address: int, data_source: str, memory_id: 
         )
 
 
-@main.command()
+@main.command(no_args_is_help=True)
 @click.argument("dek_file", type=click.File("rb"), required=True)
 @click.argument("blob_file", type=click.File("wb"), required=True)
 @click.argument(
     "key_sel",
     metavar="[KEY_SEL]",
-    type=click.Choice(["0", "1", "2", "3", "OPTMK", "ZMK", "CMK"]),
+    type=click.Choice(["0", "1", "2", "3", "OPTMK", "ZMK", "CMK"], case_sensitive=False),
     default="0",
 )
 @click.pass_context
@@ -919,7 +933,9 @@ def generate_key_blob(
     """
     with McuBoot(ctx.obj["interface"]) as mboot:
         data = dek_file.read()  # type: ignore
-        key_sel_int = int(key_sel) if key_sel.isnumeric() else GenerateKeyBlobSelect.get(key_sel)
+        key_sel_int = (
+            int(key_sel) if key_sel.isnumeric() else GenerateKeyBlobSelect.get_tag(key_sel)
+        )
         assert isinstance(key_sel_int, int)
         write_response = mboot.generate_key_blob(data, key_sel=key_sel_int)
         if write_response:
@@ -932,13 +948,13 @@ def generate_key_blob(
         )
 
 
-@main.group()
+@main.group(cls=SpsdkClickGroup)
 @click.pass_context
 def key_provisioning(ctx: click.Context) -> None:  # pylint: disable=unused-argument
     """Group of sub-commands related to key provisioning."""
 
 
-@key_provisioning.command()
+@key_provisioning.command(no_args_is_help=False)
 @click.pass_context
 def enroll(ctx: click.Context) -> None:
     """Enrolls key provisioning feature. No argument for this operation."""
@@ -947,7 +963,7 @@ def enroll(ctx: click.Context) -> None:
         display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
 
 
-@main.command()
+@main.command(no_args_is_help=True)
 @click.argument("file", metavar="FILE", type=click.File("rb"), required=True)
 @click.pass_context
 def program_aeskey(ctx: click.Context, file: click.File) -> None:
@@ -962,16 +978,33 @@ def program_aeskey(ctx: click.Context, file: click.File) -> None:
         display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
 
 
-@key_provisioning.command(name="set_user_key")
+@key_provisioning.command(name="set_user_key", no_args_is_help=True)
+@click.option(
+    "-s",
+    "--key-size",
+    type=INT(),
+    required=False,
+    help=(
+        "Key size in bits. If this field is defined,"
+        " the command could load as text as binary form of key."
+    ),
+)
 @click.argument("key_type", metavar="TYPE", type=str, required=True)
 @click.argument("file_and_size", metavar="FILE[,SIZE]", type=str, required=True)
 @click.pass_context
-def set_user_key(ctx: click.Context, key_type: str, file_and_size: str) -> None:
+def set_user_key(ctx: click.Context, key_type: str, file_and_size: str, key_size: int) -> None:
     """Sends the user key specified by type to the bootloader.
 
     <FILE> is the binary file containing user key plain text.
     If <SIZE> is not specified, the entire <FILE> will be sent.
     Otherwise, blhost only sends the first <SIZE> bytes.
+
+    \b
+    If the '--key-size' option is defined, the argument 'file_and_size' accepts those formats:
+     - filename to binary file
+     - filename to text file
+     - string with key
+    The size part is ignored in this case.
 
     \b
     TYPE  - Type of user key
@@ -996,15 +1029,18 @@ def set_user_key(ctx: click.Context, key_type: str, file_and_size: str) -> None:
     """
     file_path, size = parse_file_and_size(file_and_size)
     key_type_int = parse_key_prov_key_type(key_type)
-    with open(file_path, "rb") as key_file:
-        key_data = key_file.read(size)
+
+    if not key_size:
+        key_size = (size if size > 0 else os.path.getsize(file_path)) * 8
+
+    key_data = load_hex_string(file_path, expected_size=key_size // 8)
 
     with McuBoot(ctx.obj["interface"]) as mboot:
-        mboot.kp_set_user_key(key_type=key_type_int, key_data=key_data)  # type: ignore
+        mboot.kp_set_user_key(key_type=key_type_int, key_data=key_data)
         display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
 
 
-@key_provisioning.command(name="set_key")
+@key_provisioning.command(name="set_key", no_args_is_help=True)
 @click.argument("key_type", metavar="TYPE", type=str, required=True)
 @click.argument("key_size", metavar="SIZE", type=INT(), required=True)
 @click.pass_context
@@ -1064,7 +1100,7 @@ def read_key_nonvolatile(ctx: click.Context, memory_id: int) -> None:
         display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
 
 
-@key_provisioning.command(name="write_key_store")
+@key_provisioning.command(name="write_key_store", no_args_is_help=True)
 @click.argument("file_and_size", metavar="FILE[,SIZE]", type=str, required=True)
 @click.pass_context
 def write_key_store(ctx: click.Context, file_and_size: str) -> None:
@@ -1089,7 +1125,7 @@ def write_key_store(ctx: click.Context, file_and_size: str) -> None:
         display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
 
 
-@key_provisioning.command(name="read_key_store")
+@key_provisioning.command(name="read_key_store", no_args_is_help=True)
 @click.argument("key_store_file", metavar="FILE", type=click.File("wb"), required=True)
 @click.pass_context
 def read_key_store(ctx: click.Context, key_store_file: click.File) -> None:
@@ -1112,13 +1148,13 @@ def read_key_store(ctx: click.Context, key_store_file: click.File) -> None:
         )
 
 
-@main.group()
+@main.group(cls=SpsdkClickGroup)
 @click.pass_context
 def trust_provisioning(ctx: click.Context) -> None:  # pylint: disable=unused-argument
     """Group of sub-commands related to trust provisioning."""
 
 
-@trust_provisioning.command(name="hsm_store_key")
+@trust_provisioning.command(name="hsm_store_key", no_args_is_help=True)
 @click.argument("key_type", metavar="KEY_TYPE", type=str, required=True)
 @click.argument("key_property", metavar="KEY_PROPERTY", type=INT(), required=True)
 @click.argument("key_input_addr", metavar="KEY_INPUT_ADDR", type=INT(), required=True)
@@ -1174,7 +1210,7 @@ def hsm_store_key(
         )
 
 
-@trust_provisioning.command(name="hsm_gen_key")
+@trust_provisioning.command(name="hsm_gen_key", no_args_is_help=True)
 @click.argument("key_type", metavar="KEY_TYPE", type=str, required=True)
 @click.argument("reserved", metavar="RESERVED", type=INT(), required=True)
 @click.argument("key_blob_output_addr", metavar="KEY_BLOB_OUTPUT_ADDR", type=INT(), required=True)
@@ -1234,7 +1270,7 @@ def hsm_gen_key(
         )
 
 
-@trust_provisioning.command(name="hsm_enc_blk")
+@trust_provisioning.command(name="hsm_enc_blk", no_args_is_help=True)
 @click.argument(
     "mfg_cust_mk_sk_0_blob_input_addr",
     metavar="MFG_CUST_MK_SK_0_BLOB_INPUT_ADDR",
@@ -1294,7 +1330,7 @@ def hsm_enc_blk(
         display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
 
 
-@trust_provisioning.command(name="hsm_enc_sign")
+@trust_provisioning.command(name="hsm_enc_sign", no_args_is_help=True)
 @click.argument("key_blob_input_addr", metavar="KEY_BLOB_INPUT_ADDR", type=INT(), required=True)
 @click.argument("key_blob_input_size", metavar="KEY_BLOB_INPUT_SIZE", type=INT(), required=True)
 @click.argument("block_data_input_addr", metavar="BLOCK_DATA_INPUT_ADDR", type=INT(), required=True)
@@ -1350,7 +1386,11 @@ def hsm_enc_sign(
         )
 
 
-@trust_provisioning.command(name="oem_gen_master_share", cls=OemGenMasterShareHelp)
+@trust_provisioning.command(
+    name="oem_gen_master_share",
+    cls=OemGenMasterShareHelp,
+    no_args_is_help=True,
+)
 @click.argument("oem_share_input_addr", type=INT(), required=True)
 @click.argument("oem_share_input_size", type=INT(), required=True)
 @click.argument("oem_enc_share_output_addr", type=INT(), required=True)
@@ -1416,7 +1456,9 @@ def oem_gen_master_share(
         )
 
 
-@trust_provisioning.command(name="oem_set_master_share", cls=OemSetMasterShareHelp)
+@trust_provisioning.command(
+    name="oem_set_master_share", cls=OemSetMasterShareHelp, no_args_is_help=True
+)
 @click.argument("oem_share_input_addr", type=INT(), required=True)
 @click.argument("oem_share_input_size", type=INT(), required=True)
 @click.argument("oem_enc_master_share_input_addr", type=INT(), required=True)
@@ -1440,7 +1482,7 @@ def oem_set_master_share(
         display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
 
 
-@trust_provisioning.command(name="oem_get_cust_cert_dice_puk")
+@trust_provisioning.command(name="oem_get_cust_cert_dice_puk", no_args_is_help=True)
 @click.argument("oem_rkth_input_addr", type=INT(), required=True)
 @click.argument("oem_rkth_input_size", type=INT(), required=True)
 @click.argument("oem_cust_cert_dice_puk_output_addr", type=INT(), required=True)
@@ -1456,7 +1498,7 @@ def oem_get_cust_cert_dice_puk(
     """Creates the initial trust provisioning keys.
 
     \b
-    OEM_RKTH_INPUT_ADDR                 - The input buffer address where the OEM RKTH locates at
+    OEM_RKTH_INPUT_ADDR                - The input buffer address where the OEM RKTH locates at
     OEM_RKTH_INPUT_SIZE                - The byte count of the OEM RKTH
     OEM_CUST_CERT_DICE_PUK_OUTPUT_ADDR - The output buffer address where ROM writes the OEM Customer
                                          Certificate Public Key for DICE to
@@ -1484,6 +1526,259 @@ def oem_get_cust_cert_dice_puk(
     )
 
 
+@trust_provisioning.command(name="wpc_get_id", no_args_is_help=True)
+@click.argument("wpc_id_blob_addr", type=INT(), required=True)
+@click.argument("wpc_id_blob_size", type=INT(), required=True)
+@click.pass_context
+def wpc_get_id(
+    ctx: click.Context,
+    wpc_id_blob_addr: int,
+    wpc_id_blob_size: int,
+) -> None:
+    """Command used for harvesting device ID blob.
+
+    \b
+    WPC_ID_BLOB_ADDR - Buffer address
+    WPC_ID_BLOB_SIZE - Buffer size
+    """
+    with McuBoot(ctx.obj["interface"]) as mboot:
+        mboot.wpc_get_id(
+            wpc_id_blob_addr,
+            wpc_id_blob_size,
+        )
+        display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
+
+
+@trust_provisioning.command(name="nxp_get_id", no_args_is_help=True)
+@click.argument("id_blob_addr", type=INT(), required=True)
+@click.argument("id_blob_size", type=INT(), required=True)
+@click.pass_context
+def nxp_get_id(
+    ctx: click.Context,
+    id_blob_addr: int,
+    id_blob_size: int,
+) -> None:
+    """Command used for harvesting device ID blob during wafer test as part of RTS flow.
+
+    This command is allowed only when LC_STATE < 0x3.
+
+    \b
+    ID_BLOB_ADDR            - address of ID blob defined by Round-trip trust provisioning specification.
+    ID_BLOB_SIZE            - length of buffer in bytes
+    """
+    with McuBoot(ctx.obj["interface"]) as mboot:
+        mboot.nxp_get_id(
+            id_blob_addr,
+            id_blob_size,
+        )
+        display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
+
+
+@trust_provisioning.command(name="wpc_insert_cert", no_args_is_help=True)
+@click.argument("wpc_cert_addr", type=INT(), required=True)
+@click.argument("wpc_cert_len", type=INT(), required=True)
+@click.argument("ec_id_offset", type=INT(), required=True)
+@click.argument("wpc_puk_offset", type=INT(), required=True)
+@click.pass_context
+def wpc_insert_cert(
+    ctx: click.Context,
+    wpc_cert_addr: int,
+    wpc_cert_len: int,
+    ec_id_offset: int,
+    wpc_puk_offset: int,
+) -> None:
+    """Command used for certificate validation before it is written into flash.
+
+    This command does following things:
+        Extracts ECID and WPC PUK from certificate
+        Validates ECID and WPC PUK. If both are OK it returns success. Otherwise returns fail
+
+    \b
+    WPC_CERT_ADDR   - address of inserted certificate
+    WPC_CERT_LEN    - length in bytes of inserted certificate
+    EC_ID_OFFSET    - offset to 72-bit ECID
+    WPC_PUK_OFFSET  - WPC PUK offset from beginning of inserted certificate
+    """
+    with McuBoot(ctx.obj["interface"]) as mboot:
+        mboot.wpc_insert_cert(
+            wpc_cert_addr,
+            wpc_cert_len,
+            ec_id_offset,
+            wpc_puk_offset,
+        )
+        display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
+
+
+@trust_provisioning.command(name="wpc_sign_csr", no_args_is_help=True)
+@click.argument("csr_tbs_addr", type=INT(), required=True)
+@click.argument("csr_tbs_len", type=INT(), required=True)
+@click.argument("signature_addr", type=INT(), required=True)
+@click.argument("signature_len", type=INT(), required=True)
+@click.pass_context
+def wpc_sign_csr(
+    ctx: click.Context,
+    csr_tbs_addr: int,
+    csr_tbs_len: int,
+    signature_addr: int,
+    signature_len: int,
+) -> None:
+    """Command used for signing CSR data (TBS portion).
+
+    \b
+    CSR_TBS_ADDR   - address of CSR-TBS data
+    CSR_TBS_LEN    - length in bytes of CSR-TBS data
+    SIGNATURE_ADDR - address where to store signature
+    SIGNATURE_LEN  - expected length of signature
+    """
+    with McuBoot(ctx.obj["interface"]) as mboot:
+        mboot.wpc_sign_csr(
+            csr_tbs_addr,
+            csr_tbs_len,
+            signature_addr,
+            signature_len,
+        )
+        display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
+
+
+@trust_provisioning.command(name="dsc_hsm_create_session", no_args_is_help=True)
+@click.argument("oem_seed_input_addr", type=INT(), required=True)
+@click.argument("oem_seed_input_size", type=INT(), required=True)
+@click.argument("oem_share_output_addr", type=INT(), required=True)
+@click.argument("oem_share_output_size", type=INT(), required=True)
+@click.pass_context
+def dsc_hsm_create_session(
+    ctx: click.Context,
+    oem_seed_input_addr: int,
+    oem_seed_input_size: int,
+    oem_share_output_addr: int,
+    oem_share_output_size: int,
+) -> None:
+    """Command used by OEM to provide it share to create the initial trust provisioning keys.
+
+    \b
+    OEM_SEED_INPUT_ADDR     - address of 128-bit entropy seed value provided by the OEM.
+    OEM_SEED_INPUT_SIZE     - OEM seed size in bytes
+    OEM_SHARE_OUTPUT_ADDR   - A 128-bit encrypted token.
+    OEM_SHARE_OUTPUT_SIZE   - size in bytes
+    """
+    with McuBoot(ctx.obj["interface"]) as mboot:
+        mboot.dsc_hsm_create_session(
+            oem_seed_input_addr,
+            oem_seed_input_size,
+            oem_share_output_addr,
+            oem_share_output_size,
+        )
+        display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
+
+
+@trust_provisioning.command(name="dsc_hsm_enc_blk", no_args_is_help=True)
+@click.argument("sbx_header_input_addr", type=INT(), required=True)
+@click.argument("sbx_header_input_size", type=INT(), required=True)
+@click.argument("block_num", type=INT(), required=True)
+@click.argument("block_data_addr", type=INT(), required=True)
+@click.argument("block_data_size", type=INT(), required=True)
+@click.pass_context
+def dsc_hsm_enc_blk(
+    ctx: click.Context,
+    sbx_header_input_addr: int,
+    sbx_header_input_size: int,
+    block_num: int,
+    block_data_addr: int,
+    block_data_size: int,
+) -> None:
+    """Command used to encrypt the given block sliced by the nxpimage.
+
+    This command is only supported after issuance of dsc_hsm_create_session.
+
+    \b
+    SBX_HEADER_INPUT_ADDR - SBx header containing file size, Firmware version and Timestamp data.
+         Except for hash digest of block 0, all other fields should be valid.
+    SBX_HEADER_INPUT_SIZE - size of the header in bytes
+    BLOCK_NUM             - Number of block
+    BLOCK_DATA_ADDR       - Address of data block
+    BLOCK_DATA_SIZE       - Size of data block
+    """
+    with McuBoot(ctx.obj["interface"]) as mboot:
+        mboot.dsc_hsm_enc_blk(
+            sbx_header_input_addr,
+            sbx_header_input_size,
+            block_num,
+            block_data_addr,
+            block_data_size,
+        )
+        display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
+
+
+@trust_provisioning.command(name="dsc_hsm_enc_sign", no_args_is_help=True)
+@click.argument("block_data_input_addr", type=INT(), required=True)
+@click.argument("block_data_input_size", type=INT(), required=True)
+@click.argument("signature_output_addr", type=INT(), required=True)
+@click.argument("block_data_addr", type=INT(), required=True)
+@click.pass_context
+def dsc_hsm_enc_sign(
+    ctx: click.Context,
+    block_data_input_addr: int,
+    block_data_input_size: int,
+    signature_output_addr: int,
+    signature_output_size: int,
+) -> None:
+    """Command used for signing the data buffer provided.
+
+    This command is only supported after issuance of dsc_hsm_create_session.
+
+    \b
+    BLOCK_DATA_INPUT_ADDR - Address of data buffer to be signed
+    BLOCK_DATA_INPUT_SIZE - Size of data buffer in bytes
+    SIGNATURE_OUTPUT_ADDR - Address to output signature data
+    SIGNATURE_OUTPUT_SIZE - Size of the output signature data in bytes
+    """
+    with McuBoot(ctx.obj["interface"]) as mboot:
+        mboot.dsc_hsm_enc_sign(
+            block_data_input_addr,
+            block_data_input_size,
+            signature_output_addr,
+            signature_output_size,
+        )
+        display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
+
+
+# @main.command(no_args_is_help=True)
+@trust_provisioning.command(name="oem_get_cust_dice_response")
+@click.argument("challenge_addr", type=INT(), required=True)
+@click.argument("challenge_size", type=INT(), required=True)
+@click.argument("response_addr", type=INT(), required=True)
+@click.argument("response_size", type=INT(), required=True)
+@click.pass_context
+def oem_get_cust_dice_response(
+    ctx: click.Context,
+    challenge_addr: int,
+    challenge_size: int,
+    response_addr: int,
+    response_size: int,
+) -> None:
+    """Creates DICE response for given challenge.
+
+    \b
+    CHALLENGE_ADDR - The input buffer address where the challenge is located
+    CHALLENGE_SIZE - The byte count of the challenge
+    RESPONSE_ADDR  - The output buffer address where ROM writes DICE response
+    RESPONSE_SIZE  - The byte count of the response
+    """
+    with McuBoot(ctx.obj["interface"]) as mboot:
+        response = mboot.tp_oem_get_cust_dice_response(
+            challenge_addr, challenge_size, response_addr, response_size
+        )
+    extra_output = ""
+    if response:
+        if mboot.status_code == StatusCode.SUCCESS:
+            extra_output = f"Response size: {response} ({hex(response)})\n"
+        else:
+            extra_output = "Output buffer is smaller than the minimum requested size"
+    display_output(
+        [response], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"], extra_output
+    )
+
+
 @main.command()
 @click.argument("life-cycle", metavar="LIFE CYCLE", type=INT(), required=True)
 @click.pass_context
@@ -1498,7 +1793,42 @@ def update_life_cycle(ctx: click.Context, life_cycle: int) -> None:
         display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
 
 
-@trust_provisioning.command(name="prove_genuinity")
+@main.command(no_args_is_help=True)
+@click.argument("cmd-msg-addr", metavar="COMMAND MESSAGE ADDRESS", type=INT(), required=True)
+@click.argument("cmd-msg-cnt", metavar="COMMAND MESSAGE COUNT", type=INT(), required=True)
+@click.argument("resp-msg-addr", metavar="RESPONSE MESSAGE ADDRESS", type=INT(), required=True)
+@click.argument("resp-msg-cnt", metavar="RESPONSE MESSAGE COUNT", type=INT(), required=True)
+@click.pass_context
+def ele_message(
+    ctx: click.Context, cmd_msg_addr: int, cmd_msg_cnt: int, resp_msg_addr: int, resp_msg_cnt: int
+) -> None:
+    """Send message to EdgeLock Enclave.
+
+    This command is designed to be, as general, as is possible to work with EdgeLock Enclave.
+    EdgeLock Enclave message is prepared in PC and stored in target RAM (for example by 'blhost write-memory').
+    The response of ELE command is stored also in target memory on place that is defined by 'resp-msg-addr
+    and could be read back (for example by 'blhost read-memory').
+
+
+    Size of command message and response is in count of 32-bit words.
+
+    \b
+    COMMAND MESSAGE ADDRESS     - Address in target where is stored the command words.
+    COMMAND MESSAGE COUNT       - Count of the stored command words.
+    RESPONSE MESSAGE ADDRESS    - Address in target memory space where the ELE store response.
+    RESPONSE MESSAGE COUNT      - Maximal count of words reserved for response.
+    """
+    with McuBoot(ctx.obj["interface"]) as mboot:
+        mboot.ele_message(
+            cmdMsgAddr=cmd_msg_addr,
+            cmdMsgCnt=cmd_msg_cnt,
+            respMsgAddr=resp_msg_addr,
+            respMsgCnt=resp_msg_cnt,
+        )
+        display_output([], mboot.status_code, ctx.obj["use_json"], ctx.obj["silent"])
+
+
+@trust_provisioning.command(name="prove_genuinity", no_args_is_help=True)
 @click.argument("address", type=INT())
 @click.argument("buffer_size", type=INT())
 @click.pass_context
@@ -1515,11 +1845,15 @@ def prove_genuinity(ctx: click.Context, address: int, buffer_size: int) -> None:
             [tp_response_length],
             mboot.status_code,
             use_json=ctx.obj["use_json"],
-            extra_output=f"TP response will be {tp_response_length} bytes long.",
+            extra_output=(
+                f"TP response will be {tp_response_length} bytes long."
+                if tp_response_length
+                else None
+            ),
         )
 
 
-@trust_provisioning.command(name="isp_set_wrap_data")
+@trust_provisioning.command(name="isp_set_wrap_data", no_args_is_help=True)
 @click.argument("address", type=INT())
 @click.argument("control", type=INT(), required=False, default=0x1)
 @click.argument("stage", type=INT(), required=False, default=0x4B)
@@ -1537,52 +1871,19 @@ def set_wrap_data(ctx: click.Context, address: int, control: int, stage: int) ->
         display_output(None, mboot.status_code, use_json=ctx.obj["use_json"])
 
 
-def display_output(
-    response: Optional[list] = None,
-    status_code: int = 0,
-    use_json: bool = False,
-    suppress: bool = False,
-    extra_output: Optional[str] = None,
-) -> None:
-    """Displays response and status code.
+@trust_provisioning.command(name="el2go_close_device", no_args_is_help=True)
+@click.argument("address", type=INT())
+@click.option("-d", "--dry-run", is_flag=True, default=False, help="Dry run mode")
+@click.pass_context
+def el2go_close_device(ctx: click.Context, address: int, dry_run: bool) -> None:
+    """Close the device using EdgeLock2Go TP Firmware.
 
-    :param response: Response from the MBoot function
-    :param status_code: MBoot status code
-    :param use_json: Format the output in JSON format, defaults to False
-    :param suppress: Suppress display
-    :param extra_output: Extra string to print out, defaults to None
-    :raises SPSDKAppError: Command is executed properly, how MBoot status code is non-zero
+    \b
+    ADDRESS - Address of the Secure Objects in target to provision
     """
-    if suppress:
-        pass
-    elif use_json:
-        data = {
-            # get the name of a caller function and replace _ with -
-            "command": inspect.stack()[1].function.replace("_", "-"),
-            # this is just a visualization thing
-            "response": response or [],
-            "status": {
-                "description": stringify_status_code(status_code),
-                "value": status_code,
-            },
-        }
-        print(json.dumps(data, indent=3))
-    else:
-        print(f"Response status = {stringify_status_code(status_code)}")
-        if isinstance(response, list):
-            filtered_response = filter(lambda x: x is not None, response)
-            for i, word in enumerate(filtered_response):
-                print(f"Response word {i + 1} = {word} ({word:#x})")
-        if extra_output:
-            print(extra_output)
-    # Force exit to handover the current status code.
-    # We could do that because this function is called as last from each subcommand
-    if status_code:
-        raise SPSDKAppError()
-
-
-# For backward compatibility
-decode_status_code = stringify_status_code
+    with McuBoot(ctx.obj["interface"]) as mboot:
+        response = mboot.el2go_close_device(address=address, dry_run=dry_run)
+        display_output([response], mboot.status_code, use_json=ctx.obj["use_json"])
 
 
 @catch_spsdk_error

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2020-2023 NXP
+# Copyright 2020-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -10,30 +10,61 @@
 import filecmp
 import os
 
-from click.testing import CliRunner
+import pytest
 
 from spsdk.apps import ifr
+from tests.cli_runner import CliRunner
 
 
-def test_ifr_user_config(tmpdir):
+@pytest.mark.parametrize(
+    "family, sector",
+    [
+        ("kw45xx", "ROMCFG"),
+        ("kw45xx", "CMACTable"),
+        ("k32w1xx", "ROMCFG"),
+        ("k32w1xx", "CMACTable"),
+    ],
+)
+def test_ifr_user_config(cli_runner: CliRunner, tmpdir, family, sector):
     """Test IF CLI - Generation IF user config."""
-    cmd = f"get-template -d kw45xx --output {tmpdir}/ifr.yml"
-    runner = CliRunner()
-    result = runner.invoke(ifr.main, cmd.split())
-    assert result.exit_code == 0, result.output
+    cmd = ["get-template", "-f", family, "--sector", sector, "--output", f"{tmpdir}/ifr.yml"]
+    cli_runner.invoke(ifr.main, cmd)
     assert os.path.isfile(f"{tmpdir}/ifr.yml")
 
 
-def test_roundtrip(data_dir, tmpdir):
-    parse_cmd = f"parse-binary -d kw45xx --binary {data_dir}/ref.bin --output {tmpdir}/ref.yaml"
-    runner = CliRunner()
-    result = runner.invoke(ifr.main, parse_cmd.split())
-    assert result.exit_code == 0
+def test_roundtrip_romcfg(cli_runner: CliRunner, data_dir, tmpdir):
+    parse_cmd = [
+        "parse-binary",
+        "-f",
+        "kw45xx",
+        "--binary",
+        f"{data_dir}/ref.bin",
+        "--output",
+        f"{tmpdir}/ref.yaml",
+    ]
+    cli_runner.invoke(ifr.main, parse_cmd)
 
-    generate_cmd = (
-        f"generate-binary -d kw45xx --user-config {tmpdir}/ref.yaml --output {tmpdir}/new.bin"
-    )
-    result = runner.invoke(ifr.main, generate_cmd.split())
-    assert result.exit_code == 0
+    generate_cmd = f"generate-binary -f kw45xx --config {tmpdir}/ref.yaml --output {tmpdir}/new.bin"
+    cli_runner.invoke(ifr.main, generate_cmd.split())
 
     assert filecmp.cmp(f"{data_dir}/ref.bin", f"{tmpdir}/new.bin")
+
+
+def test_roundtrip_cmac_table(cli_runner: CliRunner, data_dir, tmpdir):
+    parse_cmd = [
+        "parse-binary",
+        "-f",
+        "kw45xx",
+        "--sector",
+        "CMACTable",
+        "--binary",
+        f"{data_dir}/kw45cmac.bin",
+        "--output",
+        f"{tmpdir}/ref.yaml",
+    ]
+    cli_runner.invoke(ifr.main, parse_cmd)
+
+    generate_cmd = f"generate-binary -f kw45xx --config {tmpdir}/ref.yaml --output {tmpdir}/new.bin"
+    cli_runner.invoke(ifr.main, generate_cmd.split())
+
+    assert filecmp.cmp(f"{data_dir}/kw45cmac.bin", f"{tmpdir}/new.bin")

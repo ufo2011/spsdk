@@ -1,110 +1,433 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2022-2023 NXP
+# Copyright 2022-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
 """This module contains Bootable image related code."""
 
-import abc
-import inspect
+
 import logging
 import os
-import re
-import sys
-from copy import deepcopy
-from typing import Any, Dict, List, Optional, Type, Union
+from typing import Any, Optional, Union
 
-from spsdk.exceptions import SPSDKKeyError, SPSDKValueError
-from spsdk.image.bootable_image import BIMG_DATABASE_FILE, BIMG_SCH_FILE
-from spsdk.image.fcb.fcb import FCB
-from spsdk.image.header import UnparsedException
-from spsdk.image.images import BootImgRT
-from spsdk.image.segments import (
-    AbstractFCB,
-    FlexSPIConfBlockFCB,
-    PaddingFCB,
-    SegAPP,
-    SegBDT,
-    SegBEE,
-    SegCSF,
-    SegDCD,
-    SegIVT2,
-    SegXMCD,
-    XMCDHeader,
+from typing_extensions import Self
+
+from spsdk.exceptions import SPSDKError, SPSDKKeyError, SPSDKValueError, SPSDKVerificationError
+from spsdk.image.bootable_image.segments import (
+    BootableImageSegment,
+    Segment,
+    SPSDKSegmentNotPresent,
+    get_segment_class,
 )
-from spsdk.image.xmcd.xmcd import XMCD, ConfigurationBlockType, MemoryType
-from spsdk.utils.database import Database
+from spsdk.image.mem_type import MemoryType
+from spsdk.utils.abstract import BaseClass
+from spsdk.utils.database import DatabaseManager, get_db, get_families, get_schema_file
 from spsdk.utils.images import BinaryImage, BinaryPattern
-from spsdk.utils.misc import DebugInfo, find_first, load_binary, write_file
-from spsdk.utils.schema_validator import ConfigTemplate, ValidationSchemas, check_config
+from spsdk.utils.misc import align, write_file
+from spsdk.utils.schema_validator import (
+    CommentedConfig,
+    check_config,
+    update_validation_schema_family,
+)
+from spsdk.utils.verifier import Verifier, VerifierResult
 
 logger = logging.getLogger(__name__)
 
-BIMG_CLASSES = [
-    "BootableImageRtxxx",
-    "BootableImageLpc55s3x",
-    "BootableImageRt1xxx",
-    "BootableImageRt118x",
-]
 
-
-def get_bimg_class(family: str) -> Type["BootableImage"]:
-    """Get the class that supports the family.
-
-    :param family: Chip family
-    :return: Bootable Image class.
-    :raises SPSDKValueError: Invalid family.
-    """
-    for cls_name in BIMG_CLASSES:
-        cls: Type["BootableImage"] = getattr(sys.modules[__name__], cls_name)
-        if family in cls.get_supported_families():
-            return cls
-    raise SPSDKValueError(f"Unsupported family({family}) by Bootable Image.")
-
-
-class BootableImage:
+class BootableImage(BaseClass):
     """Bootable Image class."""
 
-    def __init__(self, family: str, mem_type: str, revision: str = "latest") -> None:
+    def __init__(
+        self,
+        family: str,
+        mem_type: MemoryType,
+        revision: str = "latest",
+        init_offset: Union[BootableImageSegment, int] = 0,
+    ) -> None:
         """Bootable Image constructor.
 
         :param family: Chip family.
         :param mem_type: Used memory type.
         :param revision: Chip silicon revision.
-        :raises SPSDKValueError: Invalid family.
         """
-        if family not in self.get_supported_families():
-            raise SPSDKValueError(f"Unsupported family: {family}")
+        if mem_type not in self.get_supported_memory_types(family, revision):
+            raise SPSDKValueError(f"Unsupported memory type: {mem_type.label}")
         self.family = family
-        self.revision = revision
         self.mem_type = mem_type
-        self.database = Database(BIMG_DATABASE_FILE)
-        self.mem_types: Dict = self.database.get_device_value("mem_types", family, revision)
-        if mem_type not in self.mem_types.keys():
-            raise SPSDKValueError(f"Unsupported memory type: {mem_type}")
-        self.bimg_descr: Dict = self.mem_types[self.mem_type]
+        self.revision = revision
+        bimg_descr: dict[str, Any] = self.get_memory_type_config(family, mem_type, revision)
+        self.image_pattern = bimg_descr.get("image_pattern", "zeros")
+        self._segments: list[Segment] = self._get_segments(family, mem_type, revision)
+        self._init_offset: int = 0
+        self.set_init_offset(init_offset)
+
+    @property
+    def segments(self) -> list[Segment]:
+        """List of used segments."""
+        return [seg for seg in self._segments if seg.is_present]
+
+    def set_init_offset(self, init_offset: Union[BootableImageSegment, int]) -> None:
+        """Set init offset by name of segment or length."""
+        if isinstance(init_offset, int):
+            self.init_offset = init_offset
+        else:
+            segment = next((seg for seg in self._segments if seg.NAME == init_offset), None)
+            if segment is None:
+                raise SPSDKError(f"Segment with name {init_offset.label} does not exist.")
+            self.init_offset = segment.full_image_offset
+
+    def get_segment(self, segment: Union[str, BootableImageSegment]) -> Segment:
+        """Get bootable segment by its name or Enum class.
+
+        :param segment: Name of enum class of segment.
+        :return: Segment.
+        """
+        name = segment if isinstance(segment, str) else segment.label
+        for seg in self.segments:
+            if seg.NAME == name:
+                return seg
+        raise SPSDKError(
+            f"The segment {segment} is not present in this Bootable image: {str(self)}"
+        )
+
+    @property
+    def init_offset(self) -> int:
+        """Initial offset compared to "full" bootable image.Only segments after this offset are considered."""
+        return self._init_offset
+
+    @init_offset.setter
+    def init_offset(self, offset: int) -> None:
+        """Initial offset setter."""
+        if offset < 0:
+            raise SPSDKValueError("Offset cannot be a negative number.")
+        # In case the init offset is 0, return the whole image
+        if offset == 0:
+            self._init_offset = 0
+        else:
+            # Find the closest upper offset
+            upper_offsets = [
+                seg.full_image_offset
+                for seg in self._segments
+                if seg.full_image_offset >= offset or seg.full_image_offset < 0
+            ]
+            if not upper_offsets:
+                raise SPSDKValueError(
+                    f"The given offset {offset} must be lower or equal to the start of last segment of the image."
+                )
+            self._init_offset = min(upper_offsets)
+        self._update_segments()
+
+    def _update_segments(self) -> None:
+        """Update segment indexes."""
+        for segment in self._segments:
+            full_offset = segment.full_image_offset
+            new_offset = full_offset - self.init_offset
+            segment.excluded = new_offset < 0 <= full_offset
+
+    def get_segment_offset(self, segment: Segment) -> int:
+        """Get segment offset.
+
+        :param segment: Segment object to get its offset
+        :return: Segment offset
+        """
+
+        def _get_segment_offset(segments: list[Segment], segment: Segment) -> int:
+            if segment.full_image_offset >= 0:
+                return segment.full_image_offset
+
+            # It should be dynamically computed
+            prev_seg: Optional[Segment] = None
+            for seg in segments:
+                if seg == segment:
+                    if prev_seg is None:
+                        raise SPSDKError(
+                            "Cannot get dynamically offset of segment because"
+                            " there is no any previous segment with static offset."
+                        )
+                    assert isinstance(prev_seg, Segment)  # oh dear mypy...
+                    return align(
+                        _get_segment_offset(segments, prev_seg) + len(prev_seg),
+                        segment.OFFSET_ALIGNMENT,
+                    )
+                prev_seg = seg
+            raise SPSDKError("Cannot get dynamically offset of segment.")
+
+        if segment.excluded:
+            raise SPSDKError(
+                f"The segment '{segment.NAME}' is not present in this Bootable image: {str(self)}."
+            )
+        return _get_segment_offset(self._segments, segment) - self._init_offset
+
+    def __len__(self) -> int:
+        """Length of output binary."""
+        last_segment = self.segments[-1]
+        return self.get_segment_offset(last_segment) + len(last_segment)
+
+    @property
+    def header_len(self) -> int:
+        """Length of the header.
+
+        The length of the space before application data.
+        :return: Length of the bootable image area.
+        """
+        for segment in self.segments:
+            if not segment.BOOT_HEADER:
+                return self.get_segment_offset(segment)
+        raise SPSDKError("Cannot determine the size of bootable image header")
+
+    @property
+    def bootable_header_only(self) -> bool:
+        """The image contains only bootable image header.
+
+        No application is available.
+        """
+        return any(((not x.BOOT_HEADER and len(x) == 0) for x in self.segments))
+
+    def _parse(self, binary: bytes) -> None:
+        try:
+            prev_offset = prev_size = 0
+            for segment in [seg for seg in self._segments if not seg.excluded]:
+                offset = self.get_segment_offset(segment)
+                # cover the case with variable offset
+                if segment.full_image_offset < 0:
+                    start_offset = align(prev_offset + prev_size, segment.OFFSET_ALIGNMENT)
+                    if start_offset >= len(binary):
+                        continue
+                    offset = start_offset + segment.find_segment_offset(binary[start_offset:])
+                if len(binary) <= offset and segment.BOOT_HEADER:
+                    raise SPSDKError("Insufficient length of input binary.")
+                logger.debug(f"Trying to parse segment {segment.NAME} at offset 0x{offset:08X}.")
+                try:
+                    segment.parse_binary(binary[offset:])
+                except SPSDKSegmentNotPresent:
+                    segment.clear()
+                    continue
+                prev_offset = offset
+                prev_size = len(segment)
+            return
+        except SPSDKError as e:
+            logger.debug(f"Parsing of the segment '{segment.NAME}' failed: {e}")
+            raise
 
     @classmethod
-    def load_from_config(
-        cls, config: Dict, search_paths: Optional[List[str]] = None
-    ) -> "BootableImage":
-        """Load bootable image from configuration.
+    def _parse_all(
+        cls,
+        binary: bytes,
+        family: Optional[str] = None,
+        mem_type: Optional[MemoryType] = None,
+        revision: str = "latest",
+        no_errors: bool = True,
+    ) -> list[Self]:
+        """Parse binary into bootable image object.
 
-        :param config: Configuration of Bootable image.
-        :param search_paths: List of paths where to search for the file, defaults to None
+        :param binary: Bootable image binary.
+        :param family: Chip family.
+        :param mem_type: Used memory type.
+        :param revision: Chip silicon revision.
+        :param no_errors: Do not accept any parsing errors.
         """
-        check_config(config, cls.get_validation_schemas_family())
-        bimg_cls = get_bimg_class(config["family"])
-        return bimg_cls.load_from_config(config, search_paths=search_paths)
+        if not family:
+            raise SPSDKValueError("Family attribute must be specified.")
+        mem_types = [mem_type] if mem_type else cls.get_supported_memory_types(family, revision)
+        mem_types_str = ",".join([f"'{mem_type.description}'" for mem_type in mem_types])
+        logger.debug(f"Parsing of bootable image for memory type(s): {mem_types_str}")
+        bimg_instances: list[Self] = []
+        # first try to find the exact match as it is a full bootable image
+        for memory_type in mem_types:
+            logger.debug(
+                f"Parsing the image for memory type '{memory_type.description}' finding the exact match"
+            )
+            try:
+                bimg = cls(family, memory_type, revision)
+                bimg._parse(binary)
+                if no_errors:
+                    bimg.verify().validate()
+                bimg_instances.append(bimg)
+            except SPSDKError as e:
+                logger.debug(e)
+                continue
+        # try to parse bootable image with moving initial offset
+        if not bimg_instances:
+            logger.debug("The exact match has not been found")
+            for memory_type in mem_types:
+                segments = cls._get_segments(family, memory_type, revision)
+                init_offsets = [seg.full_image_offset for seg in segments if seg.INIT_SEGMENT]
+                for init_offset in init_offsets:
+                    logger.debug(
+                        f"Parsing the image for memory type '{memory_type.description}' "
+                        f"with init offset 0x{init_offset:08X}"
+                    )
+                    try:
+                        bimg = cls(family, memory_type, revision, init_offset)
+                        bimg._parse(binary)
+                        if no_errors:
+                            bimg.verify().validate()
+                        bimg_instances.append(bimg)
+                    except SPSDKError as e:
+                        logger.debug(e)
+                        continue
 
-    @abc.abstractmethod
+        return bimg_instances
+
+    @classmethod
+    def parse(
+        cls,
+        binary: bytes,
+        family: Optional[str] = None,
+        mem_type: Optional[MemoryType] = None,
+        revision: str = "latest",
+    ) -> Self:
+        """Parse binary into bootable image object.
+
+        :param binary: Bootable image binary.
+        :param family: Chip family.
+        :param mem_type: Used memory type.
+        :param revision: Chip silicon revision.
+        """
+        bimg_instances = cls._parse_all(
+            binary=binary, family=family, mem_type=mem_type, revision=revision
+        )
+
+        if not bimg_instances:
+            raise SPSDKError(
+                "The image parsing failed. The image is not matching any of memory types."
+            )
+        if len(bimg_instances) > 1:
+            mem_types_str = ", ".join(f'"{img.mem_type.description}"' for img in bimg_instances)
+            logger.warning(
+                f"Multiple possible memory types detected: {mem_types_str}."
+                f'The "{bimg_instances[0].mem_type.description}" memory type will be used.'
+            )
+        return bimg_instances[0]
+
+    def __repr__(self) -> str:
+        """Text short representation about the BootableImage."""
+        return f"BootableImage, family:{self.family}, mem_type:{self.mem_type.description}"
+
+    def __str__(self) -> str:
+        """Text information about the BootableImage."""
+        nfo = "BootableImage\n"
+        nfo += f"  Family:      {self.family}\n"
+        nfo += f"  Revision:    {self.revision}\n"
+        nfo += f"  Memory Type: {self.mem_type.description}\n"
+        if self.segments:
+            nfo += "  Segments:\n"
+        for segment in self.segments:
+            nfo += f"      {segment}\n"
+        return nfo
+
+    @staticmethod
+    def get_validation_schemas(
+        family: str, mem_type: MemoryType, revision: str = "latest"
+    ) -> list[dict[str, Any]]:
+        """Get validation schema for the family.
+
+        :param family: Chip family
+        :param mem_type: Used memory type.
+        :param revision: Chip revision specification, as default, latest is used.
+        :return: List of validation schema dictionaries.
+        """
+        bimg = BootableImage(family=family, mem_type=mem_type, revision=revision)
+        sch_cfg = get_schema_file(DatabaseManager.BOOTABLE_IMAGE)
+        sch_family = get_schema_file("general")["family"]
+        update_validation_schema_family(
+            sch_family["properties"], bimg.get_supported_families(), family, revision
+        )
+        sch_cfg["memory_type"]["properties"]["memory_type"]["template_value"] = mem_type.label
+        schemas = [sch_family, sch_cfg["memory_type"], sch_cfg["init_offset"]]
+        for segment in bimg._segments:
+            try:
+                sch_name = sch_cfg[segment.NAME.label]
+            except KeyError:
+                logger.error(f"Cannot find schema for segment {segment.NAME}")
+                continue
+            schemas.append(sch_name)
+        return schemas
+
     def store_config(self, output: str) -> None:
         """Store bootable image into configuration and binary blocks.
 
         :param output: Path to output folder to store bootable image configuration.
         """
+        schemas = self.get_validation_schemas(self.family, self.mem_type, self.revision)
+        config: dict[str, Union[str, int]] = {}
+        config["family"] = self.family
+        config["revision"] = self.revision
+        config["memory_type"] = self.mem_type.label
+        config["init_offset"] = self.init_offset
+        for segment in self._segments:
+            config[segment.cfg_key()] = segment.create_config(output)
+
+        yaml = CommentedConfig(
+            f"Bootable Image Configuration for {self.family}.", schemas
+        ).get_config(config)
+
+        write_file(
+            yaml,
+            os.path.join(output, f"bootable_image_{self.family}_{self.mem_type.label}.yaml"),
+        )
+
+    @staticmethod
+    def load_from_config(config: dict, search_paths: Optional[list[str]] = None) -> "BootableImage":
+        """Load bootable image from configuration.
+
+        :param config: Configuration of Bootable image.
+        :param search_paths: List of paths where to search for the file, defaults to None
+        """
+        check_config(config, BootableImage.get_validation_schemas_family())
+        family = config["family"]
+        mem_type = MemoryType.from_label(config["memory_type"])
+        revision = config.get("revision", "latest")
+        init_offset = config.get("init_offset", 0)
+        init_offset = (
+            BootableImageSegment.from_label(init_offset)
+            if isinstance(init_offset, str)
+            else init_offset
+        )
+        bimg = BootableImage(
+            family=family, mem_type=mem_type, revision=revision, init_offset=init_offset
+        )
+        schemas = bimg.get_validation_schemas(family, mem_type, revision)
+        check_config(config, schemas, search_paths=search_paths)
+
+        for segment in bimg._segments:
+            try:
+                segment.load_config(config, search_paths)
+            except SPSDKSegmentNotPresent:
+                segment.clear()
+                continue
+
+        return bimg
+
+    def image_info(self) -> BinaryImage:
+        """Create Binary image of bootable image.
+
+        :return: BinaryImage object of bootable image.
+        """
+        description = f"Memory type: {self.mem_type}\nRevision: {self.revision}"
+        if self.bootable_header_only:
+            description += ". This is bootable image header only, no application is included"
+        bin_image = BinaryImage(
+            name=f"Bootable Image for {self.family}",
+            size=len(self),
+            pattern=BinaryPattern(self.image_pattern),
+            description=description,
+        )
+        prev_offset = prev_size = 0
+        if self.init_offset:
+            logger.info(f"The image is not complete. Staring from offset {self.init_offset}")
+        for segment in self.segments:
+            seg_offset = segment.full_image_offset
+            if segment.full_image_offset < 0:
+                seg_offset = align(prev_offset + prev_size, segment.OFFSET_ALIGNMENT)
+            img_info = segment.image_info()
+            img_info.offset = self.get_segment_offset(segment)
+            bin_image.add_image(img_info)
+            prev_size = len(segment)
+            prev_offset = seg_offset
+        return bin_image
 
     def export(self) -> bytes:
         """Export bootable image.
@@ -113,47 +436,116 @@ class BootableImage:
         """
         return self.image_info().export()
 
-    @abc.abstractmethod
-    def parse(self, binary: bytes) -> None:
-        """Parse binary into bootable image object.
+    @staticmethod
+    def pre_parse_verify(
+        data: bytes,
+        family: str,
+        mem_type: MemoryType,
+        revision: str = "latest",
+    ) -> Verifier:
+        """Pre-Parse binary T osee main issue before parsing.
 
-        :param binary: Complete binary of bootable image.
+        :param data: Bootable image binary.
+        :param family: Chip family.
+        :param mem_type: Used memory type.
+        :param revision: Chip silicon revision.
+        :return: Verifier object of preparsed data.
         """
 
-    @abc.abstractmethod
-    def image_info(self) -> BinaryImage:
-        """Create Binary image of bootable image.
+        def check_segments(bimg_obj: BootableImage, name: str) -> Verifier:
+            ret = Verifier(f"Pre-parsed Bootable Image at offset {hex(bimg_obj.init_offset)}")
+            all_ret.add_child(ret, name)
 
-        :return: BinaryImage object of bootable image.
+            prev_offset = prev_size = 0
+            for segment in [seg for seg in bimg_obj._segments if not seg.excluded]:
+                offset = bimg_obj.get_segment_offset(segment)
+                # cover the case with variable offset
+                if segment.full_image_offset < 0:
+                    start_offset = align(prev_offset + prev_size, segment.OFFSET_ALIGNMENT)
+                    if start_offset >= len(data):
+                        continue
+                    offset = start_offset + segment.find_segment_offset(data[start_offset:])
+                if len(data) <= offset and segment.BOOT_HEADER:
+                    ret.add_record(
+                        "Length", VerifierResult.ERROR, "Insufficient length of input binary."
+                    )
+                    return ret
+                try:
+                    ret.add_child(segment.pre_parse_verify(data[offset:]))
+                    ret.validate()
+                except SPSDKVerificationError:
+                    return ret
+                prev_offset = offset
+                prev_size = len(segment)
+            return ret
+
+        all_ret = Verifier("Pre-parsed Bootable Images")
+        bimg = BootableImage(family, mem_type, revision, 0)
+        # check full image
+        full_ver = check_segments(bimg, "Whole Image pre-parse verification")
+        if not full_ver.has_errors:
+            return full_ver
+
+        init_segments = [seg for seg in bimg._segments if seg.INIT_SEGMENT]
+        for init_segment in init_segments:
+            bimg = BootableImage(family, mem_type, revision, init_segment.full_image_offset)
+            seg_ver = check_segments(bimg, f"Starting from {init_segment.NAME.label} segment")
+            if not seg_ver.has_errors:
+                return seg_ver
+        # in this case, everything fails, return information about all fails
+        return all_ret
+
+    def verify(self) -> Verifier:
+        """Get verifier object of segment.
+
+        :return: Verifier of current object.
         """
+        ret = Verifier(
+            f"Bootable Image of {self.family} rev:{self.revision} for {self.mem_type} memory type"
+        )
+        ret.add_record_range("Header length", self.header_len)
+        ret.add_record_range("Initial offset", self.init_offset)
+
+        for seg in self._segments:
+            seg_ver = Verifier(f"Segment {seg.NAME}")
+            if seg.excluded:
+                seg_ver.add_record(
+                    "Availability", VerifierResult.WARNING, "The segment is excluded"
+                )
+            else:
+                seg_ver.add_record_range("Offset in image", self.get_segment_offset(seg))
+                seg_ver.add_child(seg.verify())
+
+            ret.add_child(seg_ver)
+
+        image_info = self.image_info()
+        try:
+            image_info.validate()
+            val = "Valid"
+            if logger.getEffectiveLevel() <= logging.INFO:
+                val = image_info.draw()
+            ret.add_record("Binary structure", VerifierResult.SUCCEEDED, val, raw=True)
+        except SPSDKError:
+            ret.add_record("Binary structure", VerifierResult.ERROR, image_info.draw(), raw=True)
+        return ret
 
     @staticmethod
-    def get_validation_schemas_family() -> List[Dict[str, Any]]:
+    def get_validation_schemas_family() -> list[dict[str, Any]]:
         """Create the validation schema just for supported families.
 
         :return: List of validation schemas for Bootable Image supported families.
         """
-        sch_cfg = ValidationSchemas.get_schema_file(BIMG_SCH_FILE)
-        return [sch_cfg["family_rev"]]
+        sch_family = get_schema_file("general")["family"]
+        update_validation_schema_family(
+            sch_family["properties"], BootableImage.get_supported_families()
+        )
+        sch_cfg = get_schema_file(DatabaseManager.BOOTABLE_IMAGE)
+        return [sch_family, sch_cfg["memory_type"]]
 
-    def _get_validation_schemas(self) -> List[Dict[str, Any]]:
-        """Get validation schema.
-
-        :return: List of validation schema dictionaries.
-        """
-        return self.get_validation_schemas(self.family)
-
-    @staticmethod
-    def get_validation_schemas(family: str) -> List[Dict[str, Any]]:
-        """Get validation schema for the family.
-
-        :param family: Chip family
-        :return: List of validation schema dictionaries.
-        """
-        return get_bimg_class(family).get_validation_schemas(family)
-
-    @staticmethod
-    def generate_config_template(family: str, mem_type: str, revision: str = "latest") -> str:
+    @classmethod
+    def generate_config_template(
+        cls, family: str, mem_type: MemoryType, revision: str = "latest"
+    ) -> str:
         """Get validation schema for the family.
 
         :param family: Chip family
@@ -161,1288 +553,92 @@ class BootableImage:
         :param revision: Chip revision specification, as default, latest is used.
         :return: Validation schema.
         """
-        schemas = BootableImage.get_validation_schemas(family)
-        override = {}
-        override["family"] = family
-        override["revision"] = revision
-        override["memory_type"] = mem_type
-
-        return ConfigTemplate(
-            f"Bootable Image Configuration template for {family}.",
+        schemas = cls.get_validation_schemas(family, mem_type, revision)
+        try:
+            note = get_db(family, revision=revision).get_str(
+                DatabaseManager.BOOTABLE_IMAGE, ["mem_types", mem_type.label, "note"]
+            )
+        except SPSDKError:
+            note = None
+        return CommentedConfig(
+            f"Bootable Image Configuration template for {family} / {mem_type.description}.",
             schemas,
-            override,
-        ).export_to_yaml()
+            note=note,
+        ).get_template()
 
-    @staticmethod
-    def get_supported_families() -> List[str]:
+    @classmethod
+    def get_supported_families(cls) -> list[str]:
         """Get list of all supported families by bootable image.
 
         :return: List of families.
         """
-        return Database(BIMG_DATABASE_FILE).devices.device_names
+        return get_families(DatabaseManager.BOOTABLE_IMAGE)
 
-    @staticmethod
-    def get_supported_memory_types(family: str, revision: str = "latest") -> List[str]:
+    @classmethod
+    def get_supported_memory_types(
+        cls, family: Optional[str] = None, revision: str = "latest"
+    ) -> list[MemoryType]:
         """Return list of supported memory types.
 
         :return: List of supported families.
         """
-        database = Database(BIMG_DATABASE_FILE)
-        return list(database.get_device_value("mem_types", family, revision).keys())
+        if family:
+            database = get_db(family, revision)
+            return [
+                MemoryType.from_label(memory)
+                for memory in database.get_dict(DatabaseManager.BOOTABLE_IMAGE, "mem_types").keys()
+            ]
+
+        return [
+            MemoryType.from_label(memory)
+            for memory in DatabaseManager().quick_info.features_data.get_mem_types(
+                DatabaseManager.BOOTABLE_IMAGE
+            )
+        ]
 
     @staticmethod
-    def get_supported_revisions(family: str) -> List[str]:
+    def get_memory_type_config(
+        family: str, mem_type: MemoryType, revision: str = "latest"
+    ) -> dict[str, Any]:
+        """Return dictionary with configuration for specific memory type.
+
+        :param family: Chip family name.
+        :param mem_type: CHip memory type to handle bootable area.
+        :param revision: Revision of chip.
+        :raises SPSDKKeyError: If memory type does not exist in database
+        :return: Dictionary with configuration.
+        """
+        if mem_type not in BootableImage.get_supported_memory_types(family):
+            raise SPSDKKeyError(f"Memory type not supported: {mem_type.description}")
+        database = get_db(family, revision)
+        mem_types = database.get_dict(DatabaseManager.BOOTABLE_IMAGE, "mem_types")
+        return mem_types[mem_type.label]
+
+    @staticmethod
+    def _get_segments(family: str, mem_type: MemoryType, revision: str = "latest") -> list[Segment]:
+        """Return list of used segments for specific memory type.
+
+        :param family: Chip family name.
+        :param mem_type: CHip memory type to handle bootable area.
+        :param revision: Revision of chip.
+        :return: List of segments for choose chip and memory type.
+        """
+        bimg_descr = BootableImage.get_memory_type_config(
+            family=family, mem_type=mem_type, revision=revision
+        )
+        segments: list[Segment] = []
+        for segment_name, segment_offset in bimg_descr["segments"].items():
+            segments.append(
+                get_segment_class(BootableImageSegment.from_label(segment_name))(
+                    offset=segment_offset, family=family, mem_type=mem_type, revision=revision
+                )
+            )
+        return segments
+
+    @staticmethod
+    def get_supported_revisions(family: str) -> list[str]:
         """Return list of supported revisions.
 
         :return: List of supported revisions.
         """
-        database = Database(BIMG_DATABASE_FILE)
-        revisions = ["latest"]
-        revisions.extend(database.devices.get_by_name(family).revisions.revision_names)
-        return revisions
-
-    @classmethod
-    def _load_bin_from_config(
-        cls, config: Dict, config_key: str, search_paths: Optional[List[str]] = None
-    ) -> Optional[bytes]:
-        """Load the binary defined in condig file."""
-        bin_path = config.get(config_key)
-        if not bin_path or bin_path == "":
-            return None
-        return load_binary(bin_path, search_paths=search_paths)
-
-
-class BootableImageRtxxx(BootableImage):
-    """Bootable Image class for RTxxx devices."""
-
-    def __init__(
-        self,
-        family: str,
-        mem_type: str,
-        revision: str = "latest",
-        keyblob: Optional[bytes] = None,
-        fcb: Optional[bytes] = None,
-        image_version: int = 0,
-        keystore: Optional[bytes] = None,
-        app: Optional[bytes] = None,
-    ) -> None:
-        """Bootable Image constructor for RTxxx devices.
-
-        :param keyblob: Key Blob block, defaults to None
-        :param fcb: FCB block, defaults to None
-        :param image_version: Image version number, defaults to 0
-        :param keystore: Key store block, defaults to None
-        :param app: Application block, defaults to None
-        """
-        super().__init__(family, mem_type, revision)
-        self.keyblob = keyblob
-        self.fcb = None
-        if fcb:
-            self.fcb = FCB(self.family, self.mem_type, self.revision)
-            self.fcb.parse(fcb)
-
-        self.image_version = image_version
-        self.keystore = keystore
-        self.app = app
-
-    @staticmethod
-    def get_validation_schemas(family: str, revision: str = "latest") -> List[Dict[str, Any]]:
-        """Get validation schema for the family.
-
-        :param family: Chip family
-        :param revision: Chip revision specification, as default, latest is used.
-        :return: List of validation schema dictionaries.
-        """
-        sch_cfg = deepcopy(ValidationSchemas.get_schema_file(BIMG_SCH_FILE))
-        sch_cfg["family_rev"]["properties"]["family"][
-            "enum"
-        ] = BootableImageRtxxx.get_supported_families()
-        sch_cfg["family_rev"]["properties"]["revision"][
-            "enum"
-        ] = BootableImageRtxxx.get_supported_revisions(family)
-        sch_cfg["family_rev"]["properties"]["memory_type"][
-            "enum"
-        ] = BootableImageRtxxx.get_supported_memory_types(family, revision)
-        sch_cfg["keyblob"]["properties"]["keyblob"][
-            "template_title"
-        ] = "Bootable Image blocks definition"
-        ret = []
-        for item in ["family_rev", "keyblob", "fcb", "image_version", "keystore", "application"]:
-            ret.append(sch_cfg[item])
-        return ret
-
-    def image_info(self) -> BinaryImage:
-        """Create Binary image of bootable image.
-
-        :return: BinaryImage object of bootable image.
-        """
-        bin_image = BinaryImage(
-            name=f"Bootable Image for {self.family}", size=0, pattern=BinaryPattern("zeros")
-        )
-        if self.keyblob:
-            bin_image.add_image(
-                BinaryImage(
-                    name="Key Blob",
-                    size=self.bimg_descr["keyblob_len"],
-                    offset=self.bimg_descr["keyblob_offset"],
-                    binary=self.keyblob,
-                    parent=bin_image,
-                )
-            )
-        if self.fcb:
-            bin_image.add_image(
-                BinaryImage(
-                    name="FCB",
-                    size=self.bimg_descr["fcb_len"],
-                    offset=self.bimg_descr["fcb_offset"],
-                    binary=self.fcb.export(),
-                    parent=bin_image,
-                )
-            )
-        if self.image_version:
-            bin_image.add_image(
-                BinaryImage(
-                    name="Image version",
-                    size=self.bimg_descr["image_version_len"],
-                    offset=self.bimg_descr["image_version_offset"],
-                    description=f"Image version is {self.image_version}",
-                    binary=self.image_version.to_bytes(4, "little"),
-                    parent=bin_image,
-                )
-            )
-        if self.keystore:
-            bin_image.add_image(
-                BinaryImage(
-                    name="Key Store",
-                    size=self.bimg_descr["keystore_len"],
-                    offset=self.bimg_descr["keystore_offset"],
-                    binary=self.keystore,
-                    parent=bin_image,
-                )
-            )
-        if self.app:
-            bin_image.add_image(
-                BinaryImage(
-                    name="Application",
-                    offset=self.bimg_descr["application_offset"],
-                    binary=self.app,
-                    parent=bin_image,
-                )
-            )
-
-        return bin_image
-
-    @classmethod
-    def load_from_config(
-        cls, config: Dict, search_paths: Optional[List[str]] = None
-    ) -> "BootableImageRtxxx":
-        """Load bootable image from configuration.
-
-        :param config: Configuration of Bootable image.
-        :param search_paths: List of paths where to search for the file, defaults to None
-        """
-        check_config(config, cls.get_validation_schemas_family())
-        chip_family = config["family"]
-        mem_type = config["memory_type"]
-        revision = config.get("revision", "latest")
-        schemas = cls.get_validation_schemas(chip_family, revision)
-        check_config(config, schemas, search_paths=search_paths)
-        keyblob_path = config.get("keyblob")
-        fcb_path = config.get("fcb")
-        image_version = config.get("image_version", 0)
-        keystore_path = config.get("keystore")
-        app_path = config.get("application")
-        keyblob = load_binary(keyblob_path, search_paths=search_paths) if keyblob_path else None
-        fcb = load_binary(fcb_path, search_paths=search_paths) if fcb_path else None
-        keystore = load_binary(keystore_path, search_paths=search_paths) if keystore_path else None
-        app = load_binary(app_path, search_paths=search_paths) if app_path else None
-
-        return BootableImageRtxxx(
-            family=chip_family,
-            mem_type=mem_type,
-            revision=revision,
-            keyblob=keyblob,
-            fcb=fcb,
-            image_version=image_version,
-            keystore=keystore,
-            app=app,
-        )
-
-    def parse(self, binary: bytes) -> None:
-        """Parse binary into bootable image object.
-
-        :param binary: Complete binary of bootable image.
-        """
-        # first of all we need to identify where the image starts.
-        # That could be determined by FCB block that start at zero offset
-        # as some compilers do that, otherwise we assume standard start at zero offset
-        start_block_offset = 0
-        if binary[:4] == FlexSPIConfBlockFCB.TAG:
-            start_block_offset = self.bimg_descr["fcb_offset"]
-
-        # KeyBlob
-        if start_block_offset == 0:
-            offset = self.bimg_descr["keyblob_offset"]
-            size = self.bimg_descr["keyblob_len"]
-            self.keyblob = binary[offset : offset + size]
-        else:
-            self.keyblob = None
-        # FCB
-        offset = self.bimg_descr["fcb_offset"] - start_block_offset
-        size = self.bimg_descr["fcb_len"]
-        self.fcb = FCB(self.family, self.mem_type, self.revision)
-        self.fcb.parse(binary[offset : offset + size])
-        # Image version
-        offset = self.bimg_descr["image_version_offset"] - start_block_offset
-        size = self.bimg_descr["image_version_len"]
-        self.image_version = int.from_bytes(binary[offset : offset + size], "little")
-        # KeyStore
-        offset = self.bimg_descr["keystore_offset"] - start_block_offset
-        size = self.bimg_descr["keystore_len"]
-        self.keystore = binary[offset : offset + size]
-        # application
-        offset = self.bimg_descr["application_offset"] - start_block_offset
-        self.app = binary[offset:]
-
-    def store_config(self, output: str) -> None:
-        """Store bootable image into configuration and binary blocks.
-
-        :param output: Path to output folder to store bootable image configuration.
-        """
-        schemas = self._get_validation_schemas()
-        override: Dict[str, Union[str, int]] = {}
-        override["family"] = self.family
-        override["revision"] = self.revision
-        override["memory_type"] = self.mem_type
-        override["image_version"] = self.image_version
-        override["keyblob"] = "keyblob.bin" if self.keyblob else ""
-        override["fcb"] = "fcb.bin" if self.fcb else ""
-        override["keystore"] = "keystore.bin" if self.keystore else ""
-        override["application"] = "application.bin" if self.app else ""
-        config = ConfigTemplate(
-            f"Bootable Image Configuration for {self.family}.",
-            schemas,
-            override,
-        ).export_to_yaml()
-        write_file(
-            config,
-            os.path.join(output, f"bootable_image_{self.family}_{self.mem_type}.yaml"),
-        )
-        if self.keyblob:
-            write_file(self.keyblob, os.path.join(output, "keyblob.bin"), mode="wb")
-        if self.fcb:
-            write_file(self.fcb.export(), os.path.join(output, "fcb.bin"), mode="wb")
-            write_file(self.fcb.create_config(), os.path.join(output, "fcb.yaml"))
-        if self.keystore:
-            write_file(self.keystore, os.path.join(output, "keystore.bin"), mode="wb")
-        if self.app:
-            write_file(self.app, os.path.join(output, "application.bin"), mode="wb")
-
-    @staticmethod
-    def get_supported_families() -> List[str]:
-        """Get list of all supported families by bootable image.
-
-        :return: List of families.
-        """
-        full_list = BootableImage.get_supported_families()
-        # filter out just RTxxx
-        return [x for x in full_list if re.match(r"[rR][tT][\dxX]{3}$", x)]
-
-
-class BootableImageLpc55s3x(BootableImage):
-    """Bootable Image class for LPC55S3x devices."""
-
-    def __init__(
-        self,
-        family: str,
-        mem_type: str = "flexspi_nor",
-        revision: str = "latest",
-        fcb: Optional[bytes] = None,
-        image_version: int = 0,
-        app: Optional[bytes] = None,
-    ) -> None:
-        """Bootable Image constructor for Lpc55s3x devices.
-
-        :param mem_type: Used memory type.
-        :param fcb: FCB block, defaults to None
-        :param image_version: Image version number, defaults to 0
-        :param app: Application block, defaults to None
-        """
-        assert mem_type == "flexspi_nor"
-        super().__init__(family, mem_type, revision)
-        self.fcb = None
-        if fcb:
-            self.fcb = FCB(self.family, self.mem_type, self.revision)
-            self.fcb.parse(fcb)
-
-        self.image_version = image_version
-        self.app = app
-
-    @staticmethod
-    def get_validation_schemas(family: str, revision: str = "latest") -> List[Dict[str, Any]]:
-        """Get validation schema for the family.
-
-        :param family: Chip family
-        :param revision: Chip revision specification, as default, latest is used.
-        :return: List of validation schema dictionaries.
-        """
-        ret = []
-        sch_cfg = deepcopy(ValidationSchemas.get_schema_file(BIMG_SCH_FILE))
-        sch_cfg["family_rev"]["properties"]["family"][
-            "enum"
-        ] = BootableImageLpc55s3x.get_supported_families()
-        revisions = ["latest"]
-        revisions_device = BootableImageLpc55s3x.get_supported_revisions(family)
-        revisions.extend(revisions_device)
-        sch_cfg["family_rev"]["properties"]["revision"]["enum"] = revisions
-        mem_types = BootableImageLpc55s3x.get_supported_memory_types(family, revision)
-        sch_cfg["family_rev"]["properties"]["memory_type"]["enum"] = mem_types
-
-        ret.append(sch_cfg["family_rev"])
-        ret.append(sch_cfg["fcb"])
-        ret.append(sch_cfg["image_version"])
-        ret.append(sch_cfg["application"])
-        return ret
-
-    def image_info(self) -> BinaryImage:
-        """Create Binary image of bootable image.
-
-        :return: BinaryImage object of bootable image.
-        """
-        bin_image = BinaryImage(
-            name=f"Bootable Image for {self.family}", size=0, pattern=BinaryPattern("ones")
-        )
-        if self.fcb:
-            bin_image.add_image(
-                BinaryImage(
-                    name="FCB",
-                    size=self.bimg_descr["fcb_len"],
-                    offset=self.bimg_descr["fcb_offset"],
-                    binary=self.fcb.export(),
-                    parent=bin_image,
-                )
-            )
-        if self.image_version:
-            data = self.image_version & 0xFFFF
-            data |= (data ^ 0xFFFF) << 16
-            bin_image.add_image(
-                BinaryImage(
-                    name="Image version",
-                    size=self.bimg_descr["image_version_len"],
-                    offset=self.bimg_descr["image_version_offset"],
-                    description=f"Image version is {self.image_version}",
-                    binary=data.to_bytes(4, "little"),
-                    parent=bin_image,
-                )
-            )
-        if self.app:
-            bin_image.add_image(
-                BinaryImage(
-                    name="Application",
-                    offset=self.bimg_descr["application_offset"],
-                    binary=self.app,
-                    parent=bin_image,
-                )
-            )
-
-        return bin_image
-
-    @classmethod
-    def load_from_config(
-        cls, config: Dict, search_paths: Optional[List[str]] = None
-    ) -> "BootableImageLpc55s3x":
-        """Load bootable image from configuration.
-
-        :param config: Configuration of Bootable image.
-        :param search_paths: List of paths where to search for the file, defaults to None
-        """
-        check_config(config, cls.get_validation_schemas_family())
-        chip_family = config["family"]
-        revision = config.get("revision", "latest")
-        schemas = cls.get_validation_schemas(chip_family, revision)
-        check_config(config, schemas, search_paths=search_paths)
-        fcb_path = config.get("fcb")
-        image_version = config.get("image_version", 0)
-        app_path = config.get("application")
-        fcb = load_binary(fcb_path, search_paths=search_paths) if fcb_path else None
-        app = load_binary(app_path, search_paths=search_paths) if app_path else None
-
-        return BootableImageLpc55s3x(
-            family=chip_family,
-            revision=revision,
-            fcb=fcb,
-            image_version=image_version,
-            app=app,
-        )
-
-    def parse(self, binary: bytes) -> None:
-        """Parse binary into bootable image object.
-
-        :param binary: Complete binary of bootable image.
-        :raises SPSDKValueError: In case of invalid SW image version.
-        """
-        # first of all we need to identify where the image starts.
-        # That could be determined by FCB block that start at zero offset
-        # as some compilers do that, otherwise we assume standard start at zero offset
-        start_block_offset = 0
-        if binary[:4] == FlexSPIConfBlockFCB.TAG:
-            start_block_offset = self.bimg_descr["fcb_offset"]
-
-        # FCB
-        offset = self.bimg_descr["fcb_offset"] - start_block_offset
-        size = self.bimg_descr["fcb_len"]
-        self.fcb = FCB(self.family, self.mem_type, self.revision)
-        self.fcb.parse(binary[offset : offset + size])
-        # Image version
-        offset = self.bimg_descr["image_version_offset"] - start_block_offset
-        size = self.bimg_descr["image_version_len"]
-        image_version = int.from_bytes(binary[offset : offset + size], "little")
-        if image_version != 0xFFFFFFFF and (
-            image_version & 0xFFFF != ((image_version >> 16) ^ 0xFFFF) & 0xFFFF
-        ):
-            raise SPSDKValueError("Invalid Image version loaded during parse of bootable image.")
-        self.image_version = image_version & 0xFFFF
-        # application
-        offset = self.bimg_descr["application_offset"] - start_block_offset
-        self.app = binary[offset:]
-
-    def store_config(self, output: str) -> None:
-        """Store bootable image into configuration and binary blocks.
-
-        :param output: Path to output folder to store bootable image configuration.
-        """
-        schemas = self._get_validation_schemas()
-        override: Dict[str, Union[str, int]] = {}
-        override["family"] = self.family
-        override["revision"] = self.revision
-        override["memory_type"] = self.mem_type
-        override["image_version"] = self.image_version
-        override["fcb"] = "fcb.bin" if self.fcb else ""
-        override["application"] = "application.bin" if self.app else ""
-        config = ConfigTemplate(
-            f"Bootable Image Configuration for {self.family}.",
-            schemas,
-            override,
-        ).export_to_yaml()
-        write_file(
-            config,
-            os.path.join(output, f"bootable_image_{self.family}_{self.mem_type}.yaml"),
-        )
-        if self.fcb:
-            write_file(self.fcb.export(), os.path.join(output, "fcb.bin"), mode="wb")
-            write_file(self.fcb.create_config(), os.path.join(output, "fcb.yaml"))
-        if self.app:
-            write_file(self.app, os.path.join(output, "application.bin"), mode="wb")
-
-    @staticmethod
-    def get_supported_families() -> List[str]:
-        """Get list of all supported families by bootable image.
-
-        :return: List of families.
-        """
-        full_list = BootableImage.get_supported_families()
-        # filter out just LPC55S3x
-        return [x for x in full_list if re.match(r"[lL][pP][cC]55[sS]3[\dxX]$", x)]
-
-
-class BootImgRtSegment(abc.ABC):
-    """Base class for BootImgRT segment ."""
-
-    def __init__(self, boot_image: BootImgRT) -> None:
-        """Base class constructor."""
-        self.boot_image = boot_image
-        self.segment: Any = None
-
-    @abc.abstractmethod
-    def set_value(self, data: bytes) -> None:
-        """Set value abstract method.
-
-        :param data: Bytes data to set.
-        """
-        raise NotImplementedError()
-
-    @property
-    @abc.abstractmethod
-    def is_defined(self) -> bool:
-        """Is defined abstract property."""
-        raise NotImplementedError()
-
-    @property
-    def offset(self) -> int:
-        """Offset abstract property."""
-        raise SPSDKValueError("Offset not defined")
-
-    @property
-    def size(self) -> int:
-        """Get the size of the block."""
-        return getattr(self.segment, "size")
-
-    def export(self) -> bytes:
-        """Export data of given block as bytes object."""
-        export = getattr(self.segment, "export")
-        return export()[: self.size]
-
-
-class BootImgRtFcbSegment(BootImgRtSegment):
-    """Wrapper of FCB BootImgRT segment ."""
-
-    def __init__(self, boot_image: BootImgRT, segments_config: Dict) -> None:
-        """FCB BootImgRT segment constructor.
-
-        :param boot_image: Instance of BootImgRT.
-        :param segments_config: Additional configuration of segments
-        """
-        super().__init__(boot_image)
-        self.segments_config = segments_config
-        self.segment: AbstractFCB = self.boot_image.fcb
-
-    def set_value(self, data: bytes) -> None:
-        """Set value of FCB segment.
-
-        :param data: Bytes data to set.
-        """
-        if data[:4] == FlexSPIConfBlockFCB.TAG:
-            self.boot_image.fcb = FlexSPIConfBlockFCB.parse(data)
-        else:
-            fcb_len = len(data) if len(data) > 0 else BootImgRT.IVT_OFFSET_OTHER
-            self.boot_image.fcb = PaddingFCB(fcb_len, enabled=True)
-
-    @property
-    def offset(self) -> int:
-        """Get the offset of FCB block."""
-        fcb_offset = self.segments_config.get("fcb_offset")
-        if fcb_offset:
-            return fcb_offset
-        return self.boot_image.FCB_OFFSETS[0]
-
-    @property
-    def is_defined(self) -> bool:
-        """Returns true if FCB block is defined. False otherwise."""
-        return self.boot_image.fcb.size > 0
-
-    def export(self) -> bytes:
-        """Export data of given block as bytes object."""
-        data = self.boot_image.export_fcb(DebugInfo.disabled())[: self.size]
-        return data
-
-
-class BootImgRtBeeSegment(BootImgRtSegment):
-    """Wrapper of BEE BootImgRT segment ."""
-
-    def __init__(self, boot_image: BootImgRT) -> None:
-        """BEE BootImgRT segment constructor.
-
-        :param boot_image: Instance of BootImgRT.
-        """
-        super().__init__(boot_image)
-        self.segment: SegBEE = self.boot_image.bee
-
-    def set_value(self, data: bytes) -> None:
-        """Set value of BEE segment.
-
-        :param data: Bytes data to set.
-        """
-        self.boot_image.bee = SegBEE.parse(data)
-
-    @property
-    def offset(self) -> int:
-        """Get the offset of BEE block."""
-        return BootImgRT.BEE_OFFSET
-
-    @property
-    def is_defined(self) -> bool:
-        """Returns true if BEE block is defined. False otherwise."""
-        return self.boot_image.bee.size > 0
-
-    def export(self) -> bytes:
-        """Export data of given block as bytes object."""
-        data = self.boot_image.export_bee(DebugInfo.disabled())[: self.size]
-        return data
-
-
-class BootImgRtIvtSegment(BootImgRtSegment):
-    """Wrapper of IVT BootImgRT segment ."""
-
-    def __init__(self, boot_image: BootImgRT) -> None:
-        """IVT BootImgRT segment constructor.
-
-        :param boot_image: Instance of BootImgRT.
-        """
-        super().__init__(boot_image)
-        self.segment: SegIVT2 = self.boot_image.ivt
-
-    def set_value(self, data: bytes) -> None:
-        """Set value of IVT segment.
-
-        :param data: Bytes data to set.
-        """
-        self.boot_image.ivt = SegIVT2.parse(data)
-
-    @property
-    def offset(self) -> int:
-        """Get the offset of IVT block."""
-        return BootImgRT.IVT_OFFSET_NOR_FLASH
-
-    @property
-    def is_defined(self) -> bool:
-        """Returns true if IVT block is defined. False otherwise."""
-        return self.boot_image.ivt.size > 0
-
-
-class BootImgRtBdiSegment(BootImgRtSegment):
-    """Wrapper of BDI BootImgRT segment ."""
-
-    def __init__(self, boot_image: BootImgRT) -> None:
-        """BDI BootImgRT segment constructor.
-
-        :param boot_image: Instance of BootImgRT.
-        """
-        super().__init__(boot_image)
-        self.segment: SegBDT = self.boot_image.bdt
-
-    def set_value(self, data: bytes) -> None:
-        """Set value of Bdi segment.
-
-        :param data: Bytes data to set.
-        """
-        self.boot_image.bdt = SegBDT.parse(data)
-
-    @property
-    def offset(self) -> int:
-        """Get the offset of IVT block."""
-        return (
-            self.boot_image.ivt.bdt_address
-            - self.boot_image.ivt.ivt_address
-            + self.boot_image.ivt_offset
-        )
-
-    @property
-    def is_defined(self) -> bool:
-        """Returns true if BDI block is defined. False otherwise."""
-        return self.boot_image.bdt.size > 0
-
-
-class BootImgRtDcdSegment(BootImgRtSegment):
-    """Wrapper of DCD BootImgRT segment ."""
-
-    def __init__(self, boot_image: BootImgRT) -> None:
-        """DCD BootImgRT segment constructor.
-
-        :param boot_image: Instance of BootImgRT.
-        """
-        super().__init__(boot_image)
-        self.segment: Optional[SegDCD] = self.boot_image.dcd
-
-    def set_value(self, data: bytes) -> None:
-        """Set value of Dcd segment.
-
-        :param data: Bytes data to set.
-        """
-        self.boot_image.dcd = SegDCD.parse(data)
-
-    @property
-    def offset(self) -> int:
-        """Get the offset of DCD block."""
-        return (
-            self.boot_image.ivt.dcd_address
-            - self.boot_image.ivt.ivt_address
-            + self.boot_image.ivt_offset
-        )
-
-    @property
-    def is_defined(self) -> bool:
-        """Returns true if block is defined. False otherwise."""
-        return self.boot_image.dcd is not None and self.boot_image.dcd.size > 0
-
-    def export(self) -> bytes:
-        """Export data of given block as bytes object."""
-        data = self.boot_image.export_dcd(DebugInfo.disabled())[: self.size]
-        return data
-
-
-class BootImgRtAppSegment(BootImgRtSegment):
-    """Wrapper of App BootImgRT segment ."""
-
-    def __init__(self, boot_image: BootImgRT) -> None:
-        """App BootImgRT segment constructor.
-
-        :param boot_image: Instance of BootImgRT.
-        """
-        super().__init__(boot_image)
-        self.segment: SegAPP = self.boot_image.app
-
-    def set_value(self, data: bytes) -> None:
-        """Set value of App segment.
-
-        :param data: Bytes data to set.
-        """
-        self.boot_image.app.data = data
-
-    @property
-    def offset(self) -> int:
-        """Get the offset of App block."""
-        return self.boot_image.app_offset
-
-    @property
-    def is_defined(self) -> bool:
-        """Returns True if block is defined. False otherwise."""
-        return self.boot_image.app.size > 0
-
-
-class BootImgRtXmcdSegment(BootImgRtSegment):
-    """Wrapper of XMCD BootImgRT segment."""
-
-    def __init__(self, boot_image: BootImgRT) -> None:
-        """XMCD BootImgRT segment constructor.
-
-        :param boot_image: Instance of BootImgRT.
-        """
-        super().__init__(boot_image)
-        self.segment: Optional[SegXMCD] = self.boot_image.xmcd
-
-    def set_value(self, data: bytes) -> None:
-        """Set value of XMCD segment.
-
-        :param data: Bytes data to set.
-        """
-        self.boot_image.xmcd = SegXMCD.parse(data)
-
-    @property
-    def offset(self) -> int:
-        """Get the offset of XMCD block."""
-        return self.boot_image.ivt_offset + self.boot_image.XMCD_IVT_OFFSET
-
-    @property
-    def is_defined(self) -> bool:
-        """Returns True if block is defined. False otherwise."""
-        return self.boot_image.xmcd is not None
-
-    def export(self) -> bytes:
-        """Export data of given block as bytes object."""
-        data = b""
-        if self.boot_image.xmcd:
-            data = self.boot_image.xmcd.export()
-        return data
-
-
-class BootImgRtCsfSegment(BootImgRtSegment):
-    """Wrapper of CSF BootImgRT segment."""
-
-    def __init__(self, boot_image: BootImgRT) -> None:
-        """CSF BootImgRT segment constructor.
-
-        :param boot_image: Instance of BootImgRT.
-        """
-        super().__init__(boot_image)
-        self.segment: Optional[SegCSF] = self.boot_image.csf
-
-    def set_value(self, data: bytes) -> None:
-        """Set value of CSF segment.
-
-        :param data: Bytes data to set.
-        """
-        self.boot_image.csf = SegCSF.parse(data)
-
-    @property
-    def offset(self) -> int:
-        """Get the offset of CSF block."""
-        return (
-            self.boot_image.ivt.csf_address
-            - self.boot_image.ivt.ivt_address
-            + self.boot_image.ivt_offset
-        )
-
-    @property
-    def is_defined(self) -> bool:
-        """Returns True if block is defined. False otherwise."""
-        return self.boot_image.csf is not None and self.boot_image.csf.size > 0
-
-    def export(self) -> bytes:
-        """Export data of given block as bytes object."""
-        data = b""
-        if self.boot_image.csf:
-            data = self.boot_image.csf.export()
-        return data
-
-
-class BootImgRTSegmentsFactory:
-    """Factory class for BootImgRT segments."""
-
-    BOOT_IMAGE_SEGMENTS: Dict[str, Type[BootImgRtSegment]] = {
-        "fcb": BootImgRtFcbSegment,
-        "bee": BootImgRtBeeSegment,
-        "ivt": BootImgRtIvtSegment,
-        "bdi": BootImgRtBdiSegment,
-        "xmcd": BootImgRtXmcdSegment,
-        "dcd": BootImgRtDcdSegment,
-        "application": BootImgRtAppSegment,
-        "csf": BootImgRtCsfSegment,
-    }
-
-    def __init__(self, boot_image: BootImgRT) -> None:
-        """Factory class constructor.
-
-        :param boot_image: Instance of BootImgRT.
-        :param segments_config: Additional configuration of segments.
-        """
-        self.boot_image = boot_image
-
-    def get_segment(self, name: str, segments_config: Optional[Dict] = None) -> BootImgRtSegment:
-        """Get instance of segment by given name.
-
-        :param name: Name of segment.
-        :param segments_config: Additional configuration of segments.
-        :raises SPSDKValueError: If segments_config value is missing for segment with required segments_config parameter
-        """
-        try:
-            segment = self.BOOT_IMAGE_SEGMENTS[name]
-        except KeyError:
-            logger.debug(f"Segment {name} is not recognized as valid segment.")
-        init_signature = inspect.signature(segment.__init__)
-        kwargs = {}
-        if "segments_config" in init_signature.parameters:
-            if not segments_config:
-                raise SPSDKValueError(f"Segments config must be speecified for segment {name}")
-            kwargs["segments_config"] = segments_config
-        return segment(self.boot_image, **kwargs)
-
-    def get_all_segments(
-        self, segments_config: Optional[Dict] = None
-    ) -> Dict[str, BootImgRtSegment]:
-        """Get instances of all segments.
-
-        :param segments_config: Additional configuration of segments.
-        """
-        segments = {}
-        for name in self.BOOT_IMAGE_SEGMENTS:
-            segments[name] = self.get_segment(name, segments_config)
-        return segments
-
-    @staticmethod
-    def get_all_segment_names() -> List[str]:
-        """Get list of all segment names."""
-        return list(BootImgRTSegmentsFactory.BOOT_IMAGE_SEGMENTS.keys())
-
-
-class BootableImageRt1xxx(BootableImage):
-    """Bootable Image class for RT1xxx devices."""
-
-    DEFAULT_IMAGE_VERSION = BootImgRT.VERSIONS[0]
-
-    def __init__(
-        self,
-        family: str,
-        mem_type: str,
-        revision: str = "latest",
-        image_version: int = DEFAULT_IMAGE_VERSION,
-        **segments: bytes,
-    ) -> None:
-        """Bootable Image constructor for RT1xxx devices.
-
-        :param family: Chip family.
-        :param mem_type: Used memory type.
-        :param revision: Chip silicon revision.
-        :param image_version: Image version number, defaults to 0
-        """
-        super().__init__(family, mem_type, revision)
-        self.image_version = image_version
-        self.boot_image = BootImgRT(
-            0,
-            version=image_version,
-        )
-        self.segments = segments
-        self.bimg_descr: Dict = self.mem_types[self.mem_type]
-        self.segment_factory = BootImgRTSegmentsFactory(self.boot_image)
-        for name, value in segments.items():
-            if value is not None:
-                segment = self.segment_factory.get_segment(name, self.bimg_descr)
-                segment.set_value(value)
-        # Construct the FCB object so the yaml can be exported
-        self.fcb = None
-        if segments.get("fcb") is not None:
-            self.fcb = FCB(self.family, self.mem_type, self.revision)
-            self.fcb.parse(segments["fcb"])
-
-    @staticmethod
-    def get_validation_schemas(family: str, revision: str = "latest") -> List[Dict[str, Any]]:
-        """Get validation schema for the family.
-
-        :raises SPSDKKeyError: If given item is not defined in validation schema.
-        :return: List of validation schema dictionaries.
-        """
-        sch_cfg = deepcopy(ValidationSchemas.get_schema_file(BIMG_SCH_FILE))
-        sch_cfg["family_rev"]["properties"]["family"][
-            "enum"
-        ] = BootableImageRt1xxx.get_supported_families()
-        sch_cfg["family_rev"]["properties"]["revision"][
-            "enum"
-        ] = BootableImageRt1xxx.get_supported_revisions(family)
-        sch_cfg["family_rev"]["properties"]["memory_type"][
-            "enum"
-        ] = BootableImageRt1xxx.get_supported_memory_types(family, revision)
-        sch_cfg["fcb"]["properties"]["fcb"]["template_title"] = "Bootable Image blocks definition"
-        ret = []
-        schema_items = [
-            "family_rev",
-            "image_version",
-        ] + BootImgRTSegmentsFactory.get_all_segment_names()
-        for item in schema_items:
-            try:
-                ret.append(sch_cfg[item])
-            except KeyError as e:
-                raise SPSDKKeyError(
-                    f"Item {item} not defined in validation schema {BIMG_SCH_FILE}"
-                ) from e
-        return ret
-
-    def export(self) -> bytes:
-        """Export bootable image.
-
-        :return: Complete binary of bootable image.
-        """
-        return self.image_info().export()
-
-    def image_info(self) -> BinaryImage:
-        """Create Binary image of bootable image.
-
-        :return: BinaryImage object of bootable image.
-        """
-        bin_image = BinaryImage(
-            name=f"Bootable Image for {self.family}", size=0, pattern=BinaryPattern("zeros")
-        )
-        segments = self.segment_factory.get_all_segments(self.bimg_descr)
-        for name, seg_instance in segments.items():
-            if seg_instance.is_defined:
-                bin_image.add_image(
-                    BinaryImage(
-                        name=name.upper(),
-                        size=seg_instance.size,
-                        offset=seg_instance.offset,
-                        binary=seg_instance.export(),
-                        parent=bin_image,
-                    )
-                )
-        return bin_image
-
-    @classmethod
-    def load_from_config(
-        cls, config: Dict, search_paths: Optional[List[str]] = None
-    ) -> "BootableImageRt1xxx":
-        """Load bootable image from configuration.
-
-        :param config: Configuration of Bootable image.
-        :param search_paths: List of paths where to search for the file, defaults to None
-        """
-        check_config(config, cls.get_validation_schemas_family())
-        revision = config.get("revision", "latest")
-        schemas = cls.get_validation_schemas(config["family"], revision)
-        check_config(config, schemas, search_paths=search_paths)
-        segments: Dict[str, Any] = {}
-        for name in BootImgRTSegmentsFactory.get_all_segment_names():
-            segments[name] = cls._load_bin_from_config(config, name, search_paths)
-        return BootableImageRt1xxx(
-            family=config["family"],
-            mem_type=config["memory_type"],
-            revision=revision,
-            image_version=config.get("image_version", cls.DEFAULT_IMAGE_VERSION),
-            **segments,
-        )
-
-    def parse(self, binary: bytes) -> None:
-        """Parse binary into bootable image object.
-
-        :param binary: Complete binary of bootable image.
-        """
-        self.boot_image = self.boot_image.parse(binary)
-        self.image_version = self.boot_image.ivt.version
-        self.boot_image._update()
-        self.segment_factory = BootImgRTSegmentsFactory(self.boot_image)
-        debug_disabled = DebugInfo.disabled()
-        if self.boot_image.fcb.enabled:
-            data = self.boot_image.export_fcb(debug_disabled)
-            self.fcb = FCB(self.family, self.mem_type, self.revision)
-            self.fcb.parse(data[: self.boot_image.fcb.size])
-
-    def store_config(self, output: str) -> None:
-        """Store bootable image into configuration and binary blocks.
-
-        :param output: Path to output folder to store bootable image configuration.
-        """
-        schemas = self._get_validation_schemas()
-        override: Dict[str, Union[str, int]] = {}
-        override["family"] = self.family
-        override["revision"] = self.revision
-        override["memory_type"] = self.mem_type
-        override["image_version"] = self.image_version
-        segments = self.segment_factory.get_all_segments(self.bimg_descr)
-        # Write binaries
-        for name, seg_instance in segments.items():
-            override[name] = ""
-            if seg_instance.is_defined:
-                override[name] = self.get_validation_schema_template(schemas, name)
-                write_file(
-                    seg_instance.export(),
-                    os.path.join(output, self.get_validation_schema_template(schemas, name)),
-                    mode="wb",
-                )
-        # Write YAMLs
-        config = ConfigTemplate(
-            f"Bootable Image Configuration for {self.family}.",
-            schemas,
-            override,
-        ).export_to_yaml()
-        write_file(
-            config,
-            os.path.join(output, f"bootable_image_{self.family}_{self.mem_type}.yaml"),
-        )
-        if self.fcb:
-            write_file(self.fcb.create_config(), os.path.join(output, "fcb.yaml"))
-
-    @staticmethod
-    def get_supported_families() -> List[str]:
-        """Get list of all supported families by bootable image.
-
-        :return: List of families.
-        """
-        full_list = BootableImage.get_supported_families()
-        ignored = ["rt118x"]
-        # filter out just RT1xxx
-        return [x for x in full_list if re.match(r"[rR][tT]1[\dxX]{3}$", x) and x not in ignored]
-
-    @staticmethod
-    def get_validation_schema_template(schemas: List[Dict[str, Any]], property_name: str) -> str:
-        """Get the template value from validation schema for specific.
-
-        :param schemas: Validation schemas.
-        :param property_name: name of propetry to be searched.
-        :raises SPSDKKeyError: If property with given name does nto exist.
-        """
-        prop = find_first(schemas, lambda x: property_name in x["properties"])
-        if not prop:
-            raise SPSDKKeyError(f"A property {property_name} is not defined in validation schemas")
-        return prop["properties"][property_name]["template_value"]
-
-
-class BootableImageRt118x(BootableImage):
-    """Bootable Image class for RT1180 devices."""
-
-    def __init__(
-        self,
-        family: str = "rt118x",
-        mem_type: str = "flexspi_nor",
-        revision: str = "latest",
-        keyblob: Optional[bytes] = None,
-        fcb: Optional[bytes] = None,
-        xmcd: Optional[bytes] = None,
-        ahab_container: Optional[bytes] = None,
-    ) -> None:
-        """Bootable Image constructor for Lpc55s3x devices.
-
-        :param mem_type: Used memory type.
-        :param fcb: FCB block, defaults to None
-        :param image_version: Image version number, defaults to 0
-        :param app: Application block, defaults to None
-        """
-        assert mem_type == "flexspi_nor"
-        super().__init__(family, mem_type, revision)
-        self.keyblob = keyblob
-        self.fcb = None
-        if fcb:
-            self.fcb = FCB(self.family, self.mem_type, self.revision)
-            self.fcb.parse(fcb)
-        self.xmcd = None
-        if xmcd:
-            self.xmcd = XMCD(self.family, self.revision)
-            self.xmcd.parse(xmcd)
-        self.ahab_container = ahab_container
-
-    @staticmethod
-    def get_validation_schemas(family: str, revision: str = "latest") -> List[Dict[str, Any]]:
-        """Get validation schema for the family.
-
-        :param family: Chip family
-        :param revision: Chip revision specification, as default, latest is used.
-        :return: List of validation schema dictionaries.
-        """
-        ret = []
-        sch_cfg = deepcopy(ValidationSchemas.get_schema_file(BIMG_SCH_FILE))
-        sch_cfg["family_rev"]["properties"]["family"][
-            "enum"
-        ] = BootableImageRt118x.get_supported_families()
-        revisions = ["latest"]
-        revisions_device = BootableImageRt118x.get_supported_revisions(family)
-        revisions.extend(revisions_device)
-        sch_cfg["family_rev"]["properties"]["revision"]["enum"] = revisions
-        mem_types = BootableImageRt118x.get_supported_memory_types(family, revision)
-        sch_cfg["family_rev"]["properties"]["memory_type"]["enum"] = mem_types
-
-        ret.append(sch_cfg["family_rev"])
-        ret.append(sch_cfg["keyblob"])
-        ret.append(sch_cfg["fcb"])
-        ret.append(sch_cfg["xmcd"])
-        ret.append(sch_cfg["ahab_container"])
-        return ret
-
-    def image_info(self) -> BinaryImage:
-        """Create Binary image of bootable image.
-
-        :return: BinaryImage object of bootable image.
-        """
-        bin_image = BinaryImage(
-            name=f"Bootable Image for {self.family}", size=0, pattern=BinaryPattern("zeros")
-        )
-        if self.keyblob:
-            bin_image.add_image(
-                BinaryImage(
-                    name="Key Blob",
-                    size=len(self.keyblob),
-                    offset=self.bimg_descr["keyblob_offset"],
-                    binary=self.keyblob,
-                    parent=bin_image,
-                )
-            )
-        if self.fcb:
-            bin_image.add_image(
-                BinaryImage(
-                    name="FCB",
-                    size=len(self.fcb.registers.image_info()),
-                    offset=self.bimg_descr["fcb_offset"],
-                    binary=self.fcb.export(),
-                    parent=bin_image,
-                )
-            )
-        if self.xmcd:
-            bin_image.add_image(
-                BinaryImage(
-                    name="XMCD",
-                    size=len(self.xmcd.registers.image_info()),
-                    offset=self.bimg_descr["xmcd_offset"],
-                    binary=self.xmcd.export(),
-                    parent=bin_image,
-                )
-            )
-        if self.ahab_container:
-            bin_image.add_image(
-                BinaryImage(
-                    name="AHAB Container",
-                    offset=self.bimg_descr["ahab_container_offset"],
-                    binary=self.ahab_container,
-                    parent=bin_image,
-                )
-            )
-        return bin_image
-
-    @classmethod
-    def load_from_config(
-        cls, config: Dict, search_paths: Optional[List[str]] = None
-    ) -> "BootableImageRt118x":
-        """Load bootable image from configuration.
-
-        :param config: Configuration of Bootable image.
-        :param search_paths: List of paths where to search for the file, defaults to None
-        """
-        check_config(config, cls.get_validation_schemas_family())
-        chip_family = config["family"]
-        mem_type = config["memory_type"]
-        revision = config.get("revision", "latest")
-        schemas = cls.get_validation_schemas(chip_family, revision)
-        check_config(config, schemas, search_paths=search_paths)
-        keyblob_path = config.get("keyblob")
-        fcb_path = config.get("fcb")
-        xmcd_path = config.get("xmcd")
-        ahab_container_path = config.get("ahab_container")
-        keyblob = load_binary(keyblob_path, search_paths=search_paths) if keyblob_path else None
-        fcb = load_binary(fcb_path, search_paths=search_paths) if fcb_path else None
-        xmcd = load_binary(xmcd_path, search_paths=search_paths) if xmcd_path else None
-        ahab_container = (
-            load_binary(ahab_container_path, search_paths=search_paths)
-            if ahab_container_path
-            else None
-        )
-        return BootableImageRt118x(
-            family=chip_family,
-            mem_type=mem_type,
-            revision=revision,
-            keyblob=keyblob,
-            fcb=fcb,
-            xmcd=xmcd,
-            ahab_container=ahab_container,
-        )
-
-    def parse(self, binary: bytes) -> None:
-        """Parse binary into bootable image object.
-
-        :param binary: Full binary of bootable image.
-        """
-        # KeyBlob
-        offset = self.bimg_descr["keyblob_offset"]
-        size = self.bimg_descr["keyblob_len"]
-        self.keyblob = binary[offset : offset + size]
-        # FCB
-        offset = self.bimg_descr["fcb_offset"]
-        size = self.bimg_descr["fcb_len"]
-        self.fcb = FCB(self.family, self.mem_type, self.revision)
-        self.fcb.parse(binary[offset : offset + size])
-        # XMCD
-        offset = self.bimg_descr["xmcd_offset"]
-        size = self._get_xmcd_size(binary[offset : offset + XMCDHeader.SIZE])
-        if size > 0:
-            self.xmcd = XMCD(self.family, self.revision)
-            self.xmcd.parse(binary[offset:size])
-        # AHAB container
-        offset = self.bimg_descr["ahab_container_offset"]
-        self.ahab_container = binary[offset:]
-
-    def _get_xmcd_size(self, header_binary: bytes) -> int:
-        try:
-            header = XMCDHeader.parse(header_binary)
-        except UnparsedException:
-            return 0
-        mem_type = MemoryType(header.interface).name.lower()
-        config_type = ConfigurationBlockType(header.block_type).name.lower()
-        registers = XMCD.load_registers(self.family, mem_type, config_type, self.revision)
-        return len(registers.image_info())
-
-    def store_config(self, output: str) -> None:
-        """Store bootable image into configuration and binary blocks.
-
-        :param output: Path to output folder to store bootable image configuration.
-        """
-        schemas = self._get_validation_schemas()
-        override: Dict[str, str] = {}
-        override["family"] = self.family
-        override["revision"] = self.revision
-        override["memory_type"] = self.mem_type
-        override["keyblob"] = "keyblob.bin" if self.keyblob else ""
-        override["fcb"] = "fcb.bin" if self.fcb else ""
-        override["xmcd"] = "xmcd.bin" if self.xmcd else ""
-        override["ahab_container"] = "ahab_container.bin" if self.ahab_container else ""
-        config = ConfigTemplate(
-            f"Bootable Image Configuration for {self.family}.",
-            schemas,
-            override,
-        ).export_to_yaml()
-        write_file(
-            config,
-            os.path.join(output, f"bootable_image_{self.family}_{self.mem_type}.yaml"),
-        )
-        if self.keyblob:
-            write_file(self.keyblob, os.path.join(output, "keyblob.bin"), mode="wb")
-        if self.fcb:
-            write_file(self.fcb.export(), os.path.join(output, override["fcb"]), mode="wb")
-            write_file(self.fcb.create_config(), os.path.join(output, "fcb.yaml"))
-        if self.xmcd:
-            write_file(self.xmcd.export(), os.path.join(output, override["xmcd"]), mode="wb")
-            write_file(self.xmcd.create_config(), os.path.join(output, "xmcd.yaml"))
-        if self.ahab_container:
-            write_file(
-                self.ahab_container, os.path.join(output, override["ahab_container"]), mode="wb"
-            )
-
-    @staticmethod
-    def get_supported_families() -> List[str]:
-        """Get list of all supported families by bootable image.
-
-        :return: List of supported families.
-        """
-        return ["rt118x"]
+        return DatabaseManager().db.devices.get(family).revisions.revision_names(True)

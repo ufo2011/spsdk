@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2019-2023 NXP
+# Copyright 2019-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 """Test of commands."""
@@ -9,7 +9,7 @@
 
 import pytest
 
-from spsdk import SPSDKError
+from spsdk.exceptions import SPSDKError
 from spsdk.sbfile.sb31.commands import (
     BaseCmd,
     CmdCall,
@@ -38,7 +38,7 @@ def test_cmd_erase():
     assert cmd.address == 100
     assert cmd.length == 0xFF
     assert cmd.memory_id == 10
-    assert cmd.info()
+    assert str(cmd)
 
     data = cmd.export()
     assert len(data) == 32
@@ -69,7 +69,7 @@ def test_cmd_load():
     assert cmd.address == 100
     assert cmd.length == 10
     assert cmd.memory_id == 1
-    assert cmd.info()
+    assert str(cmd)
 
     data = cmd.export()
     assert len(data) == 48
@@ -91,7 +91,7 @@ def test_cmd_execute():
     """Test address, info value, size after export and parsing of CmdExecute command."""
     cmd = CmdExecute(address=100)
     assert cmd.address == 100
-    assert cmd.info()
+    assert str(cmd)
 
     data = cmd.export()
     assert len(data) == BaseCmd.SIZE
@@ -113,7 +113,7 @@ def test_cmd_call():
     """Test address, info value, size after export and parsing of CmdCall command."""
     cmd = CmdCall(address=100)
     assert cmd.address == 100
-    assert cmd.info()
+    assert str(cmd)
 
     data = cmd.export()
     assert len(data) == BaseCmd.SIZE
@@ -136,7 +136,7 @@ def test_program_cmd_progfuses():
     cmd = CmdProgFuses(address=100, data=bytes(12))
     assert cmd.address == 100
     assert cmd.length == 3
-    assert cmd.info()
+    assert str(cmd)
 
     data = cmd.export()
     assert len(data) == BaseCmd.SIZE + 4 * 4
@@ -150,7 +150,7 @@ def test_cmd_progifr():
     cmd = CmdProgIfr(address=100, data=bytes([0] * 100))
     assert cmd.address == 100
     assert cmd.data == bytes([0] * 100)
-    assert cmd.info()
+    assert str(cmd)
 
     data = cmd.export()
     assert len(data) == BaseCmd.SIZE + len(cmd.data) + 12
@@ -165,7 +165,7 @@ def test_cmd_loadcmac():
     assert cmd.address == 100
     assert cmd.length == 10
     assert cmd.memory_id == 0
-    assert cmd.info()
+    assert str(cmd)
 
     data = cmd.export()
     assert len(data) == 48
@@ -194,7 +194,7 @@ def test_cmd_copy():
     assert cmd.destination_address == 20
     assert cmd.memory_id_from == 30
     assert cmd.memory_id_to == 40
-    assert cmd.info()
+    assert str(cmd)
 
     data = cmd.export()
     assert len(data) % 16 == 0
@@ -218,7 +218,7 @@ def test_cmd_loadhashlocking():
     assert cmd.address == 100
     assert cmd.length == 10
     assert cmd.memory_id == 5
-    assert cmd.info()
+    assert str(cmd)
 
     data = cmd.export()
     assert len(data) == 48 + 64
@@ -241,14 +241,14 @@ def test_cmd_loadkeyblob():
     cmd = CmdLoadKeyBlob(
         offset=100,
         key_wrap_id=CmdLoadKeyBlob.get_key_id(
-            "LPC55S3x", CmdLoadKeyBlob.KeyTypes.NXP_CUST_KEK_EXT_SK
+            "lpc55s3x", CmdLoadKeyBlob.KeyTypes.NXP_CUST_KEK_EXT_SK
         ),
         data=10 * b"x",
     )
     assert cmd.address == 100
     assert cmd.length == 10
     assert cmd.key_wrap_id == 17
-    assert cmd.info()
+    assert str(cmd)
 
     data = cmd.export()
     assert len(data) % 16 == 0
@@ -258,15 +258,15 @@ def test_cmd_loadkeyblob():
     assert cmd.data == cmd_parsed.data == 10 * b"x"
 
 
-def test_cmd_loadkeyblob():
-    """Test offset, length, key_wrap, data info value, size after export and parsing of CmdLoadKeyBlob command."""
+def test_cmd_loadkeyblob_v2():
+    """Test offset, length, key_wrap, data info value, size after export and parsing of CmdLoadKeyBlob V2 command."""
     cmd = CmdLoadKeyBlob(
-        offset=100, key_wrap_id=CmdLoadKeyBlob._KeyWraps.NXP_CUST_KEK_EXT_SK.value, data=10 * b"x"
+        offset=100, key_wrap_id=CmdLoadKeyBlob._KeyWrapsV2.NXP_CUST_KEK_EXT_SK.value, data=10 * b"x"
     )
     assert cmd.address == 100
     assert cmd.length == 10
-    assert cmd.key_wrap_id == 17
-    assert cmd.info()
+    assert cmd.key_wrap_id == 19
+    assert str(cmd)
 
     data = cmd.export()
     assert len(data) % 16 == 0
@@ -292,7 +292,7 @@ def test_cmd_configurememory():
     cmd = CmdConfigureMemory(address=100, memory_id=10)
     assert cmd.address == 100
     assert cmd.memory_id == 10
-    assert cmd.info()
+    assert str(cmd)
 
     data = cmd.export()
     assert len(data) == 16
@@ -316,7 +316,7 @@ def test_cmd_fillmemory():
     assert cmd.address == 100
     assert cmd.length == 100
     assert cmd.pattern == 0xFF1111FF
-    assert cmd.info()
+    assert str(cmd)
 
     data = cmd.export()
     assert len(data) == 32
@@ -339,7 +339,7 @@ def test_cmd_fwversioncheck():
     cmd = CmdFwVersionCheck(value=100, counter_id=CmdFwVersionCheck.CounterID.SECURE)
     assert cmd.value == 100
     assert cmd.counter_id == 2
-    assert cmd.info()
+    assert str(cmd)
 
     data = cmd.export()
     assert len(data) % 16 == 0
@@ -381,9 +381,9 @@ def test_section_cmd_header_basic():
 
 
 def test_section_cmd_header_info():
-    """Test presence of all keywords in info() method of section header cmd."""
+    """Test presence of all keywords in __str__() method of section header cmd."""
     section_header = CmdSectionHeader(length=100)
-    output = section_header.info()
+    output = str(section_header)
     required_strings = ["UID", "Type"]
     for required_string in required_strings:
         assert required_string in output, f"String {required_string} is not in output"
@@ -394,7 +394,7 @@ def test_section_cmd_header_offset():
     section_header = CmdSectionHeader(length=100)
     data = section_header.export()
     with pytest.raises(SPSDKError):
-        CmdSectionHeader.parse(data=data, offset=50)
+        CmdSectionHeader.parse(data=data[50:])
 
 
 def test_parse_command_function():
@@ -523,3 +523,28 @@ def test_invalid_base_load_cmd():
         cmd._extract_data(
             data=b"U\xaa\xaaU\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x01\x00\x00"
         )
+
+
+@pytest.mark.parametrize(
+    "config,value,raise_error",
+    [
+        ({"address": 0, "value": "0x0FFFFFFE"}, b"\xfe\xff\xff\x0f", False),
+        (
+            {"address": 0, "values": "0x00000004,0x00020000,0xFFFFFFFF,0xFFFFFFFE"},
+            b"\x04\x00\x00\x00\x00\x00\x02\x00\xff\xff\xff\xff\xfe\xff\xff\xff",
+            False,
+        ),
+        (
+            {"address": 0, "unknown": "option"},
+            None,
+            True,
+        ),
+    ],
+)
+def test_load_program_ifr_cmd(config, value, raise_error):
+    if raise_error:
+        with pytest.raises(SPSDKError):
+            CmdProgIfr.load_from_config(config)
+    else:
+        cmd = CmdProgIfr.load_from_config(config)
+        assert cmd.data == value

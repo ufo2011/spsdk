@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2019-2023 NXP
+# Copyright 2019-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -11,10 +11,12 @@ from datetime import datetime
 from struct import calcsize, pack, unpack_from
 from typing import Optional
 
-from spsdk import SPSDKError
+from typing_extensions import Self
+
+from spsdk.crypto.rng import random_bytes
+from spsdk.exceptions import SPSDKError
 from spsdk.sbfile.misc import BcdVersion3, pack_timestamp, unpack_timestamp
-from spsdk.utils.crypto.abstract import BaseClass
-from spsdk.utils.crypto.common import crypto_backend
+from spsdk.utils.abstract import BaseClass
 from spsdk.utils.misc import swap16
 
 
@@ -39,6 +41,7 @@ class ImageHeaderV2(BaseClass):
         flags: int = 0x08,
         nonce: Optional[bytes] = None,
         timestamp: Optional[datetime] = None,
+        padding: Optional[bytes] = None,
     ) -> None:
         """Initialize Image Header Version 2.x.
 
@@ -47,8 +50,9 @@ class ImageHeaderV2(BaseClass):
         :param component_version: The component version (default: 1.0.0)
         :param build_number: The build number value (default: 0)
         :param flags: The flags value (default: 0x08)
-        :param nonce: The NONCE value; None if TODO ????
+        :param nonce: The NONCE value
         :param timestamp: value requested in the test; None to use current value
+        :param padding: header padding (8 bytes) for testing purpose; None to use random values (recommended)
         """
         self.nonce = nonce
         self.version = version
@@ -69,15 +73,16 @@ class ImageHeaderV2(BaseClass):
         self.product_version: BcdVersion3 = BcdVersion3.to_version(product_version)
         self.component_version: BcdVersion3 = BcdVersion3.to_version(component_version)
         self.build_number = build_number
+        self.padding = padding
 
-    def __str__(self) -> str:
+    def __repr__(self) -> str:
         return f"Header: v{self.version}, {self.image_blocks}"
 
     def flags_desc(self) -> str:
         """Return flag description."""
         return "Signed" if self.flags == 0x8 else "Unsigned"
 
-    def info(self) -> str:
+    def __str__(self) -> str:
         """Get info of Header as string."""
         nfo = str()
         nfo += f" Version:              {self.version}\n"
@@ -112,8 +117,9 @@ class ImageHeaderV2(BaseClass):
         major_version, minor_version = [int(v) for v in self.version.split(".")]
         product_version_words = [swap16(v) for v in self.product_version.nums]
         component_version_words = [swap16(v) for v in self.product_version.nums]
+        padding = padding or self.padding
         if padding is None:
-            padding = crypto_backend().random_bytes(8)
+            padding = random_bytes(8)
         else:
             if len(padding) != 8:
                 raise SPSDKError("Invalid length of padding")
@@ -162,15 +168,14 @@ class ImageHeaderV2(BaseClass):
 
     # pylint: disable=too-many-locals
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0) -> "ImageHeaderV2":
+    def parse(cls, data: bytes) -> Self:
         """Deserialization from binary form.
 
         :param data: binary representation
-        :param offset: to start parsing data
         :return: parsed instance of the header
-        :raise SPSDKError: Unable to parse data
+        :raises SPSDKError: Unable to parse data
         """
-        if cls.SIZE > len(data) - offset:
+        if cls.SIZE > len(data):
             raise SPSDKError("Insufficient amount of data")
         (
             nonce,
@@ -208,7 +213,7 @@ class ImageHeaderV2(BaseClass):
             build_number,
             # padding1
             _,
-        ) = unpack_from(cls.FORMAT, data, offset)
+        ) = unpack_from(cls.FORMAT, data)
 
         # check header signature 1
         if signature1 != cls.SIGNATURE1:

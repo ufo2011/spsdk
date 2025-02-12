@@ -1,42 +1,42 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2020-2023 NXP
+# Copyright 2020-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
-"""Contains support for BEE encryption for RT10xx devices."""
+"""Contains support for BEE encryption."""
 
 
 import logging
-import os
 from struct import calcsize, pack, unpack_from
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Optional, Sequence
 
-from Crypto.Cipher import AES
+from typing_extensions import Self
 
-from spsdk import SPSDKError
-from spsdk.exceptions import SPSDKOverlapError
-from spsdk.utils import UTILS_DATA_FOLDER
-from spsdk.utils.crypto import Counter, crypto_backend
-from spsdk.utils.database import Database
-from spsdk.utils.easy_enum import Enum
+from spsdk.crypto.rng import random_bytes
+from spsdk.crypto.symmetric import (
+    Counter,
+    aes_cbc_decrypt,
+    aes_cbc_encrypt,
+    aes_ctr_encrypt,
+    aes_ecb_decrypt,
+    aes_ecb_encrypt,
+)
+from spsdk.exceptions import SPSDKError, SPSDKOverlapError
+from spsdk.utils.database import DatabaseManager, get_families, get_schema_file
 from spsdk.utils.misc import (
-    DebugInfo,
+    Endianness,
     align_block_fill_random,
     extend_block,
     load_binary,
+    load_hex_string,
     split_data,
-    value_to_bytes,
     value_to_int,
 )
-from spsdk.utils.schema_validator import ConfigTemplate, ValidationSchemas
+from spsdk.utils.schema_validator import CommentedConfig
+from spsdk.utils.spsdk_enum import SpsdkEnum
 
 logger = logging.getLogger(__name__)
-
-
-BEE_DATA_FOLDER: str = os.path.join(UTILS_DATA_FOLDER, "bee")
-BEE_SCH_FILE: str = os.path.join(BEE_DATA_FOLDER, "sch_bee.yml")
-BEE_DATABASE_FILE: str = os.path.join(BEE_DATA_FOLDER, "database.yaml")
 
 # maximal size of encrypted block in bytes
 BEE_ENCR_BLOCK_SIZE = 0x400
@@ -57,7 +57,7 @@ class BeeBaseClass:
         return cls._FORMAT  # _FORMAT class constant must be defined in child class
 
     @classmethod
-    def _size(cls) -> int:
+    def get_size(cls) -> int:
         """:return: size of the exported binary data in bytes."""
         return calcsize(cls._struct_format())
 
@@ -67,9 +67,12 @@ class BeeBaseClass:
     @property
     def size(self) -> int:
         """:return: size of the exported binary data in bytes."""
-        return self._size()
+        return self.get_size()
 
-    def info(self) -> str:
+    def __repr__(self) -> str:
+        return f"BEE, Length = {self.size}B"
+
+    def __str__(self) -> str:
         """Info method.
 
         :return: text description of the instance.
@@ -93,17 +96,14 @@ class BeeBaseClass:
         return b""
 
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0) -> Any:
+    def check_data_to_parse(cls, data: bytes) -> None:
         """Deserialization.
 
         :param data: binary data to be parsed
-        :param offset: to start parsing the data
-        :return: instance created from binary data; this method returns just `0`
         :raises SPSDKError: If size of the data is not sufficient
         """
-        if len(data) - offset < cls._size():
+        if len(data) < cls.get_size():
             raise SPSDKError("Insufficient size of the data")
-        return 0
 
 
 class BeeFacRegion(BeeBaseClass):
@@ -125,15 +125,15 @@ class BeeFacRegion(BeeBaseClass):
         # immediately validate all parameters
         self.validate()
 
-    def __str__(self) -> str:
-        return f"FAC: 0x{self.start_addr:08x}[0x{self.length:x}]"
-
     @property
     def end_addr(self) -> int:
         """:return: end address of the region (which is last address of the region + 1)."""
         return self.start_addr + self.length
 
-    def info(self) -> str:
+    def __repr__(self) -> str:
+        return f"FAC: 0x{self.start_addr:08x}[0x{self.length:x}]"
+
+    def __str__(self) -> str:
         """:return: test description of the instance."""
         return f"FAC(start={hex(self.start_addr)}, length={hex(self.length)}, protected_level={self.protected_level})"
 
@@ -160,28 +160,25 @@ class BeeFacRegion(BeeBaseClass):
         )
 
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0) -> "BeeFacRegion":
+    def parse(cls, data: bytes) -> Self:
         """Deserialization.
 
         :param data: binary data to be parsed
-        :param offset: to start parsing the data
         :return: instance created from binary data
         :raises SPSDKError: If reserved area is non-zero
         """
-        super().parse(data, offset)  # check size of the data
-        (start, end, protected_level, _reserved) = unpack_from(
-            BeeFacRegion._struct_format(), data, offset
-        )
+        cls.check_data_to_parse(data)  # check size of the data
+        (start, end, protected_level, _reserved) = unpack_from(BeeFacRegion._struct_format(), data)
         if _reserved != b"\x00" * 20:
             raise SPSDKError("Reserved area is non-zero")
-        return BeeFacRegion(start, end - start, protected_level)
+        return cls(start, end - start, protected_level)
 
 
-class BeeProtectRegionBlockAesMode(Enum):
+class BeeProtectRegionBlockAesMode(SpsdkEnum):
     """AES mode selection for BEE PRDB encryption."""
 
-    ECB = 0
-    CTR = 1
+    ECB = (0, "ECB")
+    CTR = (1, "CTR")
 
 
 class BeeProtectRegionBlock(BeeBaseClass):
@@ -201,7 +198,7 @@ class BeeProtectRegionBlock(BeeBaseClass):
     SIZE = 0x100
 
     @classmethod
-    def _size(cls) -> int:
+    def get_size(cls) -> int:
         """:return: size of the exported binary data in bytes."""
         return cls.SIZE
 
@@ -222,12 +219,10 @@ class BeeProtectRegionBlock(BeeBaseClass):
         self._end_addr = 0xFFFFFFFF  # this is calculated automatically based on FAC regions
         self.mode = encr_mode
         self.lock_options = lock_options
-        self.counter = (
-            counter if counter else crypto_backend().random_bytes(12) + b"\x00\x00\x00\x00"
-        )
+        self.counter = counter if counter else random_bytes(12) + b"\x00\x00\x00\x00"
 
         # - FAC regions, 1 - 4
-        self.fac_regions: List[BeeFacRegion] = []
+        self.fac_regions: list[BeeFacRegion] = []
 
     def update(self) -> None:
         """Updates start and end address of the encryption region."""
@@ -257,12 +252,15 @@ class BeeProtectRegionBlock(BeeBaseClass):
         """:return: number of Factory Access Control regions."""
         return len(self.fac_regions)
 
-    def info(self) -> str:
+    def __repr__(self) -> str:
+        return f"BEE protect region block, start={hex(self._start_addr)}"
+
+    def __str__(self) -> str:
         """:return: test description of the instance."""
         result = f"BEE Region Header (start={hex(self._start_addr)}, end={hex(self._end_addr)})\n"
-        result += f"AES Encryption mode: {BeeProtectRegionBlockAesMode.name(self.mode)}\n"
+        result += f"AES Encryption mode: {self.mode.label}\n"
         for fac in self.fac_regions:
-            result += fac.info() + "\n"
+            result += str(fac) + "\n"
         return result
 
     def validate(self) -> None:
@@ -293,7 +291,7 @@ class BeeProtectRegionBlock(BeeBaseClass):
             self.fac_count,
             self._start_addr,
             self._end_addr,
-            self.mode,
+            self.mode.tag,
             self.lock_options,
             self.counter[::-1],  # bytes swapped: reversed order
             b"\x00" * 32,
@@ -304,15 +302,14 @@ class BeeProtectRegionBlock(BeeBaseClass):
         return result
 
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0) -> "BeeProtectRegionBlock":
+    def parse(cls, data: bytes) -> Self:
         """Deserialization.
 
         :param data: binary data to be parsed
-        :param offset: to start parsing the data
         :return: instance created from binary data
         :raises SPSDKError: If format does not match
         """
-        super().parse(data, offset)  # check size of the input data
+        cls.check_data_to_parse(data)  # check size of the input data
         (
             tagl,
             tagh,
@@ -324,7 +321,7 @@ class BeeProtectRegionBlock(BeeBaseClass):
             lock_options,
             counter,
             _reserved_32,
-        ) = unpack_from(BeeProtectRegionBlock._struct_format(), data, offset)
+        ) = unpack_from(BeeProtectRegionBlock._struct_format(), data)
         #
         if (tagl != BeeProtectRegionBlock.TAGL) or (tagh != BeeProtectRegionBlock.TAGH):
             raise SPSDKError("Invalid tag or unsupported version")
@@ -333,12 +330,12 @@ class BeeProtectRegionBlock(BeeBaseClass):
         if _reserved_32 != b"\x00" * 32:
             raise SPSDKError("Reserved area is non-zero")
         #
-        result = BeeProtectRegionBlock(mode, lock_options, counter[::-1])
+        result = cls(BeeProtectRegionBlockAesMode.from_tag(mode), lock_options, counter[::-1])
         result._start_addr = start_addr
         result._end_addr = end_addr
-        offset += calcsize(BeeProtectRegionBlock._struct_format())
+        offset = calcsize(BeeProtectRegionBlock._struct_format())
         for _ in range(fac_count):
-            fac = BeeFacRegion.parse(data, offset)
+            fac = BeeFacRegion.parse(data[offset:])
             result.add_fac(fac)
             offset += fac.size
         result.validate()
@@ -377,14 +374,14 @@ class BeeProtectRegionBlock(BeeBaseClass):
                     cntr_key = Counter(
                         self.counter,
                         ctr_value=start_addr >> 4,
-                        ctr_byteorder_encoding="big",
+                        ctr_byteorder_encoding=Endianness.BIG,
                     )
                     logger.debug(
                         f"Encrypting data, start={hex(start_addr)},"
-                        f"end={hex(start_addr + len(data))} with {self.info()} using fac {fac.info()}"
+                        f"end={hex(start_addr + len(data))} with {str(self)} using fac {str(fac)}"
                     )
                     data = align_block_fill_random(data, 16)  # align data to 16 bytes
-                    return crypto_backend().aes_ctr_encrypt(key, data, cntr_key.value)
+                    return aes_ctr_encrypt(key, data, cntr_key.value)
         return data
 
 
@@ -406,10 +403,13 @@ class BeeKIB(BeeBaseClass):
         :param kib_iv: AES initialization vector
         """
         # Key Info Block (KIB)
-        self.kib_key = kib_key if kib_key else crypto_backend().random_bytes(16)
-        self.kib_iv = kib_iv if kib_iv else crypto_backend().random_bytes(16)
+        self.kib_key = kib_key if kib_key else random_bytes(16)
+        self.kib_iv = kib_iv if kib_iv else random_bytes(16)
 
-    def info(self) -> str:
+    def __repr__(self) -> str:
+        return f"BEE KIB, Key: {self.kib_key.hex()}"
+
+    def __str__(self) -> str:
         """:return: test description of the instance."""
         return f"BEE-KIB: {self.kib_key.hex()}, {self.kib_iv.hex()}"
 
@@ -430,15 +430,14 @@ class BeeKIB(BeeBaseClass):
         return result + pack(self._struct_format(), self.kib_key, self.kib_iv)
 
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0) -> "BeeKIB":
+    def parse(cls, data: bytes) -> Self:
         """Deserialization.
 
         :param data: binary data to be parsed
-        :param offset: to start parsing the data
         :return: instance created from binary data
         """
-        super().parse(data, offset)  # check size of the input data
-        (key, iv) = unpack_from(BeeKIB._struct_format(), data, offset)
+        cls.check_data_to_parse(data)  # check size of the input data
+        (key, iv) = unpack_from(BeeKIB._struct_format(), data)
         result = cls(key, iv)
         result.validate()
         return result
@@ -460,7 +459,7 @@ class BeeRegionHeader(BeeBaseClass):
         )
 
     @classmethod
-    def _size(cls) -> int:
+    def get_size(cls) -> int:
         """:return: size of the exported binary data in bytes."""
         return cls.SIZE
 
@@ -477,7 +476,7 @@ class BeeRegionHeader(BeeBaseClass):
         :param kib: keys block; None to use default
         """
         self._prdb = prdb if (prdb is not None) else BeeProtectRegionBlock()
-        self._sw_key = sw_key if (sw_key is not None) else crypto_backend().random_bytes(16)
+        self._sw_key = sw_key if (sw_key is not None) else random_bytes(16)
         self._kib = kib if (kib is not None) else BeeKIB()
 
     def add_fac(self, fac: BeeFacRegion) -> None:
@@ -492,11 +491,14 @@ class BeeRegionHeader(BeeBaseClass):
         """:return: lift of Factory Access Control regions."""
         return self._prdb.fac_regions
 
-    def info(self) -> str:
+    def __repr__(self) -> str:
+        return "BEE Region Header"
+
+    def __str__(self) -> str:
         """:return: test description of the instance."""
         result = "BEE Region Header\n"
-        result += f"- KIB: {self._kib.info()}"
-        result += f"- PRDB: {self._prdb.info()}"
+        result += f"- KIB: {str(self._kib)}"
+        result += f"- PRDB: {str(self._prdb)}"
         return result
 
     def sw_key_fuses(self) -> Sequence[int]:
@@ -525,47 +527,41 @@ class BeeRegionHeader(BeeBaseClass):
         if len(self._sw_key) != 16:
             raise SPSDKError("Invalid settings")
 
-    def export(self, dbg_info: DebugInfo = DebugInfo.disabled()) -> bytes:
+    def export(self) -> bytes:
         """Serialization to binary representation.
 
-        :param dbg_info: instance allowing to provide debug info about exported data
         :return: binary representation of the region (serialization).
         """
         result = super().export()
         # KIB
         kib_data = self._kib.export()
-        dbg_info.append_binary_section("BEE-KIB (non-crypted)", kib_data)
-        aes = AES.new(self._sw_key, AES.MODE_ECB)
-        result += aes.encrypt(kib_data)
+        result += aes_ecb_encrypt(self._sw_key, kib_data)
         # padding
         result = extend_block(result, self.PRDB_OFFSET)
         # PRDB
         prdb_data = self._prdb.export()
-        dbg_info.append_binary_section("BEE-PRDB (non-crypted)", prdb_data)
-        aes = AES.new(self._kib.kib_key, AES.MODE_CBC, self._kib.kib_iv)
-        result += aes.encrypt(prdb_data)
+        result += aes_cbc_encrypt(self._kib.kib_key, prdb_data, self._kib.kib_iv)
         # padding
         return extend_block(result, self.SIZE)
 
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0, sw_key: bytes = b"") -> "BeeRegionHeader":
+    def parse(cls, data: bytes, sw_key: bytes = b"") -> Self:
         """Deserialization.
 
         :param data: binary data to be parsed
-        :param offset: to start parsing the data
-        :param sw_key: SW key used to decrypt the EKIB data (the key is marked as SW_GP2 on RT10xx)
+        :param sw_key: SW key used to decrypt the EKIB data
         :return: instance created from binary data
         :raises SPSDKError: If invalid sw key
         """
-        super().parse(data, offset)  # check size of the input data
+        cls.check_data_to_parse(data)  # check size of the input data
         if len(sw_key) != 16:
             raise SPSDKError("Invalid sw key")
-        aes = AES.new(sw_key, AES.MODE_ECB)
-        decr_data = aes.decrypt(data[offset : offset + BeeKIB._size()])
+        decr_data = aes_ecb_decrypt(sw_key, data[: BeeKIB.get_size()])
         kib = BeeKIB.parse(decr_data)
-        aes = AES.new(kib.kib_key, AES.MODE_CBC, kib.kib_iv)
-        decr_data = aes.decrypt(
-            data[offset + cls.PRDB_OFFSET : offset + cls.PRDB_OFFSET + BeeProtectRegionBlock.SIZE]
+        decr_data = aes_cbc_decrypt(
+            kib.kib_key,
+            data[cls.PRDB_OFFSET : cls.PRDB_OFFSET + BeeProtectRegionBlock.SIZE],
+            kib.kib_iv,
         )
         prdb = BeeProtectRegionBlock.parse(decr_data)
         result = cls(prdb, sw_key, kib)
@@ -594,7 +590,7 @@ class BeeNxp:
 
     def __init__(
         self,
-        headers: List[BeeRegionHeader],
+        headers: list[Optional[BeeRegionHeader]],
         input_image: bytes,
         base_address: int,
     ):
@@ -620,39 +616,39 @@ class BeeNxp:
         for block in split_data(image_data, BEE_ENCR_BLOCK_SIZE):
             logger.debug(f"Reading {hex(base_address)}, size={hex(len(block))}")
             for header in self.headers:
-                block = header.encrypt_block(base_address, block)
+                if header:
+                    block = header.encrypt_block(base_address, block)
             encrypted_data.extend(block)
             base_address += len(block)
 
         return bytes(encrypted_data)
 
-    def export_headers(self) -> List[bytes]:
+    def export_headers(self) -> list[Optional[bytes]]:
         """Export BEE headers.
 
         :return: BEE region headers
         """
-        headers = []
-        for header in self.headers:
-            headers.append(header.export())
+        headers: list[Optional[bytes]] = [None, None]
+        for idx, header in enumerate(self.headers):
+            headers[idx] = header.export() if header else None
 
         return headers
 
     @staticmethod
-    def get_supported_families() -> List[str]:
+    def get_supported_families() -> list[str]:
         """Get all supported families for BEE.
 
         :return: List of supported families.
         """
-        database = Database(BEE_DATABASE_FILE)
-        return database.devices.device_names
+        return get_families(DatabaseManager.BEE)
 
     @staticmethod
-    def get_validation_schemas() -> List[Dict[str, Any]]:
+    def get_validation_schemas() -> list[dict[str, Any]]:
         """Get list of validation schemas.
 
         :return: Validation list of schemas.
         """
-        schemas = ValidationSchemas.get_schema_file(BEE_SCH_FILE)
+        schemas = get_schema_file(DatabaseManager.BEE)
         return [schemas["bee_output"], schemas["bee"]]
 
     @staticmethod
@@ -662,16 +658,10 @@ class BeeNxp:
         :return: Dictionary of individual templates (key is name of template, value is template itself).
         """
         val_schemas = BeeNxp.get_validation_schemas()
-
-        yaml_data = ConfigTemplate(
-            "BEE configuration template",
-            val_schemas,
-        ).export_to_yaml()
-
-        return yaml_data
+        return CommentedConfig("BEE configuration template", val_schemas).get_template()
 
     @staticmethod
-    def check_overlaps(bee_headers: List[BeeRegionHeader], start_addr: int) -> None:
+    def check_overlaps(bee_headers: list[Optional[BeeRegionHeader]], start_addr: int) -> None:
         """Check for overlaps in regions.
 
         :param bee_headers: List of BeeRegionHeader
@@ -679,15 +669,16 @@ class BeeNxp:
         :raises SPSDKOverlapError: if the address is inside any region
         """
         for header in bee_headers:
-            for region in header.fac_regions:
-                if region.start_addr <= start_addr < region.end_addr:
-                    raise SPSDKOverlapError(
-                        f"Region start address {hex(start_addr)} is overlapping with {region.info()}"
-                    )
+            if header:
+                for region in header.fac_regions:
+                    if region.start_addr <= start_addr < region.end_addr:
+                        raise SPSDKOverlapError(
+                            f"Region start address {hex(start_addr)} is overlapping with {str(region)}"
+                        )
 
     @staticmethod
     def load_from_config(
-        config: Dict[str, Any], search_paths: Optional[List[str]] = None
+        config: dict[str, Any], search_paths: Optional[list[str]] = None
     ) -> "BeeNxp":
         """Converts the configuration into an BEE image object.
 
@@ -701,38 +692,45 @@ class BeeNxp:
         input_binary = load_binary(config["input_binary"], search_paths)
 
         engine_selection = config["engine_selection"]
-        bee_engines: List[Dict[str, Any]] = config["bee_engine"]
+        bee_engines: list[dict[str, Any]] = config["bee_engine"]
         base_address = value_to_int(config["base_address"])
 
-        prdb = BeeProtectRegionBlock()
-        kib = BeeKIB()
-
-        bee_headers: List[BeeRegionHeader] = []
+        bee_headers: list[Optional[BeeRegionHeader]] = [None, None]
 
         engine_selections = {"engine0": [0], "engine1": [1], "both": [0, 1]}
 
-        try:
-            for engine_idx in engine_selections[engine_selection]:
-                key = value_to_bytes(bee_engines[engine_idx]["user_key"], byte_cnt=16)
-                if bee_engines[engine_idx].get("header_path"):
-                    bin_ehdr = load_binary(bee_engines[engine_idx]["header_path"], search_paths)
-                    ehdr = BeeRegionHeader.parse(bin_ehdr, sw_key=key)
-                else:
-                    ehdr = BeeRegionHeader(prdb, key, kib)
-                bee_headers.append(ehdr)
-        except IndexError as exc:
-            raise SPSDKError("The count of BEE engines is invalid") from exc
+        for engine_idx in engine_selections[engine_selection]:
+            prdb = BeeProtectRegionBlock()
+            kib = BeeKIB()
+            header_idx = engine_idx
+            if engine_idx == len(bee_engines) and engine_selections[engine_selection] == [1]:
+                engine_idx = 0
+            elif engine_idx >= len(bee_engines):
+                raise SPSDKError("The count of BEE engines is invalid")
+            # BEE Configuration
+            bee_cfg: Optional[dict[str, Any]] = bee_engines[engine_idx].get("bee_cfg")
+            if bee_cfg:
+                key = load_hex_string(bee_cfg["user_key"], expected_size=16)
+                bee_headers[header_idx] = BeeRegionHeader(prdb, key, kib)
+                protected_regions = bee_cfg.get("protected_region", [])
+                for protected_region in protected_regions:
+                    fac = BeeFacRegion(
+                        value_to_int(protected_region["start_address"]),
+                        value_to_int(protected_region["length"]),
+                        value_to_int(protected_region["protected_level"]),
+                    )
+                    BeeNxp.check_overlaps(bee_headers, fac.start_addr)
+                    hdr = bee_headers[header_idx]
+                    if hdr:
+                        hdr.add_fac(fac)
+                continue
 
-        for engine_idx, bee_engine in enumerate(bee_engines):
-            for protected_region in bee_engine.get("protected_region", []):
-                fac = BeeFacRegion(
-                    value_to_int(protected_region["start_address"]),
-                    value_to_int(protected_region["length"]),
-                    value_to_int(protected_region["protected_level"]),
-                )
-                BeeNxp.check_overlaps(bee_headers, fac.start_addr)
-                bee_headers[engine_idx].add_fac(fac)
+            # BEE Binary configuration
+            bee_bin_cfg: Optional[dict[str, Any]] = bee_engines[engine_idx].get("bee_binary_cfg")
+            if bee_bin_cfg:
+                key = load_hex_string(bee_bin_cfg["user_key"], expected_size=16)
+                bin_ehdr = load_binary(bee_bin_cfg["header_path"], search_paths)
+                bee_headers[header_idx] = BeeRegionHeader.parse(bin_ehdr, sw_key=key)
+                continue
 
-        bee = BeeNxp(bee_headers, input_binary, base_address)
-
-        return bee
+        return BeeNxp(bee_headers, input_binary, base_address)

@@ -1,29 +1,47 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
-# Copyright 2020-2023 NXP
+# Copyright 2020-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
 """Miscellaneous functions used throughout the SPSDK."""
 import contextlib
 import hashlib
+import json
 import logging
 import math
 import os
 import re
+import textwrap
 import time
+from enum import Enum
 from math import ceil
+from pathlib import Path
 from struct import pack, unpack
-from typing import Callable, Dict, Generator, Iterable, Iterator, List, Optional, TypeVar, Union
+from typing import Any, Callable, Generator, Iterable, Iterator, Optional, Type, TypeVar, Union
 
-from spsdk import SPSDKError
-from spsdk.exceptions import SPSDKValueError
+from packaging.version import Version, parse
+
+from spsdk.crypto.rng import random_bytes
+from spsdk.exceptions import SPSDKError, SPSDKValueError
 from spsdk.utils.exceptions import SPSDKTimeoutError
 
 # for generics
 T = TypeVar("T")  # pylint: disable=invalid-name
 
 logger = logging.getLogger(__name__)
+
+
+class Endianness(str, Enum):
+    """Endianness enum."""
+
+    BIG = "big"
+    LITTLE = "little"
+
+    @classmethod
+    def values(cls) -> list[str]:
+        """Get enumeration values."""
+        return [mem.value for mem in Endianness.__members__.values()]
 
 
 class BinaryPattern:
@@ -55,7 +73,7 @@ class BinaryPattern:
         try:
             value_to_int(pattern)
         except SPSDKError:
-            if not pattern in BinaryPattern.SPECIAL_PATTERNS:
+            if pattern not in BinaryPattern.SPECIAL_PATTERNS:
                 raise SPSDKValueError(  # pylint: disable=raise-missing-from
                     f"Unsupported input pattern {pattern}"
                 )
@@ -75,10 +93,7 @@ class BinaryPattern:
             return bytes(b"\xff" * size)
 
         if self._pattern == "rand":
-            # pylint: disable=import-outside-toplevel
-            from spsdk.utils.crypto.common import crypto_backend
-
-            return crypto_backend().random_bytes(size)
+            return random_bytes(size)
 
         if self._pattern == "inc":
             return bytes((x & 0xFF for x in range(size)))
@@ -116,7 +131,7 @@ def align(number: int, alignment: int = 4) -> int:
 def align_block(
     data: Union[bytes, bytearray],
     alignment: int = 4,
-    padding: Optional[Union[int, BinaryPattern]] = None,
+    padding: Optional[Union[int, str, BinaryPattern]] = None,
 ) -> bytes:
     """Align binary data block length to specified boundary by adding padding bytes to the end.
 
@@ -164,6 +179,19 @@ def extend_block(data: bytes, length: int, padding: int = 0) -> bytes:
     return data + bytes([padding]) * num_padding
 
 
+def clean_up_file_name(original_name: str) -> str:
+    """Clean up the file name.
+
+    :param original_name: Input file name
+    :return: Sanitized name.
+    """
+    invalid_characters = '<>:"|?*\\'
+    for ch in invalid_characters:
+        original_name = original_name.replace(ch, "")
+
+    return original_name
+
+
 def find_first(iterable: Iterable[T], predicate: Callable[[T], bool]) -> Optional[T]:
     """Find first element from the list, that matches the condition.
 
@@ -174,7 +202,7 @@ def find_first(iterable: Iterable[T], predicate: Callable[[T], bool]) -> Optiona
     return next((a for a in iterable if predicate(a)), None)
 
 
-def load_binary(path: str, search_paths: Optional[List[str]] = None) -> bytes:
+def load_binary(path: str, search_paths: Optional[list[str]] = None) -> bytes:
     """Loads binary file into bytes.
 
     :param path: Path to the file.
@@ -186,12 +214,12 @@ def load_binary(path: str, search_paths: Optional[List[str]] = None) -> bytes:
     return data
 
 
-def load_text(path: str, search_paths: Optional[List[str]] = None) -> str:
-    """Loads binary file into bytes.
+def load_text(path: str, search_paths: Optional[list[str]] = None) -> str:
+    """Loads text file into string.
 
     :param path: Path to the file.
     :param search_paths: List of paths where to search for the file, defaults to None
-    :return: content of the binary file as bytes
+    :return: content of the text file as string
     """
     text = load_file(path, mode="r", search_paths=search_paths)
     assert isinstance(text, str)
@@ -199,7 +227,7 @@ def load_text(path: str, search_paths: Optional[List[str]] = None) -> str:
 
 
 def load_file(
-    path: str, mode: str = "r", search_paths: Optional[List[str]] = None
+    path: str, mode: str = "r", search_paths: Optional[list[str]] = None
 ) -> Union[str, bytes]:
     """Loads a file into bytes.
 
@@ -210,19 +238,18 @@ def load_file(
     """
     path = find_file(path, search_paths=search_paths)
     logger.debug(f"Loading {'binary' if 'b' in mode else 'text'} file from {path}")
-    with open(path, mode) as f:
+    encoding = None if "b" in mode else "utf-8"
+    with open(path, mode, encoding=encoding) as f:
         return f.read()
 
 
-def write_file(
-    data: Union[str, bytes], path: str, mode: str = "w", encoding: Optional[str] = None
-) -> int:
+def write_file(data: Union[str, bytes], path: str, mode: str = "w", encoding: str = "utf-8") -> int:
     """Writes data into a file.
 
     :param data: data to write
     :param path: Path to the file.
     :param mode: writing mode, 'w' for text, 'wb' for binary data, defaults to 'w'
-    :param encoding: Encoding of written file ('ascii', 'utf-8').
+    :param encoding: Encoding of written file ('ascii', 'utf-8'), default is 'utf-8'.
     :return: number of written elements
     """
     path = path.replace("\\", "/")
@@ -231,7 +258,7 @@ def write_file(
         os.makedirs(folder, exist_ok=True)
 
     logger.debug(f"Storing {'binary' if 'b' in mode else 'text'} file at {path}")
-    with open(path, mode, encoding=encoding) as f:
+    with open(path, mode, encoding=None if "b" in mode else encoding) as f:
         return f.write(data)
 
 
@@ -247,10 +274,86 @@ def get_abs_path(file_path: str, base_dir: Optional[str] = None) -> str:
     return os.path.abspath(os.path.join(base_dir or os.getcwd(), file_path)).replace("\\", "/")
 
 
+def _find_path(
+    path: str,
+    check_func: Callable[[str], bool],
+    use_cwd: bool = True,
+    search_paths: Optional[list[str]] = None,
+    raise_exc: bool = True,
+) -> str:
+    """Return a full path to the file.
+
+    `search_paths` takes precedence over `CWD` if used (default)
+
+    :param path: File name, part of file path or full path
+    :param use_cwd: Try current working directory to find the file, defaults to True
+    :param search_paths: List of paths where to search for the file, defaults to None
+    :param raise_exc: Raise exception if file is not found, defaults to True
+    :return: Full path to the file
+    :raises SPSDKError: File not found
+    """
+    path = path.replace("\\", "/")
+
+    if os.path.isabs(path):
+        if not check_func(path):
+            if raise_exc:
+                raise SPSDKError(f"Path '{path}' not found")
+            return ""
+        return path
+    if search_paths:
+        for dir_candidate in search_paths:
+            if not dir_candidate:
+                continue
+            dir_candidate = dir_candidate.replace("\\", "/")
+            path_candidate = get_abs_path(path, base_dir=dir_candidate)
+            if check_func(path_candidate):
+                return path_candidate
+    if use_cwd and check_func(path):
+        return get_abs_path(path)
+    # list all directories in error message
+    searched_in: list[str] = []
+    if use_cwd:
+        searched_in.append(os.path.abspath(os.curdir))
+    if search_paths:
+        searched_in.extend(filter(None, search_paths))
+    searched_in = [s.replace("\\", "/") for s in searched_in]
+    err_str = f"Path '{path}' not found, Searched in: {', '.join(searched_in)}"
+    if not raise_exc:
+        logger.debug(err_str)
+        return ""
+    raise SPSDKError(err_str)
+
+
+def find_dir(
+    dir_path: str,
+    use_cwd: bool = True,
+    search_paths: Optional[list[str]] = None,
+    raise_exc: bool = True,
+) -> str:
+    """Return a full path to the directory.
+
+    `search_paths` takes precedence over `CWD` if used (default)
+
+    :param dir_path: Directory name, part of directory path or full path
+    :param use_cwd: Try current working directory to find the directory, defaults to True
+    :param search_paths: List of paths where to search for the directory, defaults to None
+    :param raise_exc: Raise exception if directory is not found, defaults to True
+    :return: Full path to the directory
+    :raises SPSDKError: File not found
+    """
+    return _find_path(
+        path=dir_path,
+        check_func=os.path.isdir,
+        use_cwd=use_cwd,
+        search_paths=search_paths,
+        raise_exc=raise_exc,
+    )
+
+
 def find_file(
     file_path: str,
     use_cwd: bool = True,
-    search_paths: Optional[List[str]] = None,
+    search_paths: Optional[list[str]] = None,
     raise_exc: bool = True,
 ) -> str:
     """Return a full path to the file.
@@ -264,32 +367,13 @@ def find_file(
     :return: Full path to the file
     :raises SPSDKError: File not found
     """
-    file_path = file_path.replace("\\", "/")
-
-    if os.path.isabs(file_path):
-        return file_path
-    if search_paths:
-        for dir_candidate in search_paths:
-            if not dir_candidate:
-                continue
-            dir_candidate = dir_candidate.replace("\\", "/")
-            path_candidate = get_abs_path(file_path, base_dir=dir_candidate)
-            if os.path.isfile(path_candidate):
-                return path_candidate
-    if use_cwd and os.path.isfile(file_path):
-        return get_abs_path(file_path)
-    # list all directories in error message
-    searched_in: List[str] = []
-    if use_cwd:
-        searched_in.append(os.path.abspath(os.curdir))
-    if search_paths:
-        searched_in.extend(filter(None, search_paths))
-    searched_in = [s.replace("\\", "/") for s in searched_in]
-    err_str = f"File '{file_path}' not found, Searched in: {', '.join(searched_in)}"
-    if not raise_exc:
-        logger.debug(err_str)
-        return ""  # TODO Maybe, it will be better return None and solve raised MyPY recommendations
-    raise SPSDKError(err_str)
+    return _find_path(
+        path=file_path,
+        check_func=os.path.isfile,
+        use_cwd=use_cwd,
+        search_paths=search_paths,
+        raise_exc=raise_exc,
+    )
 
 
 @contextlib.contextmanager
@@ -309,88 +393,8 @@ def use_working_directory(path: str) -> Iterator[None]:
         yield
     finally:
         os.chdir(current_dir)
-        assert os.getcwd() == current_dir
-
-
-class DebugInfo:
-    """The class is used to provide detailed information about export process and exported data.
-
-    It is handy for analyzing content and debugging changes in the exported binary output.
-    """
-
-    @classmethod
-    def disabled(cls) -> "DebugInfo":
-        """Return an instance of DebugInfo with disabled message collecting."""
-        return DebugInfo(enabled=False)
-
-    def __init__(self, enabled: bool = True):
-        """Constructor.
-
-        :param enabled: True if logging enabled; False otherwise
-        """
-        self._lines: Optional[List[str]] = [] if enabled else None
-
-    @property
-    def enabled(self) -> bool:
-        """:return: whether debugging enabled."""
-        return self._lines is not None
-
-    def append(self, line: str) -> None:
-        """Appends the line to the log.
-
-        :param line: text to be added
-        :raises SPSDKError: When there is nothing to append
-        """
-        if self.enabled:
-            if self._lines is None:
-                raise SPSDKError("There is nothing to append")
-            self._lines.append(line)
-
-    def append_section(self, name: str) -> None:
-        """Append new section to the debug log.
-
-        :param name: of the section
-        """
-        self.append(f"[{name}]")
-
-    def append_hex_data(self, data: bytes) -> None:
-        """Append binary data in HEX form.
-
-        :param data: to be logged
-        """
-        self.append("hex=" + data.hex())
-        self.append("len=" + str(len(data)) + "=" + hex(len(data)))
-
-    def append_binary_section(self, section_name: str, data: bytes) -> None:
-        """Append section and binary data.
-
-        :param section_name: the name
-        :param data: binary data
-        """
-        self.append_section(section_name)
-        self.append_hex_data(data)
-
-    def append_binary_data(self, data_name: str, data: bytes) -> None:
-        """Append short section with binary data.
-
-        :param data_name: the name
-        :param data: binary data (up to 8 bytes)
-        :raises SPSDKError: When the data has incorrect length
-        """
-        if len(data) > 16:
-            raise SPSDKError("Incorrect data length")
-        self.append(data_name + "=" + data.hex())
-
-    @property
-    def lines(self) -> Iterable[str]:
-        """:return: list of logged lines; empty list if nothing logged or log disabled."""
-        if self._lines:
-            return self._lines
-        return []
-
-    def info(self) -> str:
-        """:return: multi-line text with log; empty string if nothing logged or log disabled."""
-        return "\n".join(self.lines)
+        if os.getcwd() != current_dir:
+            logger.warning(f"Directory was not changed back to the original one: {current_dir}")
 
 
 def format_value(value: int, size: int, delimiter: str = "_", use_prefix: bool = True) -> str:
@@ -401,10 +405,11 @@ def format_value(value: int, size: int, delimiter: str = "_", use_prefix: bool =
     """
     padding = size if size % 8 else (size // 8) * 2
     infix = "b" if size % 8 else "x"
-    parts = re.findall(".{1,4}", f"{value:0{padding}{infix}}"[::-1])
+    sign = "-" if value < 0 else ""
+    parts = re.findall(".{1,4}", f"{abs(value):0{padding}{infix}}"[::-1])
     rev = delimiter.join(parts)[::-1]
     prefix = f"0{infix}" if use_prefix else ""
-    return f"{prefix}{rev}"
+    return f"{sign}{prefix}{rev}"
 
 
 def get_bytes_cnt_of_int(
@@ -451,7 +456,7 @@ def value_to_int(value: Union[bytes, bytearray, int, str], default: Optional[int
         return value
 
     if isinstance(value, (bytes, bytearray)):
-        return int.from_bytes(value, "big")
+        return int.from_bytes(value, Endianness.BIG.value)
 
     if isinstance(value, str) and value != "":
         match = re.match(
@@ -474,7 +479,7 @@ def value_to_bytes(
     value: Union[bytes, bytearray, int, str],
     align_to_2n: bool = True,
     byte_cnt: Optional[int] = None,
-    endianness: str = "big",
+    endianness: Endianness = Endianness.BIG,
 ) -> bytes:
     """Function loads value from lot of formats.
 
@@ -492,28 +497,77 @@ def value_to_bytes(
 
     value = value_to_int(value)
     return value.to_bytes(
-        get_bytes_cnt_of_int(value, align_to_2n, byte_cnt=byte_cnt),
-        endianness,  # type: ignore[arg-type]
+        get_bytes_cnt_of_int(value, align_to_2n, byte_cnt=byte_cnt), endianness.value
     )
 
 
-def value_to_bool(value: Union[bool, int, str]) -> bool:
+def value_to_bool(value: Optional[Union[bool, int, str]]) -> bool:
     """Function decode bool value from various formats.
 
     :param value: Input value.
     :return: Boolean value.
     :raises SPSDKError: Unsupported input type.
     """
-    if isinstance(value, bool):
-        return value
-
-    if isinstance(value, int):
-        return bool(value)
-
     if isinstance(value, str):
-        return value in ("True", "T", "1")
+        return value in ("True", "true", "T", "1")
 
-    raise SPSDKError(f"Invalid input Boolean type({type(value)}) with value ({value})")
+    return bool(value)
+
+
+def load_hex_string(
+    source: Optional[Union[str, int, bytes]],
+    expected_size: int,
+    search_paths: Optional[list[str]] = None,
+    name: Optional[str] = "key",
+) -> bytes:
+    """Get the HEX string from the command line parameter (Keys, digests, etc).
+
+    :param source: File path to key file or hexadecimal value. If not specified random value is used.
+    :param expected_size: Expected size of key in bytes.
+    :param search_paths: List of paths where to search for the file, defaults to None
+    :param name: Name for the key/data to load
+    :raises SPSDKError: Invalid key
+    :return: Key in bytes.
+    """
+    if not source:
+        logger.warning(
+            f"The key source is not specified, the random value is used in size of {expected_size} B."
+        )
+        return random_bytes(expected_size)
+
+    key = None
+    if expected_size < 1:
+        raise SPSDKError(f"Expected size of key must be positive. Got: {expected_size}")
+
+    if isinstance(source, (bytes, int)):
+        return value_to_bytes(source, byte_cnt=expected_size)
+
+    try:
+        file_path = find_file(source, search_paths=search_paths)
+        try:
+            str_key = load_file(file_path)
+            assert isinstance(str_key, str)
+            if not str_key.startswith(("0x", "0X")):
+                str_key = "0x" + str_key
+            key = value_to_bytes(str_key, byte_cnt=expected_size)
+            if len(key) != expected_size:
+                raise SPSDKError(f"Invalid {name} size. Expected: {expected_size}, got: {len(key)}")
+        except (SPSDKError, UnicodeDecodeError):
+            key = load_binary(file_path)
+    except Exception:
+        try:
+            if not source.startswith(("0x", "0X")):
+                source = "0x" + source
+            key = value_to_bytes(source, byte_cnt=expected_size)
+        except SPSDKError:
+            pass
+
+    if key is None:
+        raise SPSDKError(f"Invalid key input: {source}")
+    if len(key) != expected_size:
+        raise SPSDKError(f"Invalid {name} size. Expected: {expected_size}, got: {len(key)}")
+
+    return key
 
 
 def reverse_bytes_in_longs(arr: bytes) -> bytes:
@@ -533,21 +587,6 @@ def reverse_bytes_in_longs(arr: bytes) -> bytes:
         word = bytearray(arr[x : x + 4])
         word.reverse()
         result.extend(word)
-    return bytes(result)
-
-
-def reverse_bits_in_bytes(arr: bytes) -> bytes:
-    """The function reverse bits order in input bytes.
-
-    :param arr: Input array.
-    :return: New array with reversed bits in bytes.
-    :raises SPSDKError: Raises when invalid value is in input.
-    """
-    result = bytearray()
-
-    for x in arr:
-        result.append(int(f"{x:08b}"[::-1], 2))
-
     return bytes(result)
 
 
@@ -622,7 +661,7 @@ class Timeout:
         return self._convert_to_units(self._get_current_time_us() - self.start_time_us)
 
     def get_consumed_time_ms(self) -> int:
-        """Returns consumed time since start of timeouted operation in milliseconds.
+        """Returns consumed time since start of timed out operation in milliseconds.
 
         :return: Consumed time in milliseconds
         """
@@ -682,6 +721,19 @@ def size_fmt(num: Union[float, int], use_kibibyte: bool = True) -> str:
     return f"{int(num)} {i}" if i == "B" else f"{num:3.1f} {i}"
 
 
+def bytes_to_print(data: bytes, max_size: int = 128) -> str:
+    """Prints bytes to hex string and shorten it if needed.
+
+    :param data: Input data in bytes
+    :param max_size: maximal count of bytes to be printed, defaults to 128
+    :return: Hex string of input data
+    """
+    if len(data) <= max_size:
+        return data.hex()
+
+    return data[:max_size].hex() + "..."
+
+
 def numberify_version(version: str, separator: str = ".", valid_numbers: int = 3) -> int:
     """Turn version string into a number.
 
@@ -725,7 +777,7 @@ def sanitize_version(version: str, separator: str = ".", valid_numbers: int = 3)
     return separator.join(version_parts[:valid_numbers])
 
 
-def get_key_by_val(value: str, dictionary: Dict[str, List[str]]) -> str:
+def get_key_by_val(value: str, dictionary: dict[str, list[str]]) -> str:
     """Return key by its value.
 
     :param value: Value to find.
@@ -764,6 +816,17 @@ def swap32(x: int) -> int:
     return unpack("<I", pack(">I", x))[0]
 
 
+def reverse_bits(x: int, bits_cnt: int = 32) -> int:
+    """Reverse bits in integer.
+
+    :param x: Integer to be bit reversed
+    :param bits_cnt: Count of bits to reverse
+    :return: Reversed value value
+    """
+    str_bits_format = "{:0{bits_cnt}b}".format(x, bits_cnt=bits_cnt)
+    return int(str_bits_format[::-1], 2)
+
+
 def check_range(x: int, start: int = 0, end: int = (1 << 32) - 1) -> bool:
     """Check if the number is in range.
 
@@ -778,38 +841,40 @@ def check_range(x: int, start: int = 0, end: int = (1 << 32) - 1) -> bool:
     return True
 
 
-def load_configuration(path: str) -> dict:
+def load_configuration(path: str, search_paths: Optional[list[str]] = None) -> dict:
     """Load configuration from yml/json file.
 
     :param path: Path to configuration file
+    :param search_paths: List of paths where to search for the file, defaults to None
     :raises SPSDKError: When unsupported file is provided
     :return: Content of configuration as dictionary
     """
-    if not os.path.exists(path):
-        raise SPSDKError(f"File not found'{path}'.")
-
-    # import YAML only if needed to save startup time
-    from ruamel.yaml import YAML, YAMLError  # pylint: disable=import-outside-toplevel
-
     try:
-        with open(path) as f:
-            return YAML(typ="safe").load(f)
-    except (YAMLError, UnicodeDecodeError):
-        pass
+        config = load_text(path, search_paths=search_paths)
+    except Exception as exc:
+        raise SPSDKError(f"Can't load configuration file: {str(exc)}") from exc
 
-    # import json only if needed to save startup time
-    import commentjson as json  # pylint: disable=import-outside-toplevel
-
+    config_data: Optional[dict] = None
     try:
-        with open(path) as f:
-            return json.load(f)
-    except json.JSONLibraryException:
-        pass
+        config_data = json.loads(config)
+    except json.JSONDecodeError:
+        # import YAML only if needed to save startup time
+        from yaml import YAMLError, safe_load  # pylint: disable=import-outside-toplevel
 
-    raise SPSDKError(f"Unable to load '{path}'.")
+        try:
+            config_data = safe_load(config)
+        except (YAMLError, UnicodeDecodeError):
+            pass
+
+    if not config_data:
+        raise SPSDKError(f"Can't parse configuration file: {path}")
+    if not isinstance(config_data, dict):
+        raise SPSDKError(f"Invalid configuration file: {path}")
+
+    return config_data
 
 
-def split_data(data: bytearray, size: int) -> Generator[bytes, None, None]:
+def split_data(data: Union[bytearray, bytes], size: int) -> Generator[bytes, None, None]:
     """Split data into chunks of size.
 
     :param bytearray data: array of bytes to be split
@@ -824,4 +889,110 @@ def get_hash(text: Union[str, bytes]) -> str:
     """Returns hash of given text."""
     if isinstance(text, str):
         text = text.encode("utf-8")
-    return hashlib.sha1(text).digest().hex()[:8]
+    return hashlib.sha256(text).digest().hex()[:8]
+
+
+def deep_update(d: dict, u: dict) -> dict:
+    """Deep update nested dictionaries.
+
+    :param d: Dictionary that will be updated
+    :param u: Dictionary with update information
+    :returns: Updated dictionary.
+    """
+    for k, v in u.items():
+        if isinstance(v, dict):
+            d[k] = deep_update(d.get(k, {}), v)
+        else:
+            d[k] = v
+    return d
+
+
+def wrap_text(text: str, max_line: int = 100) -> str:
+    """Wrap text in SPSDK standard.
+
+    Count with new lines in input string and do wrapping after that.
+
+    :param text: Text to wrap
+    :param max_line: Max line in output, defaults to 100
+    :return: Wrapped text (added new lines characters on right places)
+    """
+    lines = text.splitlines()
+    return "\n".join([textwrap.fill(text=line, width=max_line) for line in lines])
+
+
+def get_printable_path(path: str) -> str:
+    """Get path to the file.
+
+    If the JUPYTER_SPSDK environment variable is set to 1,
+    the path is relative to the current working directory.
+
+    :param path: Path to the file.
+    :return: Path to the file.
+    """
+    # check Jupyter env variable
+    if "JUPYTER_SPSDK" in os.environ and os.environ["JUPYTER_SPSDK"] == "1":
+        return Path(os.path.relpath(path, os.getcwd())).as_posix()
+    return path
+
+
+TS = TypeVar("TS", bound="SingletonMeta")  # pylint: disable=invalid-name
+
+
+class SingletonMeta(type):
+    """Singleton metaclass."""
+
+    _instance = None
+
+    def __call__(cls: Type[TS], *args: Any, **kwargs: Any) -> TS:  # type: ignore
+        """Call dunder override."""
+        if cls._instance is None:
+            instance = super().__call__(*args, **kwargs)
+            cls._instance = instance
+        return cls._instance
+
+
+def get_spsdk_version() -> Version:
+    """Get SPSDK version."""
+    try:
+        from spsdk.__version__ import version as spsdk_version
+
+    except ImportError:
+        from setuptools_scm import get_version
+
+        spsdk_version = get_version()
+    return parse(spsdk_version)
+
+
+def load_secret(value: str, search_paths: Optional[list[str]] = None) -> str:
+    """Load secret text from the configuration value.
+
+    :param value: Input string to be used for loading the secret
+    :param search_paths: List of paths where to search for the file, defaults to None
+
+    There are several options how the secret is loaded from the input string
+    1. If the value is an existing path, first line of file is read and returned
+    2. If the value has format '$ENV_VAR', the value of environment variable ENV_VAR is returned
+    3. If the value has format '$ENV_VAR' and the value contains a valid path to a file,
+    the first line of a file is returned
+    4. If the value does not match any options above, the input value itself is returned
+
+    Note, that the value with an initial component of ~ or ~user is replaced by that user’s home directory.
+
+    :return: The actual secret value
+    """
+    # value of api_key may contain '~' for user home or '$' for environment variable
+    value = os.path.expanduser(os.path.expandvars(value))
+    try:
+        file = find_file(file_path=value, search_paths=search_paths)
+        with open(file, encoding="utf-8") as f:
+            value = f.readline().strip()
+    except SPSDKError:
+        pass
+    return value
+
+
+def swap_bytes(data: bytes) -> bytes:
+    """Swap individual bytes as following: b'abcd' -> b'badc'."""
+    data_array = bytearray(data)
+    data_array[0::2], data_array[1::2] = data_array[1::2], data_array[0::2]
+    return bytes(data_array)

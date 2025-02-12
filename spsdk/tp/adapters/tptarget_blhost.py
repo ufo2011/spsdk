@@ -1,25 +1,25 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2021-2023 NXP
+# Copyright 2021-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 """Trust provisioning - TP Target, ISP mode over BLHOST."""
 
 from enum import Enum
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Optional, Union
 
-from spsdk.mboot import interfaces
 from spsdk.mboot.exceptions import McuBootError, StatusCode
-from spsdk.mboot.interfaces.base import MBootInterface
-from spsdk.mboot.interfaces.uart import Uart
-from spsdk.mboot.interfaces.usb import RawHid
+from spsdk.mboot.interfaces.uart import MbootUARTInterface
+from spsdk.mboot.interfaces.usb import MbootUSBInterface
 from spsdk.mboot.mcuboot import McuBoot
-from spsdk.tp import TP_SCH_FILE, TpTargetInterface
+from spsdk.mboot.protocol.base import MbootProtocolBase
 from spsdk.tp.exceptions import SPSDKTpTargetError
-from spsdk.tp.tp_intf import TpIntfDescription
+from spsdk.tp.tp_intf import TpIntfDescription, TpTargetInterface
+from spsdk.utils.database import DatabaseManager, get_db, get_schema_file
+from spsdk.utils.interfaces.device.serial_device import SerialDevice
+from spsdk.utils.interfaces.device.usb_device import UsbDevice
 from spsdk.utils.misc import value_to_int
-from spsdk.utils.schema_validator import ValidationSchemas
 
 
 class TpBlHostIntfDescription(TpIntfDescription):
@@ -29,7 +29,7 @@ class TpBlHostIntfDescription(TpIntfDescription):
         self,
         name: str,
         description: str,
-        settings: Optional[Dict],
+        settings: Optional[dict],
     ) -> None:
         """The BLHOST adapter for TPHOST interface description class.
 
@@ -38,38 +38,44 @@ class TpBlHostIntfDescription(TpIntfDescription):
         :param settings: Settings of target
         """
         super().__init__(name, TpTargetBlHost, description, settings)
-        self.device: Optional[MBootInterface] = None
+        self.interface: Optional[MbootProtocolBase] = None
 
-    def as_dict(self) -> Dict[str, Any]:
+    def as_dict(self) -> dict[str, Any]:
         """Returns dictionary with important fields for selection table."""
         ret = {}
         ret["name"] = self.name
         ret["description"] = self.description
         # For USB device
-        if isinstance(self.device, RawHid):
-            ret["path_hash"] = self.device.path_hash
-            ret["pid_vid"] = f"{self.device.vid:#06x}:{self.device.pid:#06x}"
-        if isinstance(self.device, Uart):
-            ret["port"] = self.device.device.port
-            ret["baudrate"] = self.device.device.baudrate
+        if isinstance(self.interface, MbootUSBInterface):
+            assert isinstance(self.interface.device, UsbDevice)
+            ret["path_hash"] = self.interface.device.path_hash
+            ret["pid_vid"] = f"{self.interface.device.vid:#06x}:{self.interface.device.pid:#06x}"
+        if isinstance(self.interface, MbootUARTInterface):
+            assert isinstance(self.interface.device, SerialDevice)
+            ret["port"] = self.interface.device._device.port
+            ret["baudrate"] = self.interface.device._device.baudrate
 
         return ret
 
     def get_id(self) -> str:
         """Returns the ID of the interface (com port or VID:PID)."""
-        if isinstance(self.device, Uart):
-            return self.device.device.port
-        if isinstance(self.device, RawHid):
-            return f"{self.device.vid:#06x}:{self.device.pid:#06x}"
-        raise SPSDKTpTargetError(f"Unknown target device type: {type(self.device)}")
+        if isinstance(self.interface, MbootUARTInterface):
+            assert isinstance(self.interface.device, SerialDevice)
+            return self.interface.device._device.port
+        if isinstance(self.interface, MbootUSBInterface):
+            assert isinstance(self.interface.device, UsbDevice)
+            return f"{self.interface.device.vid:#06x}:{self.interface.device.pid:#06x}"
+        raise SPSDKTpTargetError(f"Unknown target device type: {type(self.interface)}")
 
     def get_id_hash(self) -> str:
         """Return the ID hash of the interface. (COM port or hash of USB path)."""
-        if isinstance(self.device, Uart):
-            return self.device.device.port
-        if isinstance(self.device, RawHid):
-            return self.device.path_hash
-        raise SPSDKTpTargetError(f"Unknown target device type: {type(self.device)}")
+        if isinstance(self.interface, MbootUARTInterface):
+            assert isinstance(self.interface.device, SerialDevice)
+            return self.interface.device._device.port
+        if isinstance(self.interface, MbootUSBInterface):
+            assert isinstance(self.interface.device, UsbDevice)
+            return self.interface.device.path_hash
+        raise SPSDKTpTargetError(f"Unknown target device type: {type(self.interface)}")
 
 
 class TpTargetBlHost(TpTargetInterface):
@@ -86,7 +92,7 @@ class TpTargetBlHost(TpTargetInterface):
         BAUDRATE = "blhost_baudrate"
 
     @staticmethod
-    def _get_settings(settings: Optional[Dict] = None) -> Dict:
+    def _get_settings(settings: Optional[dict] = None) -> dict:
         """The function gets the important parameters for BLHOST from general settings.
 
         :param settings: General TPHOST target settings, defaults to None
@@ -100,13 +106,13 @@ class TpTargetBlHost(TpTargetInterface):
         return ret
 
     @classmethod
-    def get_connected_targets(cls, settings: Optional[Dict] = None) -> List[TpIntfDescription]:
+    def get_connected_targets(cls, settings: Optional[dict] = None) -> list[TpIntfDescription]:
         """Get all connected TP targets of this adapter.
 
         :param settings: Possible settings to determine the way to find connected device, defaults to None.
         :return: List of all founded TP targets.
         """
-        ret: List[TpIntfDescription] = []
+        ret: list[TpIntfDescription] = []
         desc = cls._get_settings(settings)
 
         handle_usb = not desc["port"]
@@ -116,66 +122,76 @@ class TpTargetBlHost(TpTargetInterface):
             handle_uart, handle_usb = True, True
 
         if handle_usb:
-            usb_targets: Sequence[RawHid] = interfaces.scan_usb(desc["usb"])
+            usb_targets = MbootUSBInterface.scan(desc["usb"])
             for usb_target in usb_targets:
-                name = usb_target.name
-                description = "BLHOST USB target " + str(usb_target.interface_number)
-                usbt_desc = TpBlHostIntfDescription(name, description, settings)
-                usbt_desc.device = usb_target
-                usbt_desc.device.timeout = desc["timeout"]
+                assert isinstance(usb_target.device, UsbDevice)
+                usb_name = usb_target.name
+                description = "BLHOST USB target " + str(usb_target.device.interface_number)
+                usbt_desc = TpBlHostIntfDescription(usb_name, description, settings)
+                usbt_desc.interface = usb_target
+                usbt_desc.interface.device.timeout = desc["timeout"]
                 ret.append(usbt_desc)
 
         if handle_uart:
-            uart_targets: Sequence[Uart] = interfaces.scan_uart(
-                desc["port"], desc["baudrate"], desc["timeout"]
-            )
-
+            uart_targets = MbootUARTInterface.scan(desc["port"], desc["baudrate"], desc["timeout"])
             for uart_target in uart_targets:
-                name = uart_target.device.port
+                assert isinstance(uart_target.device, SerialDevice)
+                uart_name = uart_target.device._device.port
                 description = "BLHOST UART target"
-                uart_desc = TpBlHostIntfDescription(name, description, settings)
-                uart_desc.device = uart_target
+                uart_desc = TpBlHostIntfDescription(uart_name, description, settings)
+                uart_desc.interface = uart_target
                 ret.append(uart_desc)
 
         return ret
 
     get_connected_interfaces = get_connected_targets
 
-    def __init__(self, descriptor: TpBlHostIntfDescription) -> None:
+    def __init__(
+        self,
+        descriptor: TpBlHostIntfDescription,
+        family: str,
+        *args: Union[int, str],
+        **kwargs: Union[int, str],
+    ) -> None:
         """Initialization of provisioned device adapter.
 
         :param descriptor: BLHOST adapter interface description.
         :raises SPSDKTpTargetError: None existing device.
         """
         super().__init__(descriptor=descriptor)
-        if not descriptor.device:
+        if not descriptor.interface:
             raise SPSDKTpTargetError("Device is not defined.")
-        self.mboot = McuBoot(descriptor.device)
+        self.mboot = McuBoot(descriptor.interface)
 
-        # TODO Get the right pseudo index instead of memory address
         self.buffer_address = (
             value_to_int(self.descriptor.settings.get("buffer_address", 0))
             if self.descriptor.settings
             else 0
         )
-        # TODO Get the right buffer size
+        if not self.buffer_address:
+            db = get_db(family, "latest")
+            self.buffer_address = db.get_int(DatabaseManager.COMM_BUFFER, "address")
+
         self.buffer_size = (
-            value_to_int(self.descriptor.settings.get("buffer_size", 0x1000))
+            value_to_int(self.descriptor.settings.get("buffer_size", 0))
             if self.descriptor.settings
-            else 0x1000
+            else 0
         )
+        if not self.buffer_size:
+            db = get_db(family, "latest")
+            self.buffer_size = db.get_int(DatabaseManager.COMM_BUFFER, "size", default=0x1000)
 
     @property
     def uses_uart(self) -> bool:
         """Check if the adapter is using UART for communication."""
         assert isinstance(self.descriptor, TpBlHostIntfDescription)
-        return isinstance(self.descriptor.device, Uart)
+        return isinstance(self.descriptor.interface, MbootUARTInterface)
 
     @property
     def uses_usb(self) -> bool:
         """Check if the adapter is using USB for communication."""
         assert isinstance(self.descriptor, TpBlHostIntfDescription)
-        return isinstance(self.descriptor.device, RawHid)
+        return isinstance(self.descriptor.interface, MbootUSBInterface)
 
     def open(self) -> None:
         """Open the provisioned device adapter."""
@@ -185,7 +201,7 @@ class TpTargetBlHost(TpTargetInterface):
     @property
     def is_open(self) -> bool:
         """Check if provisioned device adapter is open."""
-        return self.mboot._device.is_opened
+        return self.mboot._interface.is_opened
 
     def close(self) -> None:
         """Close the provisioned device adapter."""
@@ -279,12 +295,12 @@ class TpTargetBlHost(TpTargetInterface):
         )
 
     @classmethod
-    def get_validation_schemas(cls) -> List[Dict[str, Any]]:
+    def get_validation_schemas(cls) -> list[dict[str, Any]]:
         """Return all additional validation schemas for interface.
 
         return: List of all additional validation schemas.
         """
-        sch_cfg_file = ValidationSchemas.get_schema_file(TP_SCH_FILE)
+        sch_cfg_file = get_schema_file(DatabaseManager.TP)
 
         return [sch_cfg_file["target_blhost"]]
 
@@ -349,6 +365,5 @@ class TpTargetBlHost(TpTargetInterface):
             if self.mboot.status_code == StatusCode.UNKNOWN_COMMAND:
                 return False
             raise
-        else:
-            # this should never happen
-            raise SPSDKTpTargetError("Check for ProvFW boot-up malfunctioned!")
+        # this should never happen
+        raise SPSDKTpTargetError("Check for ProvFW boot-up malfunctioned!")

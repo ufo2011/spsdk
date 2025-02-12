@@ -2,24 +2,27 @@
 # -*- coding: UTF-8 -*-
 #
 # Copyright 2017-2018 Martin Olejar
-# Copyright 2019-2023 NXP
+# Copyright 2019-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
 """Header."""
 
 from struct import calcsize, pack, unpack_from
-from typing import Optional
+from typing import Optional, Union
 
-from spsdk import SPSDKError
-from spsdk.utils.easy_enum import Enum
+from typing_extensions import Self
+
+from spsdk.exceptions import SPSDKError, SPSDKParsingError
+from spsdk.utils.abstract import BaseClass
+from spsdk.utils.spsdk_enum import SpsdkEnum
 
 ########################################################################################################################
 # Enums
 ########################################################################################################################
 
 
-class SegTag(Enum):
+class SegTag(SpsdkEnum):
     """Segments Tag."""
 
     XMCD = (0xC0, "XMCD", "External Memory Configuration Data")
@@ -40,7 +43,7 @@ class SegTag(Enum):
     SIGB = (0x90, "SIGB", "Signature block")
 
 
-class CmdTag(Enum):
+class CmdTag(SpsdkEnum):
     """CSF/DCD Command Tag."""
 
     SET = (0xB1, "SET", "Set")
@@ -54,24 +57,11 @@ class CmdTag(Enum):
 
 
 ########################################################################################################################
-# Exceptions
-########################################################################################################################
-
-
-class UnparsedException(Exception):
-    """Unparsed Exception."""
-
-
-class CorruptedException(Exception):
-    """Corrupted Exception."""
-
-
-########################################################################################################################
 # Classes
 ########################################################################################################################
 
 
-class Header:
+class Header(BaseClass):
     """Header element type."""
 
     FORMAT = ">BHB"
@@ -104,7 +94,7 @@ class Header:
     @property
     def tag_name(self) -> str:
         """Returns the header's tag name."""
-        return SegTag.name(self.tag)
+        return SegTag.get_label(self.tag)
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({self.tag_name}, {self.param}, {self.length})"
@@ -115,33 +105,22 @@ class Header:
             f"PARAM:0x{self.param:02X}, LEN:{self.length}B>"
         )
 
-    def __eq__(self, other: object) -> bool:
-        return isinstance(other, self.__class__) and vars(other) == vars(self)
-
-    def __ne__(self, other: object) -> bool:
-        return not self.__eq__(other)
-
-    def info(self) -> str:
-        """Text representation of the header."""
-        return str(self)
-
     def export(self) -> bytes:
         """Binary representation of the header."""
         return pack(self.FORMAT, self.tag, self.length, self.param)
 
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0, required_tag: Optional[int] = None) -> "Header":
+    def parse(cls, data: bytes, required_tag: Optional[int] = None) -> Self:
         """Parse header.
 
         :param data: Raw data as bytes or bytearray
-        :param offset: Offset of input data
         :param required_tag: Check header TAG if specified value or ignore if is None
         :return: Header object
-        :raise UnparsedException: if required header tag does not match
+        :raises SPSDKParsingError: if required header tag does not match
         """
-        tag, length, param = unpack_from(cls.FORMAT, data, offset)
+        tag, length, param = unpack_from(cls.FORMAT, data)
         if required_tag is not None and tag != required_tag:
-            raise UnparsedException(
+            raise SPSDKParsingError(
                 f" Invalid header tag: '0x{tag:02X}' expected '0x{required_tag:02X}' "
             )
 
@@ -151,7 +130,9 @@ class Header:
 class CmdHeader(Header):
     """Command header."""
 
-    def __init__(self, tag: CmdTag, param: int = 0, length: Optional[int] = None) -> None:
+    def __init__(
+        self, tag: Union[CmdTag, int], param: int = 0, length: Optional[int] = None
+    ) -> None:
         """Constructor.
 
         :param tag: command tag
@@ -159,30 +140,30 @@ class CmdHeader(Header):
         :param length: of the command binary section, in bytes
         :raises SPSDKError: If invalid command tag
         """
+        tag = tag.tag if isinstance(tag, CmdTag) else tag
         super().__init__(tag, param, length)
         if tag not in CmdTag.tags():
             raise SPSDKError("Invalid command tag")
 
     @property
-    def tag(self) -> CmdTag:
+    def tag(self) -> int:
         """Command tag."""
-        return CmdTag.from_int(self._tag)
+        return self._tag
 
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0, required_tag: Optional[int] = None) -> Header:
+    def parse(cls, data: bytes, required_tag: Optional[int] = None) -> Self:
         """Create Header from binary data.
 
         :param data: binary data to convert into header
-        :param offset: to start reading binary data
         :param required_tag: CmdTag, None if not required
         :return: parsed instance
-        :raises UnparsedException: if required header tag does not match
+        :raises SPSDKParsingError: If required header tag does not match
         :raises SPSDKError: If invalid tag
         """
         if required_tag is not None:
             if required_tag not in CmdTag.tags():
                 raise SPSDKError("Invalid tag")
-        return super(CmdHeader, cls).parse(data, offset, required_tag)
+        return super(CmdHeader, cls).parse(data, required_tag)
 
 
 class Header2(Header):
@@ -195,18 +176,17 @@ class Header2(Header):
         return pack(self.FORMAT, self.param, self.length, self.tag)
 
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0, required_tag: Optional[int] = None) -> "Header":
+    def parse(cls, data: bytes, required_tag: Optional[int] = None) -> Self:
         """Parse header.
 
         :param data: Raw data as bytes or bytearray
-        :param offset: Offset of input data
         :param required_tag: Check header TAG if specified value or ignore if is None
-        :raises UnparsedException: Raises an error if required tag is empty or not valid
+        :raises SPSDKParsingError: Raises an error if required tag is empty or not valid
         :return: Header2 object
         """
-        param, length, tag = unpack_from(cls.FORMAT, data, offset)
+        param, length, tag = unpack_from(cls.FORMAT, data)
         if required_tag is not None and tag != required_tag:
-            raise UnparsedException(
+            raise SPSDKParsingError(
                 f" Invalid header tag: '0x{tag:02X}' expected '0x{required_tag:02X}' "
             )
 

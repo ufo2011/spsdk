@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2020-2023 NXP
+# Copyright 2020-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -9,14 +9,12 @@ import filecmp
 import os
 import time
 from typing import Union
+from unittest.mock import patch
 
 import pytest
-from bincopy import BinFile
 
-from spsdk import SPSDKError
-from spsdk.exceptions import SPSDKValueError
+from spsdk.exceptions import SPSDKError, SPSDKValueError
 from spsdk.utils.exceptions import SPSDKTimeoutError
-from spsdk.utils.images import BinaryImage
 from spsdk.utils.misc import (
     BinaryPattern,
     Timeout,
@@ -31,7 +29,8 @@ from spsdk.utils.misc import (
     get_bytes_cnt_of_int,
     load_binary,
     load_file,
-    reverse_bits_in_bytes,
+    load_secret,
+    reverse_bits,
     reverse_bytes_in_longs,
     size_fmt,
     swap16,
@@ -205,6 +204,9 @@ def test_load_file(data_dir):
     text = load_file(os.path.join(data_dir, "file.txt"))
     assert text == "Hello\nworld"
 
+    text2 = load_file(os.path.join(data_dir, "file_special.txt"))
+    assert text2 == "AÁBCČDĎEÉĚFGHChIÍJKLMNŇOÓPQRŘSŠTŤUÚŮVWXYÝZŽ\n"  # cspell: disable-line
+
 
 def test_write_file(data_dir, tmpdir):
     """Test writing data to data using write_file."""
@@ -258,19 +260,6 @@ def test_find_file_invalid(data_dir):
 )
 def test_format_value(value, size, expected):
     assert format_value(value, size) == expected
-
-
-@pytest.mark.parametrize(
-    "value,expected",
-    [
-        (b"\xa5", b"\xa5"),
-        (b"\x00", b"\x00"),
-        (b"\x12\x34", b"\x48\x2c"),
-        (b"", b""),
-    ],
-)
-def test_reverse_bits_in_bytes(value, expected):
-    assert reverse_bits_in_bytes(value) == expected
 
 
 def test_reg_long_reverse():
@@ -408,12 +397,13 @@ def test_value_to_bytes(value, res, exc):
     [
         (0, False, False),
         (False, False, False),
+        (None, False, False),
         ("False", False, False),
         (1, True, False),
         (True, True, False),
         ("True", True, False),
         ("T", True, False),
-        (b"\x20", True, True),
+        (b"\x20", True, False),
     ],
 )
 def test_value_to_bool(value, res, exc):
@@ -427,7 +417,7 @@ def test_value_to_bool(value, res, exc):
 
 def test_timeout_basic():
     """Basic test of timeout."""
-    timeout = Timeout(100, "ms")
+    timeout = Timeout(50, "ms")
     assert not timeout.overflow()
     time.sleep(0.1)
     with pytest.raises(SPSDKTimeoutError):
@@ -471,37 +461,30 @@ def test_size_format(input_value, use_kibibyte, expected):
     assert size_fmt(input_value, use_kibibyte) == expected
 
 
-@pytest.mark.parametrize(
-    "path",
-    [
-        ("images/image.bin"),
-        ("images/image.hex"),
-        ("images/image.s19"),
-        ("images/image.srec"),
-    ],
-)
-def test_load_binary_image(path, data_dir):
-    binary = BinaryImage.load_binary_image(os.path.join(data_dir, path))
-    assert binary
-    assert isinstance(binary, BinaryImage)
-    assert len(binary) > 0
-
-
-@pytest.mark.parametrize(
-    "path, error_msg",
-    [
-        (
-            "images/image_corrupted.s19",
-            "SPSDK: Error loading file: expected crc 'D3' in record S21407F41001020100010600000200000000000000D4, but got 'D4'",
-        ),
-        ("invalid_file", "Error loading file"),
-    ],
-)
-def test_load_binary_image_invalid(path, error_msg, data_dir):
-    with pytest.raises(SPSDKError, match=error_msg):
-        BinaryImage.load_binary_image(os.path.join(data_dir, path))
-
-
 def test_swap16_invalid():
     with pytest.raises(SPSDKError, match="Incorrect number to be swapped"):
         swap16(0xFFFFA)
+
+
+@pytest.mark.parametrize(
+    "input_value, bits_cnt, expected",
+    [
+        (0, 32, 0),
+        (1, 8, 0b10000000),
+        (0x12345678, 32, 0x1E6A2C48),
+        (1, 64, 1 << 63),
+    ],
+)
+def test_reverse_bits(input_value, bits_cnt, expected):
+    assert reverse_bits(input_value, bits_cnt) == expected
+
+
+def test_load_secret(data_dir):
+    file_with_secret = os.path.join(data_dir, "secret.txt")
+    assert load_secret(file_with_secret) == "secret text"
+    assert load_secret("secret text") == "secret text"
+    load_secret("$TEST_VAR")
+    with patch.dict("os.environ", {"TEST_VAR": "secret text"}):
+        assert load_secret("$TEST_VAR") == "secret text"
+    with patch.dict("os.environ", {"TEST_VAR": file_with_secret}):
+        assert load_secret("$TEST_VAR") == "secret text"

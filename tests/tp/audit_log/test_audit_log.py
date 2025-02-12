@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2021-2022 NXP
+# Copyright 2021-2023 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -10,8 +10,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from spsdk.tp import SPSDKTpError
 from spsdk.tp.data_container import AuditLog, AuditLogCounter, AuditLogRecord
+from spsdk.tp.exceptions import SPSDKTpError
 from spsdk.tp.tphost import TrustProvisioningHost
 
 
@@ -25,7 +25,6 @@ def test_validate(data_dir):
 
 
 def test_create(data_dir, tmpdir):
-
     log_file = f"{tmpdir}/audit_log.db"
     with open(f"{data_dir}/x_wrapped_data.bin", "rb") as f:
         container_data = f.read()

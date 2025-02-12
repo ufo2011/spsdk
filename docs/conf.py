@@ -1,3 +1,10 @@
+#!/usr/bin/env python
+# -*- coding: UTF-8 -*-
+#
+# Copyright 2019-2024 NXP
+#
+# SPDX-License-Identifier: BSD-3-Clause
+#
 # Configuration file for the Sphinx documentation builder.
 #
 # This file only contains a selection of the most common options. For a full
@@ -36,35 +43,42 @@ version = f"{spsdk.__version__}"
 
 # -- General configuration ---------------------------------------------------
 master_doc = "index"
-source_suffix = {
-    ".rst": "restructuredtext",
-    ".md": "markdown",
-}
+# source_suffix = {
+#     ".rst": "restructuredtext",
+#     ".md": "markdown",
+# }
 
 autoclass_content = "both"
-suppress_warnings = ["autosectionlabel.*"]
+suppress_warnings = ["autosectionlabel.*", "myst.header"]
 
-# TODO: remove this when the notebook has some data
+autodoc_mock_imports = ["ftd2xx"]
+
+# we don't want to execute notebooks during docs build because many of them require HW boards
 nbsphinx_execute = "never"
+nb_execution_mode = "off"
 
 # Add any Sphinx extension module names here, as strings. They can be
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
 extensions = [
+    "copy_examples",
     "generate_schemas",
     "generate_table",
     "generate_apps_img",
+    "generate_readme",
     "generate_project_struct_doc",
     "sphinx.ext.autodoc",
     "sphinx.ext.autosectionlabel",
     # 'sphinx_autodoc_annotation',
     "sphinx_autodoc_typehints",
     "sphinx.ext.todo",
-    "myst_parser",
+    # "myst_parser",
     "sphinx_click",
     "nbsphinx",
-    "nbsphinx_link",
+    # "nbsphinx_link",
+    "myst_nb",
 ]
+
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ["_templates"]
@@ -80,14 +94,16 @@ exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
 #
-html_theme = "sphinx_rtd_theme"
-html_logo = "_static/images/nxp_logo.jpg"
+html_theme = "sphinx_book_theme"
+html_logo = "_static/images/nxp_logo.svg"
 html_theme_options = {
+    "repository_url": "https://github.com/nxp-mcuxpresso/spsdk",
+    "use_repository_button": True,
     "collapse_navigation": True,
-    "sticky_navigation": True,
+    # "sticky_navigation": True,
     "navigation_depth": 4,
-    "display_version": False,
-    "prev_next_buttons_location": None,
+    # "display_version": False,
+    # "prev_next_buttons_location": None,
 }
 
 # Add any paths that contain custom static files (such as style sheets) here,
@@ -100,3 +116,8 @@ html_static_path = ["_static"]
 html_css_files = [
     "custom.css",
 ]
+
+html_extra_path = ["html_schemas"]
+
+# Myst extensions
+myst_enable_extensions = ["html_image"]

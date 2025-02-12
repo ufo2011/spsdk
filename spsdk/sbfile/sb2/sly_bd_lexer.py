@@ -1,18 +1,20 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2021-2022 NXP
+# Copyright 2021-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+
 """Lexer for command (BD) files used by parser."""
 
-from typing import List, Union
+from typing import Union
 
 from sly import Lexer
 from sly.lex import Token
 
 
+# ruff: noqa: F821
 # pylint: disable=undefined-variable,invalid-name,no-self-use
 # undefined-variable : the lexer uses '_' as a decorator, which throws undefined
 #   variable error. We can't do much with it.
@@ -50,7 +52,7 @@ class BDLexer(Lexer):
 
     def __init__(self) -> None:
         """Initializer."""
-        self._sources: List[Variable] = []
+        self._sources: list[Variable] = []
 
     def cleanup(self) -> None:
         """Resets the lexers internals into initial state."""
@@ -78,7 +80,6 @@ class BDLexer(Lexer):
         "else": "ELSE",
         "info": "INFO",
         "error": "ERROR",
-        "qspi": "QSPI",
         "enable": "ENABLE",
         "keywrap": "KEYWRAP",
         "keystore_to_nv": "KEYSTORE_TO_NV",

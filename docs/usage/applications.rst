@@ -19,6 +19,32 @@ All applications could be accessed either using a special application called ``s
     spsdk --help
 
 ------------------------
+Application Philosophy
+------------------------
+
+The goal is to provide a simple way of interaction between the application and the user and avoid long and complex command lines with lots of options.
+All configuration should be passed as configuration file.
+Application should provide *get-template* command to generate a template of the configuration file for the selected family of devices.
+This configuration file should be used as an input for the application and should be well described. The configuration file should be in YAML format.
+Some applications are generating multiple templates, this is done using the *get-templates* command.
+
+Most of the CLI application are used for generating some sort of binary files from configuration files, the command for generating the binary from configuration should be *export* with simple -c option for the configuration file.
+Some applications also allow the user to parse the binary file and extract the configuration from it. This is done by the *parse* command with the -b option for the binary file.
+
+.. code:: bash
+
+    <application> get-template -o <output_config>
+    <application> export -c <configuration_file>
+    <application> parse -b <binary_file> -o <output_directory>
+
+All applications should provide a help message with the list of available commands and options. The help message should be displayed when the application is called with the *--help* option.
+
+Most of the applications require family option, specified as --family or -f option. This option is used to select the family of devices for which the application should be used. The family option is mandatory for most of the applications.
+This allows the application to generate the correct configuration file for the selected family of devices and to validate the configuration file against the selected family of devices.
+
+.. note:: Click strictly separates parameters between commands and subcommands. What this means is that options and arguments for a specific command have to be specified after the command name itself, but before any other command names.
+
+------------------------
 Application Connectivity
 ------------------------
 
@@ -33,10 +59,6 @@ Some applications communicate with NXP devices connected to the host PC. Details
 --------------------
 Application Overview
 --------------------
-
-SPSDK applications are used for various functions and not all applications are valid for all NXP MCU device portfolios. The table mapping particular applications to a specific device is below.
-
-.. figure:: ../_static/images/spsdk-applications.png
 
 
 :ref:`blhost`
@@ -76,20 +98,6 @@ It allows user to:
 
     blhost --help
 
-:ref:`elftosb`
-==============
-
-The tool for generating TrustZone, MasterBootImage, and SecureBinary images.
-
-- generate TrustZone
-- generate MasterBootImage
-- generate SecureBinary
-
-.. note:: This tool is deprecated, use :ref:`nxpimage` instead
-
-.. code:: bash
-
-    elftosb --help
 
 :ref:`ifr`
 ================
@@ -104,20 +112,6 @@ The *ifr* application allows user to generate IFR0:
 .. code:: bash
 
     ifr --help
-
-:ref:`nxpcertgen`
-=================
-
-The *nxpcertgen* application allows the user to:
-
-- generate the self-signed x.509 certificates with properties given in the YAML configuration file.
-- generate the template of Certificate generation YAML configuration file
-
-The certificates are self-signed and support only BasicConstrains (ca, path_length).
-
-.. code:: bash
-
-    nxpcertgen --help
 
 :ref:`nxpcrypto`
 =================
@@ -170,12 +164,29 @@ The *nxpdevscan* application allows users to list all connected USB and UART NXP
 
     nxpdevscan --help
 
+:ref:`nxpfuses`
+================
+
+The *nxpfuses* application allows users to:
+
+- write single fuse into device
+- write fuses from configuration into device
+- generate the template of Fuses YAML configuration file
+- generate blhost/nxpele script to burn fuses from configuration
+- save the current state of fuses to config file
+- print the current state of fuses from device
+
+.. code:: bash
+
+    nxpfuses --help
+
 :ref:`nxpimage`
 ===============
 
 The *nxpimage* application allows users to:
 
 - generate/parse AHAB images
+- generate/parse HAB images
 - generate TrustZone images
 - generate MasterBootImage images
 - generate SecureBinary images
@@ -185,18 +196,22 @@ The *nxpimage* application allows users to:
 
     nxpimage --help
 
-:ref:`nxpkeygen`
+
+:ref:`nxpmemcfg`
 ================
 
-The *nxpkeygen* application allows user to:
+The *nxpmemcfg* application allows users to:
 
-- generate RSA/ECC key pairs (private and public) with various key's attributes
+- check database of known configuration option words for external memories
+- parse existing configuration option words
+- export option words from configuration
+- generate BLHOST scripts to configure memory
 
-.. note:: This tool is deprecated, use :ref:`nxpcrypto` instead
 
 .. code:: bash
 
-    nxpkeygen --help
+    nxpmemcfg --help
+
 
 :ref:`pfr`
 ==========
@@ -238,7 +253,7 @@ The *sdpshost* application is a utility for communication with ROM on i.MX targe
 
 It allows the user to write boot image data from the provided binary file.
 
-.. warning:: THIS IS AN EXPERIMENTAL UTILITY! USE WITH CAUTION !!!
+.. warning:: This is an experimental utility. Use with caution!
 
 .. code:: bash
 
@@ -262,3 +277,34 @@ It allows user to:
 .. code:: bash
 
     shadowregs --help
+
+
+:ref:`nxpuuu`
+=================
+
+The nxpuuu CLI application is designed for image deployment based on the libUUU (universal update utility). This guide provides instructions on how to use the various commands available in the application.
+
+.. code:: bash
+
+    nxpuuu --help
+
+-------------------------------
+Deleted/deprecated applications
+-------------------------------
+
+nxpcertgen
+==========
+
+.. note:: This tool was replaced by :ref:`nxpcrypto`
+
+
+nxpkeygen
+=========
+
+.. note:: This tool was replaced by :ref:`nxpcrypto`
+
+
+elftosb
+=========
+
+.. note:: This tool was replaced by :ref:`nxpimage`

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2020-2023 NXP
+# Copyright 2020-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -9,295 +9,94 @@
 import copy
 import logging
 import math
-import os
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Optional, Type, Union
 
-from ruamel.yaml.comments import CommentedMap as CM
-
-from spsdk import SPSDK_DATA_FOLDER, SPSDKError
-from spsdk import __version__ as spsdk_version
-from spsdk.crypto import PublicKey, ec, rsa
-from spsdk.utils.crypto.abstract import BackendClass
-from spsdk.utils.crypto.backend_openssl import openssl_backend
-from spsdk.utils.crypto.rkht import RKHT
+from spsdk.apps.utils.utils import SPSDKAppError
+from spsdk.crypto.hash import EnumHashAlgorithm, get_hash
+from spsdk.crypto.keys import PublicKey, PublicKeyEcc, PublicKeyRsa
+from spsdk.exceptions import SPSDKError
+from spsdk.pfr.exceptions import SPSDKPfrError, SPSDKPfrRotkhIsNotPresent
+from spsdk.utils.crypto.rkht import RKHT, RKHTv1, RKHTv21
+from spsdk.utils.database import DatabaseManager, get_db, get_families, get_schema_file
 from spsdk.utils.exceptions import SPSDKRegsErrorRegisterNotFound
-from spsdk.utils.misc import load_configuration, value_to_int
-from spsdk.utils.reg_config import RegConfig
-from spsdk.utils.registers import Registers, RegsRegister
-
-from . import PFR_DATA_FOLDER
-from .exceptions import (
-    SPSDKPfrConfigError,
-    SPSDKPfrConfigReadError,
-    SPSDKPfrError,
-    SPSDKPfrRotkhIsNotPresent,
-)
+from spsdk.utils.misc import BinaryPattern, Endianness, value_to_int
+from spsdk.utils.registers import Register, Registers
+from spsdk.utils.schema_validator import check_config, update_validation_schema_family
 
 logger = logging.getLogger(__name__)
-
-
-class PfrConfiguration:
-    """Class to open PFR configuration file a get basic configuration."""
-
-    def __init__(
-        self,
-        config: Optional[Union[str, dict, "PfrConfiguration"]] = None,
-        device: Optional[str] = None,
-        revision: Optional[str] = None,
-        cfg_type: Optional[str] = None,
-    ) -> None:
-        """Open config PFR file.
-
-        :param config: Filename or dictionary with PFR settings, defaults to None
-        :param device: If needed it could be used to override device from settings, defaults to ""
-        :param revision: If needed it could be used to override revision from settings, defaults to ""
-        :param cfg_type: If needed it could be used to override PFR type from settings, defaults to ""
-        """
-        self.device = device
-        self.revision = revision
-        self.type = cfg_type
-        self.settings: Optional[Union[CM, dict]] = None
-
-        if isinstance(config, (str, os.PathLike, dict)):
-            self.set_config(config)
-
-        if isinstance(config, PfrConfiguration):
-            if not self.device:
-                self.device = config.device
-            if not self.revision:
-                self.revision = config.revision
-            if not self.type:
-                self.type = config.type
-            if config.settings:
-                self.settings = config.settings.copy()
-
-    @staticmethod
-    def _detect_obsolete_style_of_settings(data: Union[CM, dict]) -> bool:
-        """Detect obsolete style of configuration.
-
-        :param data: As old JSON style as new YML style of settings data.
-        :return: True if obsolete style is detected.
-        """
-        if len(data) == 0:
-            return False
-
-        for key in data.keys():
-            if isinstance(data[key], (str, int)):
-                return True
-            if isinstance(data[key], dict):
-                first_key = list(data[key].keys())[0]
-                if first_key not in ("value", "bitfields", "name"):
-                    return True
-
-        return False
-
-    def _get_yml_style_of_settings(self, data: Union[CM, dict]) -> Union[CM, dict]:
-        """Get unified YML style of settings.
-
-        :param data: As old JSON style as new YML style of settings data.
-        :return: New YML style of data.
-        """
-        if not self._detect_obsolete_style_of_settings(data):
-            return data
-
-        yml_style: Dict[str, Union[str, int, dict]] = {}
-        for key, val in data.items():
-            if isinstance(val, (str, int)):
-                yml_style[key] = {"value": val}
-            if isinstance(val, dict):
-                bitfields = {}
-                for key_b, val_b in val.items():
-                    bitfields[key_b] = val_b
-                yml_style[key] = {"bitfields": bitfields}
-
-        return yml_style
-
-    def set_config_dict(
-        self,
-        data: Union[CM, dict],
-        device: Optional[str] = None,
-        revision: Optional[str] = None,
-        cfg_type: Optional[str] = None,
-    ) -> None:
-        """Apply configuration dictionary.
-
-        The function accepts as dictionary as from commented map.
-
-        :param data: Settings of PFR.
-        :param device: If needed it could be used to override device from settings, defaults to ""
-        :param revision: If needed it could be used to override revision from settings, defaults to ""
-        :param cfg_type: If needed it could be used to override PFR type from settings, defaults to ""
-        :raises SPSDKPfrConfigReadError: Invalid YML file.
-        """
-        if data is None or len(data) == 0:
-            raise SPSDKPfrConfigReadError("Empty YAML configuration.")
-
-        try:
-            description = data.get("description", data)
-            self.device = device or description.get("device", None)
-            self.revision = revision or description.get("revision", None)
-            self.type = cfg_type or description.get("type", None)
-            self.settings = self._get_yml_style_of_settings(data["settings"])
-
-        except KeyError as exc:
-            raise SPSDKPfrConfigReadError("Missing fields in YAML configuration.") from exc
-
-    def set_config(self, config: Union[str, CM, dict]) -> None:
-        """Apply configuration from file.
-
-        :param config: Name of configuration file or Commented map.
-        :raises SPSDKPfrConfigReadError: The configuration file cannot be loaded.
-        """
-        if isinstance(config, (CM, dict)):
-            self.set_config_dict(config)
-        else:
-            try:
-                data = load_configuration(config)
-            except SPSDKError as exc:
-                raise SPSDKPfrConfigReadError(str(exc)) from exc
-            self.set_config_dict(data)
-
-    def get_yaml_config(self, data: CM, indent: int = 0) -> CM:
-        """Return YAML configuration In PfrConfiguration format.
-
-        :param data: The registers settings data.
-        :param indent: YAML start indent.
-        :return: YAML PFR configuration in commented map(ordered dict).
-        :raises SPSDKError: When there is no device found
-        :raises SPSDKError: When there is no type found
-        """
-        if not self.device:
-            raise SPSDKError("Device not found")
-        if not self.type:
-            raise SPSDKError("Type not found")
-        res_data = CM()
-
-        res_data.yaml_set_start_comment(
-            f"NXP {self.device} PFR {self.type} configuration", indent=indent
-        )
-
-        description = CM()
-        description.insert(1, "device", self.device, comment="The NXP device name.")
-        description.insert(2, "revision", self.revision, comment="The NXP device revision.")
-        description.insert(
-            3, "type", self.type.upper(), comment="The PFR type (CMPA, CFPA) or IFR type."
-        )
-        description.insert(4, "version", spsdk_version, comment="The SPSDK tool version.")
-
-        res_data.insert(
-            1,
-            "description",
-            description,
-            comment=f"The {self.type} configuration description.",
-        )
-        res_data.insert(2, "settings", data, comment=f"The {self.type} registers configuration.")
-        return res_data
-
-    def is_invalid(self) -> Optional[str]:
-        """Validate configuration.
-
-        :return: None if configuration is valid, otherwise description string what is invalid.
-        """
-        if not self.device:
-            return "The device is NOT specified!"
-        if not self.type:
-            return "The PFR type (CMPA/CFPA) is NOT specified!"
-
-        return None
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, PfrConfiguration):
-            return False
-
-        return vars(self) == vars(other)
 
 
 class BaseConfigArea:
     """Base for CMPA and CFPA classes."""
 
-    CONFIG_DIR = PFR_DATA_FOLDER
-    CONFIG_FILE = "database.yaml"
+    FEATURE_NAME = DatabaseManager.PFR
+    DB_SUB_FEATURE: str = ""
     BINARY_SIZE = 512
     ROTKH_SIZE = 32
     ROTKH_REGISTER = "ROTKH"
     MARK = b"SEAL"
     DESCRIPTION = "Base Config Area"
-    IMAGE_PREFILL_PATTERN = 0
+    IMAGE_PREFILL_PATTERN = "0x00"
 
     def __init__(
         self,
-        device: Optional[str] = None,
-        revision: Optional[str] = None,
-        user_config: Optional[PfrConfiguration] = None,
-        raw: bool = False,
+        family: str,
+        revision: str = "latest",
     ) -> None:
         """Initialize an instance.
 
-        :param device: device to use, list of supported devices is available via 'devices' method
+        :param family: Family to use, list of supported families is available via 'get_supported_families' method
         :param revision: silicon revision, if not specified, the latest is being used
-        :param user_config: PfrConfiguration with user configuration to use with initialization
-        :param raw: When set the computed fields from configuration will be applied
         :raises SPSDKError: When no device is provided
         :raises SPSDKError: When no device is not supported
         :raises SPSDKError: When there is invalid revision
         """
-        if not (device or user_config):
-            raise SPSDKError("No device provided")
-        self.config = self._load_config()
-        # either 'device' or 'user_config' IS defined! Mypy doesn't understand the check above
-        self.device = device or user_config.device  # type: ignore
-
-        if self.device not in self.config.devices.device_names:
-            raise SPSDKError(f"Device '{self.device}' is not supported")
-        self.revision = revision or (user_config.revision if user_config else "latest")
-        revisions = self.config.devices.get_by_name(self.device).revisions  # type: ignore
-        if not self.revision or self.revision == "latest":
-            self.revision = revisions.get_latest().name
-            logger.info(
-                f"The silicon revision is not specified, the latest: '{self.revision}' has been used."
-            )
-
-        if self.revision not in revisions.revision_names:
-            raise SPSDKError(f"Invalid revision '{self.revision}' for '{self.device}'")
-        self.registers = Registers(self.device, base_endianness="little")  # type: ignore
-        self.registers.load_registers_from_xml(
-            xml=self.config.get_data_file(self.device, self.revision),  # type: ignore
-            filter_reg=self.config.get_ignored_registers(self.device),
-            grouped_regs=self.config.get_grouped_registers(self.device),
+        self.db = get_db(family, revision)
+        self.family = self.db.device.name
+        self.revision = self.db.name
+        self.registers = self._load_registers(family, revision)
+        self.computed_fields: dict[str, dict[str, str]] = self.db.get_dict(
+            self.FEATURE_NAME, [self.DB_SUB_FEATURE, "computed_fields"], {}
         )
 
+    @classmethod
+    def _load_registers(cls, family: str, revision: str = "latest") -> Registers:
+        """Load register class for PFR tool.
+
+        :param family: Device family name
+        :param revision: Revision of the chip, defaults to "latest"
+        :return: Loaded register class
+        """
+        registers = Registers(
+            family=family,
+            feature=cls.FEATURE_NAME,
+            base_key=cls.DB_SUB_FEATURE,
+            revision=revision,
+            base_endianness=Endianness.LITTLE,
+        )
+        computed_fields: dict[str, dict[str, str]] = get_db(family, revision).get_dict(
+            cls.FEATURE_NAME, [cls.DB_SUB_FEATURE, "computed_fields"], {}
+        )
         # Set the computed field handler
-        for reg, fields in self.config.get_computed_fields(self.device).items():
-            reg_obj = self.registers.find_reg(reg)
-            reg_obj.add_setvalue_hook(self.reg_computed_fields_handler, fields)
+        for reg, fields in computed_fields.items():
+            reg_obj = registers.get_reg(reg)
+            for bitfield in fields.keys():
+                reg_obj.get_bitfield(bitfield).hidden = True
+                logger.debug(f"Hiding bitfield: {bitfield} in {reg}")
+        return registers
 
-        self.user_config = PfrConfiguration(
-            config=user_config,
-            device=self.device,
-            revision=self.revision,
-            cfg_type=self.__class__.__name__,
-        )
+    def compute_register(self, reg: Register, method: str) -> None:
+        """Recalculate register value.
 
-        if self.user_config.settings:
-            self.set_config(self.user_config, raw=raw)
-
-    def reg_computed_fields_handler(self, val: bytes, context: Any) -> bytes:
-        """Recalculate all fields for given register value.
-
-        :param val: Input register value.
-        :param context: The method context (fields).
-        :return: recomputed value.
+        :param reg: Register to be recalculated.
+        :param method: Method name to be use to recalculation of register value.
         :raises SPSDKPfrError: Raises when the computing routine is not found.
         """
-        fields: dict = context
-        for method in fields.values():
-            if hasattr(self, method):
-                method_ref = getattr(self, method)
-                val = method_ref(val)
-            else:
-                raise SPSDKPfrError(f"The '{method}' compute function doesn't exists.")
-
-        return val
+        if hasattr(self, method):
+            method_ref = getattr(self, method)
+            reg.set_value(method_ref(reg.get_value(True)), True)
+        else:
+            raise SPSDKPfrError(f"The '{method}' compute function doesn't exists.")
 
     @staticmethod
     def pfr_reg_inverse_high_half(val: int) -> int:
@@ -323,122 +122,140 @@ class BaseConfigArea:
         return ret
 
     @classmethod
-    def _load_config(cls) -> RegConfig:
-        """Loads the PFR block configuration file.
+    def get_supported_families(cls) -> list[str]:
+        """Classmethod to get list of supported families.
 
-        :return: PFR block configuration database.
+        :return: List of supported families.
         """
-        return RegConfig(os.path.join(cls.CONFIG_DIR, cls.CONFIG_FILE))
+        return get_families(cls.FEATURE_NAME, cls.DB_SUB_FEATURE)
 
     @classmethod
-    def devices(cls) -> List[str]:
-        """Classmethod to get list of supported devices.
+    def get_validation_schemas_family(cls) -> list[dict[str, Any]]:
+        """Create the validation schema just for supported families.
 
-        :return: List of supported devices.
+        :return: List of validation schemas for Shadow registers supported families.
         """
-        config = cls._load_config()
-        return config.devices.device_names
+        sch_family = get_schema_file("general")["family"]
+        update_validation_schema_family(sch_family["properties"], cls.get_supported_families())
+        sch_cfg = get_schema_file(DatabaseManager.PFR)
 
-    def _get_registers(self) -> List[RegsRegister]:
-        """Get a list of all registers.
+        return [sch_family, sch_cfg["pfr_base"]]
 
-        :return: List of PFR configuration registers.
+    @classmethod
+    def get_validation_schemas(cls, family: str, revision: str = "latest") -> list[dict[str, Any]]:
+        """Create the validation schema.
+
+        :param family: Family description.
+        :param revision: Chip revision specification, as default, latest is used.
+        :raises SPSDKError: Family or revision is not supported.
+        :return: List of validation schemas.
         """
-        exclude = self.config.get_ignored_registers(self.device)
-        return self.registers.get_registers(exclude)
+        sch_cfg = get_schema_file(DatabaseManager.PFR)
+        sch_family = get_schema_file("general")["family"]
+        update_validation_schema_family(
+            sch_family["properties"], cls.get_supported_families(), family, revision
+        )
+        try:
+            regs = cls._load_registers(family=family, revision=revision)
+            sch_cfg["pfr_base"]["properties"]["type"]["template_value"] = cls.__name__.upper()
+            sch_cfg["pfr_base"]["properties"]["type"]["enum"] = [
+                cls.__name__.upper(),
+                cls.__name__.lower(),
+            ]
+            sch_cfg["pfr_settings"]["properties"]["settings"][
+                "properties"
+            ] = regs.get_validation_schema()["properties"]
+            return [sch_family, sch_cfg["pfr_base"], sch_cfg["pfr_settings"]]
+        except (KeyError, SPSDKError) as exc:
+            raise SPSDKError(f"Family {family} or revision {revision} is not supported") from exc
 
-    def set_config(self, config: PfrConfiguration, raw: bool = False) -> None:
-        """Apply configuration from file.
+    @classmethod
+    def validate_config(cls, cfg: dict[str, Any]) -> None:
+        """Validate input PFR configuration.
+
+        :param cfg: PFR configuration
+        """
+        base_schemas = cls.get_validation_schemas_family()
+        check_config(cfg, base_schemas)
+        description: Optional[dict[str, Any]] = cfg.get("description")
+        family = (
+            description["device"] if description else cfg.get("family", cfg.get("device", "N/A"))
+        )
+        revision = (
+            description.get("revision", "latest") if description else cfg.get("revision", "latest")
+        )
+        schemas = cls.get_validation_schemas(family=family, revision=revision)
+        check_config(cfg, schemas)
+
+    def set_config(self, cfg: dict[str, Any]) -> None:
+        """Set a new values configuration.
+
+        :param cfg: Registers configuration.
+        """
+        self.registers.load_yml_config(cfg)
+        # Updates necessary register values
+        for reg_uid, bitfields_rec in self.computed_fields.items():
+            reg_name = self.registers.get_reg(uid=reg_uid).name
+            if reg_name in cfg:
+                reg = self.registers.get_reg(reg_uid)
+                for bitfield_uid, method in bitfields_rec.items():
+                    bitfield_name = reg.get_bitfield(bitfield_uid).name
+                    compute = isinstance(cfg[reg_name], dict) and bitfield_name not in cfg[reg_name]
+                    if compute:
+                        self.compute_register(reg, method)
+                        logger.warning(
+                            (
+                                f"The {reg_name} register has been recomputed, because "
+                                f"it has been used in configuration and the bitfield {bitfield_name} "
+                                "has not been specified"
+                            )
+                        )
+
+    @staticmethod
+    def load_from_config(config: dict[str, Any]) -> "BaseConfigArea":
+        """Get Configuration class from configuration.
 
         :param config: PFR configuration.
-        :param raw: When set all (included computed fields) configuration will be applied.
-        :raises SPSDKError: When device is not provided.
-        :raises SPSDKError: When revision is not provided.
-        :raises SPSDKPfrConfigError: Invalid config file.
+        :returns: BaseConfigArea object
         """
-        if not self.device:
-            raise SPSDKError("No device provided")
-        if not self.revision:
-            raise SPSDKError("No revision provided")
+        description: Optional[dict[str, str]] = config.get("description")
+        if description:  # backward compatibility branch
+            family = description["device"]
+            revision = description.get("revision", "latest")
+            cls = CONFIG_AREA_CLASSES[description["type"].lower()]
+        else:
+            family = config.get("family", config.get("device"))
+            revision = config.get("revision", "latest")
+            cls = CONFIG_AREA_CLASSES[config["type"].lower()]
+        settings = config["settings"]
+        ret = cls(family=family, revision=revision)
+        ret.set_config(settings)
+        return ret
 
-        if config.device != self.device:
-            raise SPSDKPfrConfigError(
-                f"Invalid device in configuration. {self.device} != {config.device}"
-            )
-        if not config.revision or config.revision in ("latest", ""):
-            config.revision = (
-                self.config.devices.get_by_name(self.device).revisions.get_latest().name
-            )
-            logger.warning(
-                f"The configuration file doesn't contains silicon revision,"
-                f" the latest: '{config.revision}' has been used."
-            )
-        if config.revision != self.revision:
-            raise SPSDKPfrConfigError(
-                f"Invalid revision in configuration. {self.revision} != {config.revision}"
-            )
-        if config.type and config.type.upper() != self.__class__.__name__:
-            raise SPSDKPfrConfigError(
-                f"Invalid configuration type. {self.__class__.__name__} != {config.type}"
-            )
+    def get_config(self, diff: bool = False) -> dict[str, Union[str, dict[str, Any]]]:
+        """Return configuration from loaded PFR.
 
-        if not config.settings:
-            raise SPSDKPfrConfigError("Missing configuration of PFR fields!")
-
-        computed_regs = []
-        computed_regs.extend(self.config.get_ignored_registers(self.device))
-        if not raw:
-            computed_regs.extend(list(self.config.get_computed_registers(self.device).keys()))
-        computed_fields = None if raw else self.config.get_computed_fields(self.device)
-
-        self.registers.load_yml_config(config.settings, computed_regs, computed_fields)
-        if not raw:
-            # Just update only configured registers
-            exclude_hooks = []
-            if not self.config.get_value("mandatory_computed_regs", self.device):
-                exclude_hooks.extend(
-                    list(set(self.registers.get_reg_names()) - set(config.settings.keys()))
-                )
-            self.registers.run_hooks(exclude_hooks)
-
-    def get_yaml_config(
-        self, exclude_computed: bool = True, diff: bool = False, indent: int = 0
-    ) -> CM:
-        """Return YAML configuration from loaded registers.
-
-        :param exclude_computed: Omit computed registers and fields.
         :param diff: Get only configuration with difference value to reset state.
-        :param indent: YAML start indent.
-        :return: YAML PFR configuration in commented map(ordered dict).
+        :return: PFR configuration in dictionary.
         """
-        computed_regs = (
-            None
-            if not exclude_computed
-            else list(self.config.get_computed_registers(self.device).keys())
-        )
-        computed_fields = (
-            None if not exclude_computed else self.config.get_computed_fields(self.device)
-        )
-        ignored_fields = self.config.get_ignored_fields(self.device)
+        res_data: dict[str, Union[str, dict[str, Any]]] = {}
+        res_data["family"] = self.family
+        res_data["revision"] = self.revision
+        res_data["type"] = self.__class__.__name__.upper()
+        res_data["settings"] = self.registers.get_config(diff=diff)
+        return res_data
 
-        data = self.registers.create_yml_config(
-            computed_regs, computed_fields, ignored_fields, diff, indent + 2
-        )
-        return self.user_config.get_yaml_config(data, indent)
-
-    def generate_config(self, exclude_computed: bool = True) -> CM:
+    def generate_config(self) -> dict:
         """Generate configuration structure for user configuration.
 
-        :param exclude_computed: Exclude computed fields, defaults to True.
         :return: YAML commented map with PFR configuration  in reset state.
         """
         # Create own copy to keep self as is and get reset values by standard YML output
         copy_of_self = copy.deepcopy(self)
         copy_of_self.registers.reset_values()
+        return copy_of_self.get_config()
 
-        return copy_of_self.get_yaml_config(exclude_computed)
-
-    def _calc_rotkh(self, keys: List[PublicKey]) -> bytes:
+    def _calc_rotkh(self, keys: list[PublicKey]) -> bytes:
         """Calculate ROTKH (Root Of Trust Key Hash).
 
         :param keys: List of Keys to compute ROTKH.
@@ -448,68 +265,105 @@ class BaseConfigArea:
         # the data structure use for computing final ROTKH is 4*32B long
         # 32B is a hash of individual keys
         # 4 is the max number of keys, if a key is not provided the slot is filled with '\x00'
-        # The LPC55S3x has two options to compute ROTKH, so it's needed to be
+        # Some devices have two options to compute ROTKH, so it's needed to be
         # detected the right algorithm and mandatory warn user about this selection because
         # it's MUST correspond to settings in eFuses!
         reg_rotkh = self.registers.find_reg("ROTKH")
-        rkht = RKHT(keys=keys, keys_cnt=4, min_keys_cnt=1)
-        rkht.validate()
+        assert isinstance(self.family, str)
+        cls = self.get_cert_block_class(family=self.family)
+        rkht = cls.from_keys(keys=keys)
 
         if rkht.hash_algorithm_size > reg_rotkh.width:
             raise SPSDKPfrError("The ROTKH field is smaller than used algorithm width.")
+        return rkht.rkth().ljust(reg_rotkh.width // 8, b"\x00")
 
-        return rkht.rotkh().ljust(reg_rotkh.width // 8, b"\x00")
+    @classmethod
+    def get_cert_block_class(cls, family: str) -> Type[RKHT]:
+        """Return the seal count.
+
+        :param family: The device name, if not specified, the general value is used.
+        :return: The seal count.
+        :raises SPSDKError: When there is invalid seal count
+        """
+        cert_blocks = {
+            "cert_block_1": RKHTv1,
+            "cert_block_21": RKHTv21,
+        }
+        val = get_db(family).get_str(DatabaseManager.CERT_BLOCK, "rot_type")
+        if val is None or val not in cert_blocks:
+            raise SPSDKError(f"Invalid certificate block version: {val}")
+
+        return cert_blocks[val]
 
     def _get_seal_start_address(self) -> int:
-        """Function returns start of seal fields for the device.
+        """Function returns start of seal fields for the family.
 
         :return: Start of seals fields.
-        :raises SPSDKError: When 'seal_start_address' in database.yaml can not be found
+        :raises SPSDKError: When 'seal_start_address' in database can not be found
         """
-        start = self.config.get_seal_start_address(self.device)
+        start = self.db.get_str(self.FEATURE_NAME, [self.DB_SUB_FEATURE, "seal_start"])
         if not start:
-            raise SPSDKError("Can't find 'seal_start_address' in database.yaml")
-        return self.registers.find_reg(start).offset
+            raise SPSDKError("Can't find 'seal_start_address' in database.")
+        return self.registers.get_reg(start).offset
 
     def _get_seal_count(self) -> int:
-        """Function returns seal count for the device.
+        """Function returns seal count for the family.
 
         :return: Count of seals fields.
-        :raises SPSDKError: When 'seal_count' in database.yaml can not be found
+        :raises SPSDKError: When 'seal_count' in database can not be found
         """
-        count = self.config.get_seal_count(self.device)
+        count = self.db.get_int(self.FEATURE_NAME, [self.DB_SUB_FEATURE, "seal_count"])
         if not count:
-            raise SPSDKError("Can't find 'seal_count' in database.yaml")
+            raise SPSDKError("Can't find 'seal_count' in database")
         return value_to_int(count)
 
-    def export(self, add_seal: bool = False, keys: Optional[List[PublicKey]] = None) -> bytes:
+    def export(
+        self,
+        add_seal: bool = False,
+        keys: Optional[list[PublicKey]] = None,
+        rotkh: Optional[bytes] = None,
+        draw: bool = True,
+    ) -> bytes:
         """Generate binary output.
 
         :param add_seal: The export is finished in the PFR record by seal.
         :param keys: List of Keys to compute ROTKH field.
+        :param rotkh: ROTKH binary value.
+        :param draw: Draw the configuration data in log
         :return: Binary block with PFR configuration(CMPA or CFPA).
-        :raises SPSDKPfrRotkhIsNotPresent: This PFR block doesn't contains ROTKH field.
+        :raises SPSDKPfrRotkhIsNotPresent: This PFR block doesn't contain ROTKH field.
         :raises SPSDKError: The size of data is {len(data)}, is not equal to {self.BINARY_SIZE}.
         """
-        if keys:
+        if keys or rotkh:
             try:
                 # ROTKH may or may not be present, derived class defines its presence
                 rotkh_reg = self.registers.find_reg(self.ROTKH_REGISTER)
-                rotkh_data = self._calc_rotkh(keys)
-                rotkh_reg.set_value(rotkh_data, True)
+                if rotkh:
+                    rotkh_data = rotkh
+                elif keys:
+                    rotkh_data = self._calc_rotkh(keys)
+                else:
+                    raise SPSDKError("Cannot determine source of RoTKH data.")
+                rotkh_reg.set_value(rotkh_data, False)
             except SPSDKRegsErrorRegisterNotFound as exc:
                 raise SPSDKPfrRotkhIsNotPresent(
                     "This device doesn't contain ROTKH register!"
                 ) from exc
 
-        data = bytearray([self.IMAGE_PREFILL_PATTERN] * self.BINARY_SIZE)
-        for reg in self._get_registers():
-            data[reg.offset : reg.offset + reg.width // 8] = reg.get_bytes_value()
+        image_info = self.registers.image_info(
+            size=self.BINARY_SIZE, pattern=BinaryPattern(self.IMAGE_PREFILL_PATTERN)
+        )
+        if draw:
+            logger.info(image_info.draw())
+        data = bytearray(image_info.export())
 
         if add_seal:
-            seal_start = self._get_seal_start_address()
-            seal_count = self._get_seal_count()
-            data[seal_start : seal_start + seal_count * 4] = self.MARK * seal_count
+            try:
+                seal_start = self._get_seal_start_address()
+                seal_count = self._get_seal_count()
+                data[seal_start : seal_start + seal_count * 4] = self.MARK * seal_count
+            except SPSDKError:
+                logger.warning("This device doesn't support sealing of PFR page.")
 
         if len(data) != self.BINARY_SIZE:
             raise SPSDKError(f"The size of data is {len(data)}, is not equal to {self.BINARY_SIZE}")
@@ -520,60 +374,98 @@ class BaseConfigArea:
 
         :param data: Input binary data of PFR block.
         """
-        for reg in self.registers.get_registers(include_group_regs=False):
-            value = data[reg.offset : reg.offset + reg.width // 8]
-            reg.set_bytes_value(value)
+        self.registers.parse(data)
+
+    def __eq__(self, obj: Any) -> bool:
+        """Compare if the objects has same settings."""
+        return (
+            isinstance(obj, self.__class__)
+            and obj.family == self.family
+            and obj.revision == self.revision
+            and obj.registers == self.registers
+        )
 
 
 class CMPA(BaseConfigArea):
     """Customer Manufacturing Configuration Area."""
 
-    CONFIG_DIR = os.path.join(BaseConfigArea.CONFIG_DIR, "cmpa")
+    DB_SUB_FEATURE = "cmpa"
     DESCRIPTION = "Customer Manufacturing Programmable Area"
 
 
 class CFPA(BaseConfigArea):
     """Customer In-Field Configuration Area."""
 
-    CONFIG_DIR = os.path.join(BaseConfigArea.CONFIG_DIR, "cfpa")
+    DB_SUB_FEATURE = "cfpa"
     DESCRIPTION = "Customer In-field Programmable Area"
 
 
 class ROMCFG(BaseConfigArea):
     """Information flash region - ROMCFG."""
 
-    CONFIG_DIR = os.path.join(os.path.join(SPSDK_DATA_FOLDER, "ifr"))
+    DB_SUB_FEATURE = "romcfg"
+    FEATURE_NAME = DatabaseManager.IFR
     BINARY_SIZE = 304
-    IMAGE_PREFILL_PATTERN = 0xFF
+    IMAGE_PREFILL_PATTERN = "0xFF"
+    DESCRIPTION = "ROM Bootloader configurations"
+
+
+class CMACTABLE(BaseConfigArea):
+    """Information flash region - CMAC Table."""
+
+    DB_SUB_FEATURE = "cmactable"
+    FEATURE_NAME = DatabaseManager.IFR
+    BINARY_SIZE = 128
+    IMAGE_PREFILL_PATTERN = "0xFF"
+    DESCRIPTION = "CMAC table - Used to save hashes of multiple boot components"
+
+
+CONFIG_AREA_CLASSES: dict[str, Type[BaseConfigArea]] = {
+    "cmpa": CMPA,
+    "cfpa": CFPA,
+    "romcfg": ROMCFG,
+    "cmactable": CMACTABLE,
+}
 
 
 def calc_pub_key_hash(
     public_key: PublicKey,
-    backend: BackendClass = openssl_backend,
     sha_width: int = 256,
 ) -> bytes:
     """Calculate a hash out of public key's exponent and modulus in RSA case, X/Y in EC.
 
     :param public_key: List of public keys to compute hash from.
-    :param backend: Crypto subsystem backend.
     :param sha_width: Used hash algorithm.
     :raises SPSDKError: Unsupported public key type
     :return: Computed hash.
     """
-    if isinstance(public_key, rsa.RSAPublicKey):
-        n_1 = public_key.public_numbers().e  # type: ignore # MyPy is unable to pickup the class member
+    if isinstance(public_key, PublicKeyRsa):
+        n_1 = public_key.e
         n1_len = math.ceil(n_1.bit_length() / 8)
-        n_2 = public_key.public_numbers().n  # type: ignore # MyPy is unable to pickup the class member
+        n_2 = public_key.n
         n2_len = math.ceil(n_2.bit_length() / 8)
-    elif isinstance(public_key, ec.EllipticCurvePublicKey):
-        n_1 = public_key.public_numbers().y  # type: ignore # MyPy is unable to pickup the class member
+    elif isinstance(public_key, PublicKeyEcc):
+        n_1 = public_key.y
         n1_len = sha_width // 8
-        n_2 = public_key.public_numbers().x  # type: ignore # MyPy is unable to pickup the class member
+        n_2 = public_key.x
         n2_len = sha_width // 8
     else:
         raise SPSDKError(f"Unsupported key type: {type(public_key)}")
 
-    n1_bytes = n_1.to_bytes(n1_len, "big")
-    n2_bytes = n_2.to_bytes(n2_len, "big")
+    n1_bytes = n_1.to_bytes(n1_len, Endianness.BIG.value)
+    n2_bytes = n_2.to_bytes(n2_len, Endianness.BIG.value)
 
-    return backend.hash(n2_bytes + n1_bytes, algorithm=f"sha{sha_width}")
+    return get_hash(n2_bytes + n1_bytes, algorithm=EnumHashAlgorithm.from_label(f"sha{sha_width}"))
+
+
+def get_ifr_pfr_class(area_name: str, family: str) -> Type[BaseConfigArea]:
+    """Return IFR/PFR class based on the name."""
+    _cls: Type[BaseConfigArea] = globals()[area_name.upper()]
+    devices = _cls.get_supported_families()
+    if family not in devices + list(
+        DatabaseManager().quick_info.devices.get_predecessors(devices).keys()
+    ):
+        raise SPSDKAppError(
+            f"The family has not support for {_cls.FEATURE_NAME.upper()} {area_name.upper()} area"
+        )
+    return _cls

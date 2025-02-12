@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2020-2023 NXP
+# Copyright 2020-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -9,13 +9,12 @@
 
 from typing import Optional
 
-from Crypto.Cipher import AES
+from spsdk.crypto.symmetric import aes_ecb_encrypt
+from spsdk.exceptions import SPSDKError
+from spsdk.utils.spsdk_enum import SpsdkEnum
 
-from spsdk import SPSDKError
-from spsdk.utils.easy_enum import Enum
 
-
-class KeySourceType(Enum):
+class KeySourceType(SpsdkEnum):
     """Device key source."""
 
     OTP = (0, "OTP", "Device keys stored in OTP")
@@ -26,9 +25,7 @@ class KeyStore:
     """Provide info about KeyStore for MaterBootImage."""
 
     # size of key store in bytes
-    KEY_STORE_SIZE = (
-        1424  # Size can be device-specific, the current value is valid for RT5xx and RT6xx
-    )
+    KEY_STORE_SIZE = 1424  # Size can be device-specific, the current value is valid for currently supported devices
 
     SBKEK_SIZE = 32  # Size of Secure Binary KEK in bytes
 
@@ -63,10 +60,13 @@ class KeyStore:
         """Binary key store content; empty bytes for empty key-store."""
         return self._key_store if self._key_store else bytes()
 
-    def info(self) -> str:
+    def __repr__(self) -> str:
+        return f"KeyStore Class, Source: {self.key_source}"
+
+    def __str__(self) -> str:
         """Information about key store in text form."""
         return (
-            f"Device key source:    {KeySourceType.name(self.key_source)}\n"
+            f"Device key source:    {self.key_source.label}\n"
             f"Device key store len: {str(len(self.export()))}"
         )
 
@@ -80,8 +80,7 @@ class KeyStore:
         """
         if len(hmac_key) != 32:
             raise SPSDKError("Invalid length of hmac key")
-        aes = AES.new(hmac_key, AES.MODE_ECB)
-        return aes.encrypt(bytes([0] * 16))
+        return aes_ecb_encrypt(hmac_key, bytes([0] * 16))
 
     @staticmethod
     def derive_enc_image_key(master_key: bytes) -> bytes:
@@ -93,8 +92,7 @@ class KeyStore:
         """
         if len(master_key) != 32:
             raise SPSDKError("Invalid length of master key")
-        aes = AES.new(master_key, AES.MODE_ECB)
-        return aes.encrypt(bytes([1] + [0] * 15 + [2] + [0] * 15))
+        return aes_ecb_encrypt(master_key, bytes([1] + [0] * 15 + [2] + [0] * 15))
 
     @staticmethod
     def derive_sb_kek_key(master_key: bytes) -> bytes:
@@ -106,8 +104,7 @@ class KeyStore:
         """
         if len(master_key) != 32:
             raise SPSDKError("Invalid length of master key")
-        aes = AES.new(master_key, AES.MODE_ECB)
-        return aes.encrypt(bytes([3] + [0] * 15 + [4] + [0] * 15))
+        return aes_ecb_encrypt(master_key, bytes([3] + [0] * 15 + [4] + [0] * 15))
 
     @staticmethod
     def derive_otfad_kek_key(master_key: bytes, otfad_input: bytes) -> bytes:
@@ -123,5 +120,4 @@ class KeyStore:
             raise SPSDKError("Invalid length of master key")
         if len(otfad_input) != KeyStore.OTFAD_KEY_SIZE:
             raise SPSDKError("Invalid length of input")
-        aes = AES.new(master_key, AES.MODE_ECB)
-        return aes.encrypt(otfad_input)
+        return aes_ecb_encrypt(master_key, otfad_input)

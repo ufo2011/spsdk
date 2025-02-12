@@ -2,7 +2,7 @@
 # -*- coding: UTF-8 -*-
 #
 # Copyright 2017-2018 Martin Olejar
-# Copyright 2019-2023 NXP
+# Copyright 2019-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -11,19 +11,15 @@
 from datetime import datetime, timezone
 from io import SEEK_CUR, SEEK_END, BufferedReader, BytesIO
 from struct import unpack_from
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Optional, Union
 
-from cryptography import x509
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives.ciphers.aead import AESCCM
-from cryptography.hazmat.primitives.serialization import Encoding
-
-from spsdk import SPSDKError
-from spsdk.utils.crypto import crypto_backend
-from spsdk.utils.easy_enum import Enum
-from spsdk.utils.misc import DebugInfo, align, align_block, extend_block
-
-from .commands import (
+from spsdk.crypto.certificate import Certificate
+from spsdk.crypto.crypto_types import SPSDKEncoding
+from spsdk.crypto.keys import PrivateKeyRsa
+from spsdk.crypto.rng import random_bytes
+from spsdk.crypto.symmetric import aes_ccm_decrypt, aes_ccm_encrypt
+from spsdk.exceptions import SPSDKError, SPSDKParsingError
+from spsdk.image.commands import (
     CmdAuthData,
     CmdInstallKey,
     EnumAlgorithm,
@@ -32,10 +28,10 @@ from .commands import (
     EnumEngine,
     EnumInsKey,
 )
-from .header import Header, Header2, UnparsedException
-from .misc import NotEnoughBytesException, read_raw_data, read_raw_segment
-from .secret import MAC, CertificateImg, Signature, SrkTable
-from .segments import (
+from spsdk.image.header import Header, Header2
+from spsdk.image.misc import NotEnoughBytesException, read_raw_data, read_raw_segment
+from spsdk.image.secret import MAC, CertificateImg, Signature, SrkTable
+from spsdk.image.segments import (
     AbstractFCB,
     FlexSPIConfBlockFCB,
     PaddingFCB,
@@ -54,21 +50,26 @@ from .segments import (
     SegXMCD,
     XMCDHeader,
 )
+from spsdk.utils.misc import align, align_block, extend_block
+from spsdk.utils.spsdk_enum import SpsdkEnum
+
+# This caused issue on Python 3.xx with pylint version 3.2.5 on LINUX
+# pylint: disable=attribute-defined-outside-init
 
 ########################################################################################################################
 # i.MX Boot Image Classes
 ########################################################################################################################
 
 
-class EnumAppType(Enum):
+class EnumAppType(SpsdkEnum):
     """Type of the application image."""
 
-    SCFW = 1
-    M4_0 = 2
-    M4_1 = 3
-    APP = 4  # actually this means APP or A35 or A53
-    A72 = 5
-    SCD = 6
+    SCFW = (1, "SCFW")
+    M4_0 = (2, "M4_0")
+    M4_1 = (3, "M4_1")
+    APP = (4, "APP")  # actually this means APP or A35 or A53
+    A72 = (5, "A72")
+    SCD = (6, "SCD")
 
 
 class BootImgBase:
@@ -98,7 +99,10 @@ class BootImgBase:
         assert isinstance(value, SegDCD)
         self._dcd = value
 
-    def info(self) -> str:
+    def __repr__(self) -> str:
+        return f"Boot Image Base Class: {self.__class__.__name__}"
+
+    def __str__(self) -> str:
         """Text info about the instance.
 
         :raises NotImplementedError: Derived class has to implement this method
@@ -145,6 +149,7 @@ class BootImgBase:
 ########################################################################################################################
 # Boot Image V2 (i.MX-RT)
 ########################################################################################################################
+
 
 # pylint: disable=too-many-public-methods
 class BootImgRT(BootImgBase):
@@ -381,9 +386,20 @@ class BootImgRT(BootImgBase):
         Please mind: the offset include FCB block (even the FCB block is not exported)
         The offset is 0x2000 for XIP images and 0x1000 for non-XIP images
         """
+        return self.get_app_offset(self.ivt_offset)
+
+    @staticmethod
+    def get_app_offset(ivt_offset: int) -> int:
+        """:return: offset in the binary image, where the application starts.
+
+        Please mind: the offset include FCB block (even the FCB block is not exported)
+        The offset is 0x2000 for XIP images and 0x1000 for non-XIP images
+
+        :param ivt_offset: Offset of IVT segment
+        """
         return (
             BootImgRT.XIP_APP_OFFSET
-            if (self.ivt_offset == self.IVT_OFFSET_NOR_FLASH)
+            if (ivt_offset == BootImgRT.IVT_OFFSET_NOR_FLASH)
             else BootImgRT.NON_XIP_APP_OFFSET
         )
 
@@ -481,49 +497,52 @@ class BootImgRT(BootImgBase):
             for mac in csf.macs:
                 mac.update_aead_encryption_params(self._nonce, self._mac)
 
-    def info(self) -> str:
+    def __repr__(self) -> str:
+        return f"Boot Image RT, Size: {self.size}B"
+
+    def __str__(self) -> str:
         """Text info about the instance."""
         self._update()
         # Print FCB
         msg = "#" * 60 + "\n"
         msg += "# FCB (Flash Configuration Block)\n"
         msg += "#" * 60 + "\n\n"
-        msg += self.fcb.info()
+        msg += str(self.fcb)
         # Print BEE
         if self.bee_encrypted:
             msg += "#" * 60 + "\n"
             msg += "# BEE (Encrypted XIP configuration)\n"
             msg += "#" * 60 + "\n\n"
-            msg += self.bee.info()
+            msg += str(self.bee)
         # Print IVT
         msg += "#" * 60 + "\n"
         msg += "# IVT (Image Vector Table)\n"
         msg += "#" * 60 + "\n\n"
-        msg += self.ivt.info()
+        msg += str(self.ivt)
         # Print BDI
         msg += "#" * 60 + "\n"
         msg += "# BDI (Boot Data Info)\n"
         msg += "#" * 60 + "\n\n"
-        msg += self.bdt.info()
+        msg += str(self.bdt)
         # Print DCD
         if (self.dcd is not None) and self.dcd.enabled:
             msg += "#" * 60 + "\n"
             msg += "# DCD (Device Config Data)\n"
             msg += "#" * 60 + "\n\n"
-            msg += self.dcd.info()
+            msg += str(self.dcd)
         # Print XMCD
         if self.xmcd:
             msg += "#" * 60 + "\n"
             msg += "# XMCD (External Memory Configuration Data)\n"
             msg += "#" * 60 + "\n\n"
-            msg += self.xmcd.info()
+            msg += str(self.xmcd)
         # Print CSF
         csf = self.enabled_csf
         if csf:
             msg += "#" * 60 + "\n"
             msg += "# CSF (Code Signing Data)\n"
             msg += "#" * 60 + "\n\n"
-            msg += csf.info()
+            msg += str(csf)
         return msg
 
     def add_image(
@@ -576,7 +595,7 @@ class BootImgRT(BootImgBase):
                 self._nonce = nonce
             nonce_len = BootImgRT.aead_nonce_len(self.app.size)
             if self._nonce is None:
-                self._nonce = crypto_backend().random_bytes(nonce_len)
+                self._nonce = random_bytes(nonce_len)
             elif len(self._nonce) != nonce_len:
                 raise SPSDKError(f"Invalid nonce length, expected {nonce_len} bytes")
             # encrypt APP
@@ -606,9 +625,9 @@ class BootImgRT(BootImgBase):
         srk_table: SrkTable,
         src_key_index: int,
         csf_cert: bytes,
-        csf_priv_key: bytes,
+        csf_priv_key: PrivateKeyRsa,
         img_cert: bytes,
-        img_priv_key: bytes,
+        img_priv_key: PrivateKeyRsa,
     ) -> None:
         """Add CSF with standard authentication.
 
@@ -618,7 +637,7 @@ class BootImgRT(BootImgBase):
         :param srk_table: SRK table of root certificates; must contain min 1, max 4 certificates
         :param src_key_index: index of selected SRK key used for authentication
         :param csf_cert: CSF certificate
-        :param csf_priv_key: CSF private key; decrypted binary data in PEM format
+        :param csf_priv_key: CSF private key
         :param img_cert: IMG certificate
         :param img_priv_key: IMG private key; decrypted binary data in PEM format
         :raises SPSDKError: If invalid length of srk table
@@ -638,9 +657,9 @@ class BootImgRT(BootImgBase):
         csf.append_command(cmd_ins)
         # install CSF certificate
         cmd_ins = CmdInstallKey(EnumInsKey.CSF, EnumCertFormat.X509, EnumAlgorithm.ANY, 0, 1)
-        cert = x509.load_pem_x509_certificate(csf_cert, default_backend())
+        cert = Certificate.parse(csf_cert)
         cmd_ins.cmd_data_reference = CertificateImg(
-            version=version, data=cert.public_bytes(Encoding.DER)
+            version=version, data=cert.export(SPSDKEncoding.DER)
         )
         csf.append_command(cmd_ins)
         # authenticate content of the CSF segment
@@ -650,15 +669,15 @@ class BootImgRT(BootImgBase):
             EnumCertFormat.CMS,
             EnumEngine.DCP,
             certificate=cert,
-            private_key_pem_data=csf_priv_key,
+            private_key=csf_priv_key,
         )
         cmd_auth.cmd_data_reference = Signature(version=version)
         csf.append_command(cmd_auth)
         # install image certificate
         cmd_ins = CmdInstallKey(EnumInsKey.CLR, EnumCertFormat.X509, EnumAlgorithm.ANY, 0, 2)
-        cert = x509.load_pem_x509_certificate(img_cert, default_backend())
+        cert = Certificate.parse(img_cert)
         cmd_ins.cmd_data_reference = CertificateImg(
-            version=version, data=cert.public_bytes(Encoding.DER)
+            version=version, data=cert.export(SPSDKEncoding.DER)
         )
         csf.append_command(cmd_ins)
         # authenticate image data
@@ -668,7 +687,7 @@ class BootImgRT(BootImgBase):
             EnumCertFormat.CMS,
             EnumEngine.DCP,
             certificate=cert,
-            private_key_pem_data=img_priv_key,
+            private_key=img_priv_key,
         )
         cmd_auth.append(self.address + self.ivt_offset, SegIVT2.SIZE + BootImgRT.BDT_SIZE)
         if self.dcd:
@@ -725,8 +744,13 @@ class BootImgRT(BootImgBase):
         dek = self.dek_key
         if dek is None:
             raise SPSDKError("DEK key is not present")
-        aesccm = AESCCM(dek, tag_length=MAC.AES128_BLK_LEN)
-        encr = aesccm.encrypt(self._nonce, app_data, b"")
+        encr = aes_ccm_encrypt(
+            key=dek,
+            plain_data=app_data,
+            nonce=self._nonce,
+            associated_data=b"",
+            tag_len=MAC.AES128_BLK_LEN,
+        )
         if len(encr) != len(app_data) + 16:
             raise SPSDKError("Invalid length of encrypted data")
         self._mac = encr[-16:]
@@ -753,9 +777,13 @@ class BootImgRT(BootImgBase):
         dek = self.dek_key
         if not (mac and self._nonce and dek):
             raise SPSDKError("Mac or nonce or dek not present")
-        aesccm = AESCCM(dek, tag_length=MAC.AES128_BLK_LEN)
-        res = aesccm.decrypt(self._nonce, app_data + mac, b"")
-        return res
+        return aes_ccm_decrypt(
+            key=dek,
+            encrypted_data=app_data + mac,
+            nonce=self._nonce,
+            associated_data=b"",
+            tag_len=MAC.AES128_BLK_LEN,
+        )
 
     def add_csf_encrypted(
         self,
@@ -763,9 +791,9 @@ class BootImgRT(BootImgBase):
         srk_table: SrkTable,
         src_key_index: int,
         csf_cert: bytes,
-        csf_priv_key: bytes,
+        csf_priv_key: PrivateKeyRsa,
         img_cert: bytes,
-        img_priv_key: bytes,
+        img_priv_key: PrivateKeyRsa,
     ) -> None:
         """Add CSF with image encryption.
 
@@ -775,9 +803,9 @@ class BootImgRT(BootImgBase):
         :param srk_table: SRK table of root certificates; must contain min 1, max 4 certificates
         :param src_key_index: index of selected SRK key used for authentication, 0..srk_table.len - 1
         :param csf_cert: CSF certificate
-        :param csf_priv_key: CSF private key; decrypted binary data in PEM format
+        :param csf_priv_key: CSF private key
         :param img_cert: IMG certificate
-        :param img_priv_key: IMG private key; decrypted binary data in PEM format
+        :param img_priv_key: IMG private key
         :raises SPSDKError: If invalid length of srk table
         :raises SPSDKError: If invalid index of srk table
         :raises SPSDKError: If application data is not present
@@ -795,9 +823,9 @@ class BootImgRT(BootImgBase):
         csf.append_command(cmd_ins)
         # install CSF certificate
         cmd_ins = CmdInstallKey(EnumInsKey.CSF, EnumCertFormat.X509, EnumAlgorithm.ANY, 0, 1)
-        cert = x509.load_pem_x509_certificate(csf_cert, default_backend())
+        cert = Certificate.parse(csf_cert)
         cmd_ins.cmd_data_reference = CertificateImg(
-            version=version, data=cert.public_bytes(Encoding.DER)
+            version=version, data=cert.export(SPSDKEncoding.DER)
         )
         csf.append_command(cmd_ins)
         # authenticate content of the CSF segment
@@ -807,15 +835,15 @@ class BootImgRT(BootImgBase):
             EnumCertFormat.CMS,
             EnumEngine.DCP,
             certificate=cert,
-            private_key_pem_data=csf_priv_key,
+            private_key=csf_priv_key,
         )
         cmd_auth.cmd_data_reference = Signature(version=version)
         csf.append_command(cmd_auth)
         # install image certificate
         cmd_ins = CmdInstallKey(EnumInsKey.CLR, EnumCertFormat.X509, EnumAlgorithm.ANY, 0, 2)
-        cert = x509.load_pem_x509_certificate(img_cert, default_backend())
+        cert = Certificate.parse(img_cert)
         cmd_ins.cmd_data_reference = CertificateImg(
-            version=version, data=cert.public_bytes(Encoding.DER)
+            version=version, data=cert.export(SPSDKEncoding.DER)
         )
         csf.append_command(cmd_ins)
         # authenticate image data
@@ -825,7 +853,7 @@ class BootImgRT(BootImgBase):
             EnumCertFormat.CMS,
             EnumEngine.DCP,
             certificate=cert,
-            private_key_pem_data=img_priv_key,
+            private_key=img_priv_key,
         )
         cmd_auth.append(self.address + self.ivt_offset, SegIVT2.SIZE + BootImgRT.BDT_SIZE)
         app_data = self.app.data
@@ -843,7 +871,7 @@ class BootImgRT(BootImgBase):
             EnumCertFormat.AEAD,
             EnumEngine.DCP,
             certificate=cert,
-            private_key_pem_data=img_priv_key,
+            private_key=img_priv_key,
         )
         if app_data is None:
             raise SPSDKError("Application data is not present")
@@ -853,38 +881,35 @@ class BootImgRT(BootImgBase):
         #
         self.csf = csf
 
-    def export_fcb(self, dbg_info: DebugInfo) -> bytes:
+    def export_fcb(self) -> bytes:
         """Export FCB segment.
 
-        :param dbg_info: optional instance to provide info about exported data
         :return: binary FCB segment
         :raises SPSDKError: If invalid length of data
         """
         if not self.fcb.enabled:
             return b""
-        data = self.fcb.export(dbg_info=dbg_info)
+        data = self.fcb.export()
         if len(data) != self.fcb.space:
             raise SPSDKError("Invalid length of data")
         return data
 
-    def export_bee(self, dbg_info: DebugInfo) -> bytes:
+    def export_bee(self) -> bytes:
         """Export BEE segment.
 
-        :param dbg_info: optional instance to provide info about exported data
         :return: binary BEE segment
         :raises SPSDKError: if any BEE region is configured for images not located in the FLASH
         """
         data = b""
         if self.ivt_offset == self.IVT_OFFSET_NOR_FLASH:
-            data = self.bee.export(dbg_info=dbg_info)
+            data = self.bee.export()
         elif self.bee.space > 0:
             raise SPSDKError("BEE can be configured only for XIP images located in FLASH")
         return data
 
-    def export_dcd(self, dbg_info: DebugInfo) -> bytes:
+    def export_dcd(self) -> bytes:
         """Export DCD segment.
 
-        :param dbg_info: optional instance to provide info about exported data
         :return: binary DCD segment
         :raises SPSDKError: If DCD padding is not set
         """
@@ -893,25 +918,20 @@ class BootImgRT(BootImgBase):
             if self.dcd.padding_len != 0:
                 raise SPSDKError("Padding can not be present")
             dcd_data = self.dcd.export()
-            dbg_info.append_binary_section("DCD", dcd_data)
         return dcd_data
 
-    def export_csf(
-        self, dbg_info: DebugInfo, data: bytes, zulu: datetime = datetime.now(timezone.utc)
-    ) -> bytes:
+    def export_csf(self, data: bytes, zulu: datetime = datetime.now(timezone.utc)) -> bytes:
         """Export CSF segment.
 
-        :param dbg_info: optional instance to provide info about exported data
         :param data: generated binary data used for creating of signature
         :param zulu: current UTC datetime
         :return: binary CFD segment
         """
         csf_data = b""
         if self.enabled_csf:
-            dbg_info.append_section("CSF")
             base_data_addr = self.address if self.fcb.enabled else self.address + self.ivt_offset
             self.enabled_csf.update_signatures(zulu, data, base_data_addr)
-            csf_data = self.enabled_csf.export(dbg_info=dbg_info)
+            csf_data = self.enabled_csf.export()
         return csf_data
 
     def _bee_encrypt_img_data(self, data: bytes) -> bytes:
@@ -937,13 +957,11 @@ class BootImgRT(BootImgBase):
     def export(
         self,
         zulu: datetime = datetime.now(timezone.utc),
-        dbg_info: DebugInfo = DebugInfo.disabled(),
     ) -> bytes:
         """Export image as bytes array.
 
         :param zulu: optional UTC datetime; should be used only if you need fixed datetime for the test
                 Note: the parameter is applied to CSF only, so it is not used for unsigned images
-        :param dbg_info: optional instance to provide info about exported data
         :raises SPSDKError: If the image is not encrypted
         :raises SPSDKError: If padding is present
         :raises SPSDKError: If invalid alignment of application
@@ -956,22 +974,19 @@ class BootImgRT(BootImgBase):
             raise SPSDKError("CSF must be assigned for encrypted images")
 
         self._update()
-        dbg_info.append_section("RT10xxBootableImage")
         # FCB
-        data = self.export_fcb(dbg_info)
+        data = self.export_fcb()
         # BEE
-        bee_data = self.export_bee(dbg_info)
+        bee_data = self.export_bee()
         data += bee_data
         # IVT
         ivt_data = self.ivt.export()
         data += ivt_data
-        dbg_info.append_binary_section("IVT", ivt_data)
         # BDT
         bdt_data = self.bdt.export()
         data += bdt_data
-        dbg_info.append_binary_section("BDT", bdt_data)
         # DCD
-        dcd_data = self.export_dcd(dbg_info)
+        dcd_data = self.export_dcd()
         data += dcd_data
         # padding before APP
         app_alignment = self.app_offset if self.fcb.enabled else self.app_offset - self.ivt_offset
@@ -981,16 +996,15 @@ class BootImgRT(BootImgBase):
         # APP
         app_data = self.app.export()
         data += app_data
-        dbg_info.append_binary_section("APP", app_data)
         # CSF
-        csf_data = self.export_csf(dbg_info, data=data, zulu=zulu)
+        csf_data = self.export_csf(data=data, zulu=zulu)
         data += csf_data
         return self._bee_encrypt_img_data(data)
 
     @classmethod
     def _find_ivt_pos(
         cls, strm: Union[BufferedReader, BytesIO], size: Optional[int] = None
-    ) -> Tuple[Header, int, int]:
+    ) -> tuple[Header, int, int]:
         """Search IVT start position in the image; used by parser.
 
         :param strm: of image data; start seeking from current position
@@ -1005,16 +1019,15 @@ class BootImgRT(BootImgBase):
             end_pos = min(start_pos + size, end_pos)
 
         for ivt_ofs in cls.IVT_OFFSETS:
-
             if start_pos + ivt_ofs > end_pos:
                 break
             strm.seek(start_pos + ivt_ofs)
             header_data = read_raw_data(strm, Header.SIZE, no_seek=True)
             try:
-                header = Header.parse(header_data, required_tag=SegTag.IVT2)
+                header = Header.parse(header_data, required_tag=SegTag.IVT2.tag)
                 if (header.length == SegIVT2.SIZE) and (header.param in cls.VERSIONS):
                     return header, start_pos + ivt_ofs, end_pos
-            except UnparsedException:  # ignore different header tags
+            except SPSDKParsingError:  # ignore different header tags
                 pass
 
         raise SPSDKError("IVT not found")
@@ -1075,7 +1088,7 @@ class BootImgRT(BootImgBase):
             obj.ivt_offset = start_pos
 
         # Parse IVT
-        obj.ivt = SegIVT2.parse(read_raw_segment(stream, SegTag.IVT2))
+        obj.ivt = SegIVT2.parse(read_raw_segment(stream, SegTag.IVT2.tag))
 
         # Try to find XMCD segment
         stream.seek(start_pos + cls.XMCD_IVT_OFFSET)
@@ -1083,7 +1096,7 @@ class BootImgRT(BootImgBase):
             xmcd_header = XMCDHeader.parse(read_raw_data(stream, XMCDHeader.SIZE))
             xmcd_data = read_raw_data(stream, xmcd_header.config_data_size)
             obj.xmcd = SegXMCD(header=xmcd_header, config_data=xmcd_data)
-        except UnparsedException:
+        except SPSDKParsingError:
             # No XMCD found
             pass
         # Parse BDT
@@ -1094,7 +1107,7 @@ class BootImgRT(BootImgBase):
         # Parse DCD
         if obj.ivt.dcd_address:
             stream.seek(start_pos + obj.ivt.dcd_address - obj.ivt.ivt_address)
-            obj.dcd = SegDCD.parse(read_raw_segment(stream, SegTag.DCD))
+            obj.dcd = SegDCD.parse(read_raw_segment(stream, SegTag.DCD.tag))
         # Parse APP
         if obj.ivt.csf_address > 0:
             app_size = obj.ivt.csf_address - obj.ivt.ivt_address - (obj.app_offset - obj.ivt_offset)
@@ -1266,31 +1279,34 @@ class BootImg2(BootImgBase):
         self.bdt.app_length = self.size + self.offset
         self.bdt.plugin = 1 if self.plugin else 0
 
-    def info(self) -> str:
+    def __repr__(self) -> str:
+        return f"Boot Image v2, Size: {self.size}B"
+
+    def __str__(self) -> str:
         """String representation of the IMX Boot Image v2."""
         self._update()
         # Print IVT
         msg = "#" * 60 + "\n"
         msg += "# IVT (Image Vector Table)\n"
         msg += "#" * 60 + "\n\n"
-        msg += self.ivt.info()
+        msg += str(self.ivt)
         # Print DBI
         msg += "#" * 60 + "\n"
         msg += "# BDI (Boot Data Info)\n"
         msg += "#" * 60 + "\n\n"
-        msg += self.bdt.info()
+        msg += str(self.bdt)
         # Print DCD
         if self.dcd:
             msg += "#" * 60 + "\n"
             msg += "# DCD (Device Config Data)\n"
             msg += "#" * 60 + "\n\n"
-            msg += self.dcd.info()
+            msg += str(self.dcd)
         # Print CSF
         if self.csf.enabled:
             msg += "#" * 60 + "\n"
             msg += "# CSF (Code Signing Data)\n"
             msg += "#" * 60 + "\n\n"
-            msg += self.csf.info()
+            msg += str(self.csf)
         return msg
 
     def add_image(
@@ -1308,7 +1324,7 @@ class BootImg2(BootImgBase):
             if address != 0:
                 self.address = address
         else:
-            raise Exception("Unknown data type !")
+            raise SPSDKError("Unknown data type !")
 
     def export(self) -> bytes:
         """Export image as bytes array.
@@ -1379,7 +1395,7 @@ class BootImg2(BootImgBase):
             obj.offset = start_index
 
         # Parse IVT
-        obj.ivt = SegIVT2.parse(read_raw_segment(stream, SegTag.IVT2))
+        obj.ivt = SegIVT2.parse(read_raw_segment(stream, SegTag.IVT2.tag))
         # Parse BDT
         obj.bdt = SegBDT.parse(read_raw_data(stream, SegBDT.SIZE))
         obj.offset = obj.ivt.ivt_address - obj.bdt.app_start
@@ -1387,7 +1403,7 @@ class BootImg2(BootImgBase):
         obj.plugin = bool(obj.bdt.plugin)
         # Parse DCD
         if obj.ivt.dcd_address:
-            obj.dcd = SegDCD.parse(read_raw_segment(stream, SegTag.DCD))
+            obj.dcd = SegDCD.parse(read_raw_segment(stream, SegTag.DCD.tag))
             obj.dcd.padding = (obj.ivt.app_address - obj.ivt.dcd_address) - obj.dcd.size
         # Parse APP
         app_start = start_index + (obj.ivt.app_address - obj.ivt.ivt_address)
@@ -1552,31 +1568,34 @@ class BootImg8m(BootImgBase):
         self.bdt.app_length = self.size + self.offset
         self.bdt.plugin = 1 if self.plugin else 0
 
-    def info(self) -> str:
+    def __repr__(self) -> str:
+        return f"Boot Image i.MX v8, Size: {self.size}B"
+
+    def __str__(self) -> str:
         """String representation of the IMX Boot Image."""
         self._update()
         # Print IVT
         msg = "#" * 60 + "\n"
         msg += "# IVT (Image Vector Table)\n"
         msg += "#" * 60 + "\n\n"
-        msg += self.ivt.info()
+        msg += str(self.ivt)
         # Print DBI
         msg += "#" * 60 + "\n"
         msg += "# BDI (Boot Data Info)\n"
         msg += "#" * 60 + "\n\n"
-        msg += self.bdt.info()
+        msg += str(self.bdt)
         # Print DCD
         if self.dcd:
             msg += "#" * 60 + "\n"
             msg += "# DCD (Device Config Data)\n"
             msg += "#" * 60 + "\n\n"
-            msg += self.dcd.info()
+            msg += str(self.dcd)
         # Print CSF
         if self.csf.enabled:
             msg += "#" * 60 + "\n"
             msg += "# CSF (Code Signing Data)\n"
             msg += "#" * 60 + "\n\n"
-            msg += self.csf.info()
+            msg += str(self.csf)
         return msg
 
     def add_image(
@@ -1594,7 +1613,7 @@ class BootImg8m(BootImgBase):
             if address != 0:
                 self.address = address
         else:
-            raise Exception("Unknown data type !")
+            raise SPSDKError("Unknown data type !")
 
     def export(self) -> bytes:
         """Export Image as bytes array.
@@ -1662,7 +1681,7 @@ class BootImg8m(BootImgBase):
             obj.offset = start_index
 
         # Parse IVT
-        obj.ivt = SegIVT2.parse(read_raw_segment(stream, SegTag.IVT2))
+        obj.ivt = SegIVT2.parse(read_raw_segment(stream, SegTag.IVT2.tag))
         # Parse BDT
         obj.bdt = SegBDT.parse(read_raw_data(stream, SegBDT.SIZE))
         obj.offset = obj.ivt.ivt_address - obj.bdt.app_start
@@ -1670,7 +1689,7 @@ class BootImg8m(BootImgBase):
         obj.plugin = bool(obj.bdt.plugin)
         # Parse DCD
         if obj.ivt.dcd_address:
-            obj.dcd = SegDCD.parse(read_raw_segment(stream, SegTag.DCD))
+            obj.dcd = SegDCD.parse(read_raw_segment(stream, SegTag.DCD.tag))
             obj.dcd.padding = (obj.ivt.app_address - obj.ivt.dcd_address) - obj.dcd.size
         # Parse APP
         app_start = start_index + (obj.ivt.app_address - obj.ivt.ivt_address)
@@ -1738,22 +1757,22 @@ class BootImg3a(BootImgBase):
         self._plg = value
 
     @property
-    def ivt(self) -> List[SegIVT3a]:
+    def ivt(self) -> list[SegIVT3a]:
         """IVT."""
         return self._ivt
 
     @ivt.setter
-    def ivt(self, value: List) -> None:
+    def ivt(self, value: list) -> None:
         assert isinstance(value, list) and isinstance(value[0], SegIVT3a)
         self._ivt = value
 
     @property
-    def bdt(self) -> List[SegBDS3a]:
+    def bdt(self) -> list[SegBDS3a]:
         """BDT."""
         return self._bdt
 
     @bdt.setter
-    def bdt(self, value: List) -> None:
+    def bdt(self, value: list) -> None:
         assert isinstance(value, list) and isinstance(value[0], SegBDS3a)
         self._bdt = value
 
@@ -1804,8 +1823,8 @@ class BootImg3a(BootImgBase):
             # Set IVT section
             self.ivt[container].ivt_address = (
                 self.address[container]  # type: ignore
-                + self.offset  # type: ignore
-                + container * self.ivt[container].size  # type: ignore
+                + self.offset
+                + container * self.ivt[container].size
             )
             self.ivt[container].bdt_address = (
                 self.ivt[container].ivt_address
@@ -1862,7 +1881,10 @@ class BootImg3a(BootImgBase):
                 self.app[container][self.bdt[container].images_count - 1].padding = 0
                 # Set BDT section
 
-    def info(self) -> str:
+    def __repr__(self) -> str:
+        return "Boot Image i.MX v3a"
+
+    def __str__(self) -> str:
         """String representation of the i.MX Boot Image v3a."""
         self._update()
         # Print IVT
@@ -1873,7 +1895,7 @@ class BootImg3a(BootImgBase):
             msg += "-" * 60 + "\n"
             msg += f"- IVT[{index}]\n"
             msg += "-" * 60 + "\n\n"
-            msg += ivt.info()
+            msg += str(ivt)
         # Print BDI
         msg += "#" * 60 + "\n"
         msg += "# BDI (Boot Data Info)\n"
@@ -1882,19 +1904,19 @@ class BootImg3a(BootImgBase):
             msg += "-" * 60 + "\n"
             msg += f"- BDI[{index}]\n"
             msg += "-" * 60 + "\n\n"
-            msg += bdi.info()
+            msg += str(bdi)
         # Print DCD
         if self.dcd:
             msg += "#" * 60 + "\n"
             msg += "# DCD (Device Config Data)\n"
             msg += "#" * 60 + "\n\n"
-            msg += self.dcd.info()
+            msg += str(self.dcd)
         # Print CSF
         if self.csf.enabled:
             msg += "#" * 60 + "\n"
             msg += "# CSF (Code Signing Data)\n"
             msg += "#" * 60 + "\n\n"
-            msg += self.csf.info()
+            msg += str(self.csf)
         return msg
 
     def add_image(
@@ -1955,7 +1977,7 @@ class BootImg3a(BootImgBase):
 
         elif img_type == EnumAppType.SCD:
             if self._sdc_address == 0:
-                raise Exception("SCFW have to be define before SCD!")
+                raise SPSDKError("SCFW have to be define before SCD!")
             image_index = self.bdt[0].images_count
             self.bdt[0].images[image_index].image_destination = self._sdc_address
             self.bdt[0].images[image_index].image_entry = 0
@@ -1969,7 +1991,7 @@ class BootImg3a(BootImgBase):
             self.app[0][image_index].padding = self._compute_padding(len(data), self.SECTOR_SIZE)
 
         else:
-            raise Exception("Unknown data type!")
+            raise SPSDKError("Unknown data type!")
 
     def export(self) -> bytes:
         """Export Image as binary blob."""
@@ -2042,19 +2064,19 @@ class BootImg3a(BootImgBase):
         if start_index > 0:
             obj.offset = start_index
         # Parse IVT
-        obj.ivt[0] = SegIVT3a.parse(read_raw_segment(stream, SegTag.IVT3))
-        obj.ivt[1] = SegIVT3a.parse(read_raw_segment(stream, SegTag.IVT3))
+        obj.ivt[0] = SegIVT3a.parse(read_raw_segment(stream, SegTag.IVT3.tag))
+        obj.ivt[1] = SegIVT3a.parse(read_raw_segment(stream, SegTag.IVT3.tag))
         # Parse BDT
         obj.bdt[0] = SegBDS3a.parse(read_raw_data(stream, SegBDS3a.SIZE))
         obj.bdt[1] = SegBDS3a.parse(read_raw_data(stream, SegBDS3a.SIZE))
         # Parse DCD
         if obj.ivt[0].dcd_address:
             stream.seek(start_index + (obj.ivt[0].dcd_address - obj.ivt[0].ivt_address), 0)
-            obj.dcd = SegDCD.parse(read_raw_segment(stream, SegTag.DCD))
+            obj.dcd = SegDCD.parse(read_raw_segment(stream, SegTag.DCD.tag))
         # Parse CSF
         if obj.ivt[0].csf_address:
             stream.seek(start_index + (obj.ivt[0].csf_address - obj.ivt[0].ivt_address), 0)
-            obj.csf = SegCSF.parse(read_raw_segment(stream, SegTag.CSF))
+            obj.csf = SegCSF.parse(read_raw_segment(stream, SegTag.CSF.tag))
         # Parse IMAGES
         for container in range(obj.COUNT_OF_CONTAINERS):
             for i in range(obj.bdt[container].images_count):
@@ -2116,12 +2138,12 @@ class BootImg3b(BootImgBase):
         self._plg = value
 
     @property
-    def ivt(self) -> List[SegIVT3b]:
+    def ivt(self) -> list[SegIVT3b]:
         """IVT."""
         return self._ivt
 
     @ivt.setter
-    def ivt(self, value: List) -> None:
+    def ivt(self, value: list) -> None:
         assert isinstance(value, list)
         if len(value) != self.COUNT_OF_CONTAINERS:
             raise SPSDKError("Invalid value of IVT")
@@ -2129,12 +2151,12 @@ class BootImg3b(BootImgBase):
         self._ivt = value
 
     @property
-    def bdt(self) -> List[SegBDS3b]:
+    def bdt(self) -> list[SegBDS3b]:
         """BDT."""
         return self._bdt
 
     @bdt.setter
-    def bdt(self, value: List) -> None:
+    def bdt(self, value: list) -> None:
         assert isinstance(value, list)
         if len(value) != self.COUNT_OF_CONTAINERS:
             raise SPSDKError("Invalid value of BDT")
@@ -2171,7 +2193,7 @@ class BootImg3b(BootImgBase):
         self._plg = False
         self._scd_address = 0
         if not isinstance(self.address, int):
-            self.address = [self.INITIAL_LOAD_ADDR_SCU_ROM, self.INITIAL_LOAD_ADDR_AP_ROM]  # type: ignore
+            self.address = [self.INITIAL_LOAD_ADDR_SCU_ROM, self.INITIAL_LOAD_ADDR_AP_ROM]
 
     @staticmethod
     def _compute_padding(image_size: int, sector_size: int) -> int:
@@ -2188,8 +2210,8 @@ class BootImg3b(BootImgBase):
             # Set IVT section
             self.ivt[container].ivt_address = (
                 self.address[container]  # type: ignore
-                + self.offset  # type: ignore
-                + container * self.ivt[container].size  # type: ignore
+                + self.offset
+                + container * self.ivt[container].size
             )
             self.ivt[container].bdt_address = (
                 self.ivt[container].ivt_address
@@ -2264,7 +2286,10 @@ class BootImg3b(BootImgBase):
                     next_image_address += self.csf.space
                     # Set BDT section
 
-    def info(self) -> str:
+    def __repr__(self) -> str:
+        return "Boot Image i.MX v3b"
+
+    def __str__(self) -> str:
         """String representation of the IMX Boot Image v3b."""
         self._update()
         # Print IVT
@@ -2275,7 +2300,7 @@ class BootImg3b(BootImgBase):
             msg += "-" * 60 + "\n"
             msg += f"- IVT[{index}]\n"
             msg += "-" * 60 + "\n\n"
-            msg += ivt.info()
+            msg += str(ivt)
         # Print BDI
         msg += "#" * 60 + "\n"
         msg += "# BDI (Boot Data Info)\n"
@@ -2284,19 +2309,19 @@ class BootImg3b(BootImgBase):
             msg += "-" * 60 + "\n"
             msg += f"- BDI[{index}]\n"
             msg += "-" * 60 + "\n\n"
-            msg += bdi.info()
+            msg += str(bdi)
         # Print DCD
         if self.dcd:
             msg += "#" * 60 + "\n"
             msg += "# DCD (Device Config Data)\n"
             msg += "#" * 60 + "\n\n"
-            msg += self.dcd.info()
+            msg += str(self.dcd)
         # Print CSF
         if self.csf.enabled:
             msg += "#" * 60 + "\n"
             msg += "# CSF (Code Signing Data)\n"
             msg += "#" * 60 + "\n\n"
-            msg += self.csf.info()
+            msg += str(self.csf)
         return msg
 
     def add_image(
@@ -2363,7 +2388,7 @@ class BootImg3b(BootImgBase):
 
         elif img_type == EnumAppType.SCD:
             if self._scd_address == 0:
-                raise Exception("SCFW have to be define before SCD!")
+                raise SPSDKError("SCFW have to be define before SCD!")
             self.scd.data = data
             self.scd.padding = self._compute_padding(len(data), self.SECTOR_SIZE)
             self.bdt[0].scd.image_destination = self._scd_address
@@ -2372,7 +2397,7 @@ class BootImg3b(BootImgBase):
             self.ivt[0].scd_address = self.bdt[0].scd.image_destination
 
         else:
-            raise Exception("Unknown image type!")
+            raise SPSDKError("Unknown image type!")
 
     def export(self) -> bytes:
         """Export."""
@@ -2451,15 +2476,15 @@ class BootImg3b(BootImgBase):
         if start_index > 0:
             obj.offset = start_index
         # Parse IVT
-        obj.ivt[0] = SegIVT3b.parse(read_raw_segment(stream, SegTag.IVT2))
-        obj.ivt[1] = SegIVT3b.parse(read_raw_segment(stream, SegTag.IVT2))
+        obj.ivt[0] = SegIVT3b.parse(read_raw_segment(stream, SegTag.IVT2.tag))
+        obj.ivt[1] = SegIVT3b.parse(read_raw_segment(stream, SegTag.IVT2.tag))
         # Parse BDT
         obj.bdt[0] = SegBDS3b.parse(read_raw_data(stream, SegBDS3b.SIZE))
         obj.bdt[1] = SegBDS3b.parse(read_raw_data(stream, SegBDS3b.SIZE))
         # Parse DCD
         if obj.ivt[0].dcd_address:
             stream.seek(start_index + (obj.ivt[0].dcd_address - obj.ivt[0].ivt_address), 0)
-            obj.dcd = SegDCD.parse(read_raw_segment(stream, SegTag.DCD))
+            obj.dcd = SegDCD.parse(read_raw_segment(stream, SegTag.DCD.tag))
         # Parse IMAGES
         for container in range(obj.COUNT_OF_CONTAINERS):
             for i in range(obj.bdt[container].images_count):
@@ -2474,7 +2499,7 @@ class BootImg3b(BootImgBase):
         # Parse CSF
         if obj.bdt[0].csf.image_source != 0:
             stream.seek(obj.bdt[0].csf.image_source - obj.offset, 0)
-            obj.csf = SegCSF.parse(read_raw_segment(stream, SegTag.CSF))
+            obj.csf = SegCSF.parse(read_raw_segment(stream, SegTag.CSF.tag))
 
         return obj
 
@@ -2501,27 +2526,30 @@ class BootImg4(BootImgBase):
     def _update(self) -> None:
         pass
 
-    def info(self) -> str:
+    def __repr__(self) -> str:
+        return "Boot Image i.MX v4"
+
+    def __str__(self) -> str:
         """String representation of the i.MX Boot Image v4."""
         self._update()
         msg = ""
         msg += "#" * 60 + "\n"
         msg += "# Boot Images Container 1\n"
         msg += "#" * 60 + "\n\n"
-        msg += self._cont1_header.info()
+        msg += str(self._cont1_header)
         msg += "#" * 60 + "\n"
         msg += "# Boot Images Container 2\n"
         msg += "#" * 60 + "\n\n"
-        msg += self._cont2_header.info()
+        msg += str(self._cont2_header)
         if self.dcd:
             if self.dcd.enabled:
                 msg += "#" * 60 + "\n"
                 msg += "# DCD (Device Config Data)\n"
                 msg += "#" * 60 + "\n\n"
-                msg += self.dcd.info()
+                msg += str(self.dcd)
         return msg
 
-    def add_image(self, data: bytes, img_type: int, address: int) -> None:
+    def add_image(self, data: bytes, img_type: EnumAppType, address: int) -> None:
         """Add image.
 
         :raises NotImplementedError: Not yet implemented
@@ -2659,9 +2687,6 @@ class KernelImg:
     def _update(self) -> None:
         pass
 
-    def info(self) -> None:
-        """String representation of the IMX Kernel Image."""
-
     def export(self) -> bytes:
         """Export."""
         self._update()
@@ -2671,8 +2696,8 @@ class KernelImg:
         return data
 
     @classmethod
-    def parse(cls, data: Union[str, bytes]) -> None:
-        """Parse."""
+    def _check_data_to_parse(cls, data: Union[str, bytes]) -> None:
+        """Check data to parse."""
         assert isinstance(data, (bytes, str))
         if not len(data) > cls.IMAGE_MIN_SIZE:
             raise SPSDKError("Invalid length of data to be parsed")
@@ -2715,27 +2740,27 @@ def parse(
         raw = read_raw_data(stream, Header.SIZE, no_seek=True)
 
         if (
-            raw[0] == SegTag.IVT2
+            raw[0] == SegTag.IVT2.tag
             and ((raw[1] << 8) | raw[2]) == SegIVT2.SIZE
             and raw[3] in (0x40, 0x41, 0x42)
         ):
             return BootImg2.parse(stream)
 
         if (
-            raw[0] == SegTag.IVT2
+            raw[0] == SegTag.IVT2.tag
             and ((raw[1] << 8) | raw[2]) == SegIVT3b.SIZE
             and raw[3] in (0x43,)
         ):
             return BootImg3b.parse(stream)
 
         if (
-            raw[0] == SegTag.IVT3
+            raw[0] == SegTag.IVT3.tag
             and ((raw[1] << 8) | raw[2]) == SegIVT3a.SIZE
             and raw[3] in (0x43,)
         ):
             return BootImg3a.parse(stream)
 
-        if raw[3] == SegTag.BIC1:
+        if raw[3] == SegTag.BIC1.tag:
             return BootImg4.parse(stream)
 
         start_index = stream.seek(step, SEEK_CUR)

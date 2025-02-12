@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2020-2022 NXP
+# Copyright 2020-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -9,9 +9,8 @@
 
 from typing import Mapping, Type
 
-from spsdk import SPSDKError
-
-from ..sb2.commands import (
+from spsdk.exceptions import SPSDKError
+from spsdk.sbfile.sb2.commands import (
     CmdBaseClass,
     CmdCall,
     CmdErase,
@@ -42,15 +41,14 @@ _CMDV1_TO_CLASS: Mapping[EnumCmdTag, Type[CmdBaseClass]] = {
 }
 
 
-def parse_v1_command(data: bytes, offset: int = 0) -> CmdBaseClass:
+def parse_v1_command(data: bytes) -> CmdBaseClass:
     """Parse SB V1.x command from binary format.
 
     :param data: Input data as bytes
-    :param offset: The offset of input data to start parsing
     :return: parsed command object
     :raises SPSDKError: Raised when there is unsupported command
     """
-    header_tag = EnumCmdTag.from_int(data[offset + 1])
+    header_tag = EnumCmdTag.from_tag(data[1])
     if header_tag not in _CMDV1_TO_CLASS:
-        raise SPSDKError(f"Unsupported command: {EnumCmdTag.name(header_tag)}")
-    return _CMDV1_TO_CLASS[header_tag].parse(data, offset)
+        raise SPSDKError(f"Unsupported command: {header_tag.label}")
+    return _CMDV1_TO_CLASS[header_tag].parse(data)

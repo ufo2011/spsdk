@@ -1,13 +1,12 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2021-2023 NXP
+# Copyright 2021-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
 """Testing utilities for the BLHost application."""
 import os
-from typing import List, Tuple
 
 import pytest
 
@@ -19,6 +18,7 @@ from spsdk.apps.blhost_helper import (
     parse_trust_prov_wrapping_key_type,
 )
 from spsdk.utils.images import BinaryImage
+from spsdk.utils.interfaces.device.usbsio_device import UsbSioDevice
 
 
 @pytest.mark.parametrize(
@@ -42,12 +42,12 @@ def test_parse_property_tag(input, expected):
 @pytest.mark.parametrize(
     "input,family,expected",
     [
-        ("verify-erase", "kw45xx", 10),
-        ("verify-erase", "k32w1xx", 10),
+        ("verify-erase", "kw45b41z8", 10),
+        ("verify-erase", "k32w148", 10),
         ("verify-erase", None, 0xFF),
         ("current-version", None, 1),
-        ("current-version", "kw45xx", 1),
-        ("current-version", "k32w1xx", 1),
+        ("current-version", "kw45b41z8", 1),
+        ("current-version", "k32w148", 1),
     ],
 )
 def test_parse_property_tag_override(input, family, expected):
@@ -94,7 +94,7 @@ def test_parse_key_prov_key_type(input, expected):
         ),
     ],
 )
-def test_parse_image_file(path, segment_info_list: List[Tuple[int, int]], data_dir):
+def test_parse_image_file(path, segment_info_list: list[tuple[int, int]], data_dir):
     result = BinaryImage.load_binary_image(os.path.join(data_dir, path))
     assert len(result.sub_images) == len(segment_info_list)
     for current, ref in zip(result.sub_images, segment_info_list):
@@ -120,7 +120,7 @@ def test_parse_image_file(path, segment_info_list: List[Tuple[int, int]], data_d
         ),
     ],
 )
-def test_parse_image_file_aligned_sizes(path, aligned_sizes: List[Tuple[int, int]], data_dir):
+def test_parse_image_file_aligned_sizes(path, aligned_sizes: list[tuple[int, int]], data_dir):
     result = BinaryImage.load_binary_image(os.path.join(data_dir, path))
     assert len(result.sub_images) == len(aligned_sizes)
     for segment, expected in zip(result.sub_images, aligned_sizes):

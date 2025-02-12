@@ -2,15 +2,14 @@
 # -*- coding: UTF-8 -*-
 #
 # Copyright 2016-2018 Martin Olejar
-# Copyright 2019-2021 NXP
+# Copyright 2019-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
 """Exceptions used in the MBoot module."""
 
-from spsdk import SPSDKError
-
-from .error_codes import StatusCode
+from spsdk.exceptions import SPSDKConnectionError, SPSDKError
+from spsdk.mboot.error_codes import StatusCode
 
 ########################################################################################################################
 # McuBoot Exceptions
@@ -37,7 +36,11 @@ class McuBootCommandError(McuBootError):
         super().__init__()
         self.cmd_name = cmd
         self.error_value = value
-        self.description = StatusCode.desc(value, f"Unknown Error 0x{value:08X}")
+        self.description = (
+            StatusCode.get_description(value)
+            if value in StatusCode.tags()
+            else f"Unknown Error 0x{value:08X}"
+        )
 
     def __str__(self) -> str:
         return self.fmt.format(cmd_name=self.cmd_name, description=self.description)
@@ -49,7 +52,7 @@ class McuBootDataAbortError(McuBootError):
     fmt = "Mboot: Data aborted by sender"
 
 
-class McuBootConnectionError(McuBootError):
+class McuBootConnectionError(SPSDKConnectionError, McuBootError):
     """MBoot Module: Connection Exception."""
 
     fmt = "MBoot: Connection issue -> {description}"

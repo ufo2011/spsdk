@@ -1,18 +1,20 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2019-2022 NXP
+# Copyright 2019-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
 import os
 from binascii import unhexlify
 from datetime import datetime, timezone
-from typing import List
 
 import pytest
 
-from spsdk import SPSDKError
+from spsdk.crypto.certificate import Certificate
+from spsdk.crypto.signature_provider import get_signature_provider
+from spsdk.exceptions import SPSDKError
+from spsdk.mboot.memories import ExtMemId, MemIdEnum
 from spsdk.sbfile.sb2.commands import (
     CmdCall,
     CmdErase,
@@ -28,17 +30,17 @@ from spsdk.sbfile.sb2.images import (
     BootImageV20,
     BootImageV21,
     BootSectionV2,
-    CertBlockV2,
+    CertBlockV1,
     SBV2xAdvancedParams,
 )
-from spsdk.utils.crypto import Certificate, KeyBlob, Otfad
-from spsdk.utils.easy_enum import Enum
+from spsdk.utils.crypto.otfad import KeyBlob, Otfad
 from spsdk.utils.misc import align_block
+from spsdk.utils.spsdk_enum import SpsdkEnum
 
 kek_value = unhexlify("AC701E99BD3492E419B756EADC0985B3D3D0BC0FDB6B057AA88252204C2DA732")
 
 
-class SectionsContent(Enum):
+class SectionsContent(SpsdkEnum):
     """type of sections content to test"""
 
     SIMPLE = (1, "simple", "one simple section")
@@ -53,34 +55,31 @@ def test_sb20_parser(data_dir):
 
     assert isinstance(img_obj, BootImageV20)
 
-    # check info() produces something
-    assert img_obj.info()
+    # check __str__() produces something
+    assert str(img_obj)
 
 
-def gen_cert_block(data_dir, sign_bits) -> CertBlockV2:
+def gen_cert_block(data_dir, sign_bits) -> CertBlockV1:
     """Shared function to generate certificate block for SB2.x
     :param data_dir: absolute path to load certificate
     :param sign_bits: signature key length in bits
 
     :return: certificate block for SB2.x
     """
-    with open(
-        os.path.join(data_dir, "sb2_x", "selfsign_" + str(sign_bits) + "_v3.der.crt"), "rb"
-    ) as f:
-        cert_data = f.read()
+    cert_obj = Certificate.load(
+        os.path.join(data_dir, "sb2_x", "selfsign_" + str(sign_bits) + "_v3.der.crt")
+    )
+    root_key_hash = cert_obj.public_key_hash()
 
-    cert_obj = Certificate(cert_data)
-    root_key = cert_obj.public_key_hash
-
-    cb = CertBlockV2()
-    cb.set_root_key_hash(0, root_key)
-    cb.add_certificate(cert_data)
+    cb = CertBlockV1()
+    cb.set_root_key_hash(0, root_key_hash)
+    cb.add_certificate(cert_obj)
     return cb
 
 
 def get_boot_sections(
     data_dir: str, otfad: bool, sect_cont: SectionsContent, load_addr: int
-) -> List[BootSectionV2]:
+) -> list[BootSectionV2]:
     """Create list of boot sections for SB 2.x file
 
     :param data_dir: absolute path to load boot image
@@ -90,6 +89,11 @@ def get_boot_sections(
     :return:
     """
     result = list()
+
+    class TestExtMemId(MemIdEnum):
+        """McuBoot External Memory Property Tags."""
+
+        TEST = (3, "TEST", "Test memory id")
 
     # load input image (binary)
     with open(os.path.join(data_dir, "sb2_x", "boot_image.bin"), "rb") as f:
@@ -154,8 +158,8 @@ def get_boot_sections(
             CmdVersionCheck(VersionCheckType.NON_SECURE_VERSION, 15263),
             CmdErase(address=0, length=0x2800),
             CmdLoad(address=load_addr, data=encr_image),
-            CmdKeyStoreBackup(0x12345678, 3),
-            CmdKeyStoreRestore(0x12345678, 3),
+            CmdKeyStoreBackup(0x12345678, TestExtMemId.TEST),
+            CmdKeyStoreRestore(0x12345678, TestExtMemId.TEST),
             hmac_count=1,
         )
     else:
@@ -267,12 +271,12 @@ def test_sb2x_builder(
 
     if signed:
         boot_image.cert_block = gen_cert_block(data_dir, sign_bits)
-        with open(
-            os.path.join(data_dir, "sb2_x", "selfsign_privatekey_rsa" + str(sign_bits) + ".pem"),
-            "rb",
-        ) as keyf:
-            key_data = keyf.read()
-        boot_image.private_key_pem_data = key_data
+        private_key = os.path.join(
+            data_dir, "sb2_x", "selfsign_privatekey_rsa" + str(sign_bits) + ".pem"
+        )
+        signature_provider = get_signature_provider(local_file_key=private_key)
+
+        boot_image.signature_provider = signature_provider
 
     for sect in get_boot_sections(data_dir, otfad, sect_cont, load_addr):
         boot_image.add_boot_section(sect)
@@ -284,10 +288,10 @@ def test_sb2x_builder(
     # test raw_size
     assert len(result) == boot_image.raw_size
 
-    # check that info() prints anything
-    assert boot_image.info()
+    # check that __str__() prints anything
+    assert str(boot_image)
 
-    sect_cont_str = SectionsContent.name(sect_cont)
+    sect_cont_str = sect_cont.label
     if otfad:
         mode = "otfad"
     elif signed:
@@ -390,7 +394,7 @@ def test_invalid_boot_image_v2():
     with pytest.raises(
         SPSDKError, match="Certificate block cannot be used unless SB file is signed"
     ):
-        bimg.cert_block = CertBlockV2()
+        bimg.cert_block = CertBlockV1()
     bimg = BootImageV20(True, kek=bytes(31))
     bimg.cert_block = None
     with pytest.raises(SPSDKError, match="Certification block not present"):

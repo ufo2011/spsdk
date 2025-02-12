@@ -1,29 +1,24 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2020-2021 NXP
+# Copyright 2020-2023 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-from re import L
 
 import pytest
 
-from spsdk import SPSDKError
-from spsdk.image import BootImgRT
-from spsdk.utils.misc import DebugInfo
+from spsdk.exceptions import SPSDKError
+from spsdk.image.images import BootImgRT
 
 
 def test_bootimage_rt10xx_basic():
     """Simple test for BootImgRT"""
     img = BootImgRT(0x60000000)
-    assert img.info()
-    dbg_info = DebugInfo()
-    img_data = img.export(dbg_info=dbg_info)
+    assert str(img)
+    img_data = img.export()
     # test parser returns same result
-    dbg_info2 = DebugInfo()
-    img_data2 = BootImgRT.parse(img_data).export(dbg_info=dbg_info2)
-    assert dbg_info.lines == dbg_info2.lines
+    img_data2 = BootImgRT.parse(img_data).export()
     assert img_data == img_data2
 
 

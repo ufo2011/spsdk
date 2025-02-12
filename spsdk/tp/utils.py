@@ -1,19 +1,16 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2021-2023 NXP
+# Copyright 2021-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 """Trust Provisioning utilities."""
-import os
-from typing import List, Optional, Type
+from typing import Optional, Type
 
-from ruamel.yaml import YAML
-
-from spsdk.crypto import ec
-
-from . import TP_DATA_FOLDER, TpDevInterface, TpIntfDescription, TpTargetInterface
-from .adapters import TP_DEVICES, TP_TARGETS
+from spsdk.exceptions import SPSDKError
+from spsdk.tp.adapters import TP_DEVICES, TP_TARGETS
+from spsdk.tp.tp_intf import TpDevInterface, TpIntfDescription, TpTargetInterface
+from spsdk.utils.database import DatabaseManager, get_families
 
 
 def single_tp_device_adapter() -> bool:
@@ -26,33 +23,28 @@ def single_tp_target_adapter() -> bool:
     return len(TP_TARGETS) == 1
 
 
-def get_supported_devices() -> List[str]:
-    """Return list of supported devices for Trust Provisioning.
-
-    :return: List of devices.
-    """
-    with open(os.path.join(TP_DATA_FOLDER, "database.yaml")) as f:
-        data = YAML(typ="safe").load(f)
-    return list(data["devices"].keys())
+def get_supported_devices() -> list[str]:
+    """Return list of supported devices for Trust Provisioning."""
+    return get_families(DatabaseManager.TP)
 
 
-def get_tp_device_types() -> List[str]:
+def get_tp_device_types() -> list[str]:
     """Return list of supported TP device types."""
     return list(TP_DEVICES.keys())
 
 
 def scan_tp_devices(
     tpdev: Optional[str] = None, settings: Optional[dict] = None
-) -> List[TpIntfDescription]:
+) -> list[TpIntfDescription]:
     """The function scans the TP devices on system.
 
     :param tpdev: Selection of one type of TP device, defaults to None (scan all supported).
     :param settings: Additional settings to setup interface, defaults to {}.
     :return: List of active TP device descriptors.
-    :raises ValueError: Invalid value of parameter.
+    :raises SPSDKError: Invalid value of parameter.
     """
     if tpdev and tpdev not in get_tp_device_types():
-        raise ValueError(f"Unsupported TP device name - {tpdev}")
+        raise SPSDKError(f"Unsupported TP device name - {tpdev}")
 
     dev_list = [tpdev] if tpdev else get_tp_device_types()
 
@@ -65,7 +57,7 @@ def scan_tp_devices(
 
 def get_tp_devices(
     tpdev: Optional[str] = None, settings: Optional[dict] = None
-) -> List[TpDevInterface]:
+) -> list[TpDevInterface]:
     """Return a list of active TP Devices fulfilling criteria in 'settings'.
 
     This functions attempts to open/close the device, please mind possible side-effects.
@@ -89,23 +81,23 @@ def get_tp_devices(
     return devices
 
 
-def get_tp_target_types() -> List[str]:
+def get_tp_target_types() -> list[str]:
     """Return list of supported TP targets."""
     return list(TP_TARGETS.keys())
 
 
 def scan_tp_targets(
     tptarget: Optional[str] = None, settings: Optional[dict] = None
-) -> List[TpIntfDescription]:
+) -> list[TpIntfDescription]:
     """The function scans the TP targets on system.
 
     :param tptarget: Selection of one type of TP target, defaults to None (scan all supported).
     :param settings: Additional settings to setup interface, defaults to {}.
     :return: List of active TP devices.
-    :raises ValueError: Invalid value of parameter.
+    :raises SPSDKError: Invalid value of parameter.
     """
     if tptarget and tptarget not in get_tp_target_types():
-        raise ValueError(f"Unsupported TP device name - {tptarget}")
+        raise SPSDKError(f"Unsupported TP device name - {tptarget}")
 
     target_list = [tptarget] if tptarget else get_tp_target_types()
 
@@ -118,7 +110,7 @@ def scan_tp_targets(
 
 def get_tp_targets(
     tptarget: Optional[str] = None, settings: Optional[dict] = None
-) -> List[TpTargetInterface]:
+) -> list[TpTargetInterface]:
     """Return a list of active TP Targets fulfilling criteria in 'settings'.
 
     This functions attempts to open/close the device, please mind possible side-effects.
@@ -158,14 +150,3 @@ def get_tp_target_class(name: str) -> Type[TpTargetInterface]:
     :return: TP target interface.
     """
     return TP_TARGETS[name]
-
-
-def reconstruct_cryptography_key(key_material: bytes) -> ec.EllipticCurvePublicKey:
-    """Reconstruct cryptography's ECC Public Key from coordinates."""
-    coordinate_length = len(key_material) // 2
-    curve = {32: ec.SECP256R1(), 48: ec.SECP384R1()}[coordinate_length]
-    point_x = int.from_bytes(key_material[:coordinate_length], byteorder="big")
-    point_y = int.from_bytes(key_material[coordinate_length:], byteorder="big")
-    pub_numbers = ec.EllipticCurvePublicNumbers(x=point_x, y=point_y, curve=curve)
-    key = pub_numbers.public_key()
-    return key

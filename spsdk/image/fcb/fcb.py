@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2022-2023 NXP
+# Copyright 2022-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -9,25 +9,32 @@
 
 
 import datetime
-import os
-from copy import deepcopy
-from typing import Any, Dict, List
+import logging
+from typing import Any
 
-from ruamel.yaml.comments import CommentedMap as CM
+from typing_extensions import Self
 
 from spsdk import version as spsdk_version
 from spsdk.exceptions import SPSDKError, SPSDKValueError
-from spsdk.image.fcb import FCB_DATA_FOLDER, FCB_DATABASE_FILE, FCB_SCH_FILE
+from spsdk.image.mem_type import MemoryType
 from spsdk.image.segments_base import SegmentBase
-from spsdk.utils.database import Database
+from spsdk.utils.database import DatabaseManager, get_schema_file
+from spsdk.utils.misc import Endianness, swap_bytes
 from spsdk.utils.registers import Registers
-from spsdk.utils.schema_validator import ConfigTemplate, ValidationSchemas
+from spsdk.utils.schema_validator import CommentedConfig, update_validation_schema_family
+
+logger = logging.getLogger(__name__)
 
 
 class FCB(SegmentBase):
     """FCB (Flash Configuration Block)."""
 
-    def __init__(self, family: str, mem_type: str, revision: str = "latest") -> None:
+    FEATURE = DatabaseManager.FCB
+    TAG = b"FCFB"
+    TAG_SWAPPED = swap_bytes(TAG)
+    SIZE = 0x200
+
+    def __init__(self, family: str, mem_type: MemoryType, revision: str = "latest") -> None:
         """FCB Constructor.
 
         :param family: Chip family.
@@ -38,36 +45,73 @@ class FCB(SegmentBase):
         super().__init__(family, revision)
         mem_types = FCB.get_supported_memory_types(self.family, self.revision)
         if mem_type not in mem_types:
-            raise SPSDKValueError(f"Unsupported memory type:{mem_type} not in {mem_types}")
+            raise SPSDKValueError(
+                f"Unsupported memory type:{mem_type.label} not in {[mem_type.label for mem_type in mem_types]}"
+            )
         self.mem_type = mem_type
-        self._registers = Registers(family, base_endianness="little")
-
-        block_file_name = self.get_memory_types(self.family, self.revision)[self.mem_type]
-        self._registers.load_registers_from_xml(os.path.join(FCB_DATA_FOLDER, block_file_name))
-
-    @staticmethod
-    def get_database() -> Database:
-        """Get the devices database."""
-        return Database(FCB_DATABASE_FILE)
+        self._registers = Registers(
+            family=family,
+            feature=self.FEATURE,
+            base_key=["mem_types", self.mem_type.label],
+            revision=revision,
+            base_endianness=Endianness.LITTLE,
+        )
 
     @property
     def registers(self) -> Registers:
         """Registers of segment."""
         return self._registers
 
+    @classmethod
+    def parse(
+        cls,
+        binary: bytes,
+        offset: int = 0,
+        family: str = "Unknown",
+        mem_type: MemoryType = MemoryType.FLEXSPI_NOR,
+        revision: str = "latest",
+    ) -> Self:
+        """Parse binary block into FCB object.
+
+        :param binary: binary image.
+        :param offset: Offset of FCB in binary image.
+        :param family: Chip family.
+        :param mem_type: Used memory type.
+        :param revision: Optional Chip family revision.
+        :raises SPSDKError: If given binary block contains wrong FCB tag
+        """
+        fcb = cls(family=family, mem_type=mem_type, revision=revision)
+        if len(binary[offset:]) < FCB.SIZE:
+            raise SPSDKError(
+                f"Invalid input binary block size: ({len(binary[offset:])} < {FCB.SIZE})."
+            )
+        if binary[: (len(cls.TAG))] == cls.TAG_SWAPPED:
+            logger.info("Swapped bytes order has been detected. Fixing the bytes order.")
+            binary = swap_bytes(binary)
+        fcb.registers.parse(binary[offset:])
+        tag = fcb.registers.find_reg("tag")
+        if tag.get_bytes_value() != cls.TAG:
+            raise SPSDKError(
+                f"Tag value {tag.get_bytes_value()!r} does does not match the expected value."
+            )
+        return fcb
+
     @staticmethod
-    def load_from_config(config: Dict) -> "FCB":
+    def load_from_config(config: dict) -> "FCB":
         """Load configuration file of FCB.
 
         :param config: FCB configuration file.
         :return: FCB object.
         """
-        family = config.get("family", "Unknown")
-        mem_type = config.get("type", "Unknown")
-        revision = config.get("revision", "latest")
-        fcb = FCB(family=family, mem_type=mem_type, revision=revision)
-        fcb_settings = config.get("fcb_settings", {})
-        fcb.registers.load_yml_config(fcb_settings)
+        try:
+            family = config["family"]
+            mem_type = MemoryType.from_label(config["type"])
+            revision = config.get("revision", "latest")
+            fcb = FCB(family=family, mem_type=mem_type, revision=revision)
+            fcb_settings = config.get("fcb_settings", {})
+            fcb.registers.load_yml_config(fcb_settings)
+        except (SPSDKError, AttributeError) as exc:
+            raise SPSDKValueError(f"Cannot load FCB configuration: {str(exc)}") from exc
         return fcb
 
     def create_config(self) -> str:
@@ -75,22 +119,25 @@ class FCB(SegmentBase):
 
         :return: Configuration of FCB Block.
         """
-        config = CM()
+        config: dict[str, Any] = {}
         config["family"] = self.family
         config["revision"] = self.revision
-        config["type"] = self.mem_type
-        config["fcb_settings"] = self.registers.create_yml_config()
-        config.yaml_set_start_comment(
-            f"FCB configuration for {self.family}.\n"
-            f"Created: {datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')}.\n"
-            f"NXP SPSDK version: {spsdk_version}"
-        )
-        return ConfigTemplate.convert_cm_to_yaml(config)
+        config["type"] = self.mem_type.label
+        config["fcb_settings"] = self.registers.get_config()
+        schemas = self.get_validation_schemas(self.family, self.mem_type, self.revision)
+        return CommentedConfig(
+            main_title=(
+                f"FCB configuration for {self.family}.\n"
+                f"Created: {datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')}.\n"
+                f"NXP SPSDK version: {spsdk_version}"
+            ),
+            schemas=schemas,
+        ).get_config(config)
 
     @classmethod
     def get_validation_schemas(
-        cls, family: str, mem_type: str, revision: str = "latest"
-    ) -> List[Dict[str, Any]]:
+        cls, family: str, mem_type: MemoryType, revision: str = "latest"
+    ) -> list[dict[str, Any]]:
         """Create the validation schema.
 
         :param family: Family description.
@@ -100,34 +147,37 @@ class FCB(SegmentBase):
         :return: List of validation schemas.
         """
         fcb_obj = FCB(family, mem_type, revision)
-        sch_cfg = deepcopy(ValidationSchemas.get_schema_file(FCB_SCH_FILE))
+        sch_cfg = get_schema_file(DatabaseManager.FCB)
+        sch_family = get_schema_file("general")["family"]
         try:
-            sch_cfg["fcb_family_rev"]["properties"]["family"]["enum"] = FCB.get_supported_families()
-            revisions = ["latest"]
-            revisions.extend(
-                fcb_obj.get_database().devices.get_by_name(family).revisions.revision_names
+            update_validation_schema_family(
+                sch_family["properties"], FCB.get_supported_families(), family, revision
             )
-            sch_cfg["fcb_family_rev"]["properties"]["revision"]["enum"] = revisions
-            sch_cfg["fcb_family_rev"]["properties"]["type"]["enum"] = list(
-                fcb_obj.get_supported_memory_types(fcb_obj.family, revision)
-            )
+            sch_cfg["memory_type"]["properties"]["type"]["enum"] = [
+                mem_type.label
+                for mem_type in fcb_obj.get_supported_memory_types(fcb_obj.family, revision)
+            ]
+            sch_cfg["memory_type"]["properties"]["type"]["template_value"] = mem_type.label
             sch_cfg["fcb"]["properties"]["fcb_settings"] = fcb_obj.registers.get_validation_schema()
-            return [sch_cfg["fcb_family_rev"], sch_cfg["fcb"]]
+            return [sch_family, sch_cfg["memory_type"], sch_cfg["fcb"]]
         except (KeyError, SPSDKError) as exc:
             raise SPSDKError(f"Family {family} or {revision} is not supported") from exc
 
     @staticmethod
-    def get_validation_schemas_family() -> List[Dict[str, Any]]:
+    def get_validation_schemas_family() -> list[dict[str, Any]]:
         """Create the validation schema just for supported families.
 
         :return: List of validation schemas for FCB supported families.
         """
-        sch_cfg = deepcopy(ValidationSchemas.get_schema_file(FCB_SCH_FILE))
-        sch_cfg["fcb_family_rev"]["properties"]["family"]["enum"] = FCB.get_supported_families()
-        return [sch_cfg["fcb_family_rev"]]
+        sch_cfg = get_schema_file(DatabaseManager.FCB)
+        sch_family = get_schema_file("general")["family"]
+        update_validation_schema_family(sch_family["properties"], FCB.get_supported_families())
+        return [sch_family, sch_cfg["memory_type"]]
 
     @staticmethod
-    def generate_config_template(family: str, mem_type: str, revision: str = "latest") -> str:
+    def generate_config_template(
+        family: str, mem_type: MemoryType, revision: str = "latest"
+    ) -> str:
         """Generate configuration for selected family.
 
         :param family: Family description.
@@ -139,15 +189,19 @@ class FCB(SegmentBase):
 
         if family in FCB.get_supported_families():
             schemas = FCB.get_validation_schemas(family, mem_type, revision)
-            override = {}
-            override["family"] = family
-            override["revision"] = revision
-            override["type"] = mem_type
-
-            ret = ConfigTemplate(
-                f"Flash Configuration Block template for {family}.",
-                schemas,
-                override,
-            ).export_to_yaml()
+            ret = CommentedConfig(
+                f"Flash Configuration Block template for {family}.", schemas
+            ).get_template()
 
         return ret
+
+    def __repr__(self) -> str:
+        return f"FCB Segment, memory type: {self.mem_type.description}"
+
+    def __str__(self) -> str:
+        return (
+            "FCB Segment:\n"
+            f" Family:           {self.family}\n"
+            f" Revision:         {self.revision}\n"
+            f" Memory type:      {self.mem_type.description}\n"
+        )

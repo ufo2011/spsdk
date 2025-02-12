@@ -1,13 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2022-2023 NXP
+# Copyright 2022-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
 """Script for creation of image with all SPSDK apps"""
+import math
 import os
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -18,7 +19,7 @@ IMG_APPS_PATH = os.path.join(IMG_PATH, "spsdk-architecture-apps.png")
 IMG_APIS_PATH = os.path.join(IMG_PATH, "spsdk-architecture-apis.png")
 IMG_ARCHITECTURE_PATH = os.path.join(IMG_PATH, "spsdk-architecture.png")
 
-IMG_FONT_PATH = os.path.join(os.path.abspath("."), "_static/fonts/Roboto-Medium.ttf")
+IMG_FONT_PATH = os.path.join(os.path.abspath("."), "_static/fonts/Poppins-Regular.ttf")
 
 SHOW_IMG = False
 
@@ -31,7 +32,7 @@ class ImgTable:
         table_list: List[str],
         header_text: str,
         x_count: int = 3,
-        y_count: int = 4,
+        y_count: Optional[int] = None,
         rect_width: int = 300,
         rect_height: int = 100,
         offset: int = 10,
@@ -63,7 +64,7 @@ class ImgTable:
         self.table_list = table_list
         self.header_text = header_text
         self.x_count = x_count
-        self.y_count = y_count
+        self.y_count = y_count or math.ceil(len(table_list) / x_count)
         self.rect_width = rect_width
         self.rect_height = rect_height
         self.offset = offset
@@ -75,10 +76,10 @@ class ImgTable:
         self.outline_color = outline_color
         self.font = font
 
-        if len(table_list) > x_count * y_count:
+        if len(table_list) > self.x_count * self.y_count:
             print(
                 f"Warning: {header_text} table list is larger than the size of the table,"
-                f"size {x_count * y_count}, required {len(table_list)}"
+                f"size {self.x_count * self.y_count}, required {len(table_list)}"
             )
 
         self.img, self.draw = self._get_img()
@@ -122,12 +123,11 @@ class ImgTable:
 
     def _create_table(self):
         """Draws rectangle as table"""
-        idx = 0
-        for j in range(self.x_count):
-            for i in range(self.y_count):
+        sorted_list = sorted(self.table_list)
+        for i in range(self.y_count):
+            for j in range(self.x_count):
                 try:
-                    command = self.table_list[idx]
-                    idx += 1
+                    command = sorted_list[i * self.x_count + j]
                 except IndexError:
                     return
 
@@ -142,7 +142,8 @@ class ImgTable:
                     outline=self.outline_color,
                 )
 
-                text_w, text_h = self.draw.textsize(command, font=self.table_text_font)
+                text_w = self.draw.textlength(command, font=self.table_text_font)
+                text_h = self.table_font_size
 
                 text_offset_x = (self.rect_width - text_w) / 2
                 text_offset_y = (self.rect_height - text_h) / 2
@@ -168,7 +169,7 @@ class ImgTable:
             outline=self.outline_color,
         )
 
-        text_w, _ = self.draw.textsize(self.header_text, font=self.header_text_font)
+        text_w = self.draw.textlength(self.header_text, font=self.header_text_font)
 
         text_offset_x = (x2 - x1 - text_w) / 2 + self.offset
 
@@ -205,6 +206,9 @@ def get_spsdk_apps() -> List[str]:
     :return: list of all SPSDK apps
     """
     commands = spsdk_main.commands
+    commands.pop("utils")  # remove utils group commands
+    if "get-families" in commands:
+        commands.pop("get-families")  # remove general get-families
     return list(commands.keys())
 
 
@@ -235,12 +239,13 @@ def main():
         "Crypto",
         "Master Boot Image",
         "Secure Binary File",
-        "AHAB",
+        "AHAB + ELE",
         "Debug Authentication",
         "Mboot Protocol",
         "SDP(S) Protocol",
         "Debuggers",
         "Trust Provisioning",
+        "DK6",
     ]
 
     tools_list = ["MCUXpresso SEC tool", "Mass production tools", "3rd party tools"]
@@ -252,9 +257,9 @@ def main():
     img_api = ImgTable(
         table_list=apis_list, header_text="APIs Modules", table_font_size=25, font=IMG_FONT_PATH
     )
-    img_apps = ImgTable(apps_list, "Applications", y_count=6, font=IMG_FONT_PATH)
+    img_apps = ImgTable(apps_list, "Applications", font=IMG_FONT_PATH)
     img_tools = ImgTable(
-        tools_list, "Tools", y_count=1, table_font_size=25, rect_height=150, font=IMG_FONT_PATH
+        tools_list, "Tools", table_font_size=25, rect_height=150, font=IMG_FONT_PATH
     )
 
     # create architecture image by concatenating them
@@ -272,6 +277,7 @@ def main():
     img_apps.save(IMG_APPS_PATH)
     img_api.save(IMG_APIS_PATH)
     img_architecture.save(IMG_ARCHITECTURE_PATH)
+    print("Generation done")
 
 
 def setup(app):

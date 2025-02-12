@@ -1,17 +1,18 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2021-2023 NXP
+# Copyright 2021-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 """Commands used in SmartCard."""
 
 import logging
 from struct import pack
-from typing import Optional, Tuple
+from typing import Optional
 
-from spsdk import SPSDKError
-from spsdk.utils.easy_enum import Enum
+from spsdk.exceptions import SPSDKError
+from spsdk.utils.misc import Endianness
+from spsdk.utils.spsdk_enum import SpsdkEnum
 
 try:
     from smartcard.CardConnection import CardConnection
@@ -21,12 +22,12 @@ except ImportError as e:
     ) from e
 
 
-from .. import SPSDKTpError
+from spsdk.tp.exceptions import SPSDKTpError
 
 logger = logging.getLogger(__name__)
 
 
-class StatusCodes(Enum):
+class StatusCodes(SpsdkEnum):
     """SmartCard APDU general status codes."""
 
     SEC_COND_NOT_SATISFIED = (0x6982, "SecCondNotSatisfied", "Security condition not satisfied")
@@ -48,6 +49,11 @@ class StatusCodes(Enum):
     GENERIC_ERROR = (0x6F00, "GenericError", "Generic error")
 
     MAX_COUNTER_REACHED = (0x5501, "CounterReached", "Max provisioning counter reached")
+    COUNTER_NOT_INITIALIZED = (
+        0x5502,
+        "CounterNotInitialized",
+        "Provisioning counter is not initialized (Smart card is probably not configured)",
+    )
     VERIFICATION_ERROR = (0x6300, "VerificationError", "Public key can't be verified")
 
 
@@ -67,13 +73,20 @@ class SmartCardAPDU:
         :param data: A sequence of bytes in the data field of the command
         :param le: Maximum of bytes expected in the data field of the response to the command
         """
-        assert cla in [0x00, 0x80]
-        assert ins < 256
-        assert p1 < 256
-        assert p2 < 256
-        assert le < 65535
+        if cla not in [0x00, 0x80]:
+            raise SPSDKTpError("CLA must be 0x00 or 0x80")
+        if ins > 255:
+            raise SPSDKTpError("INS must be less than 256")
+        if p1 > 255:
+            raise SPSDKTpError("P1 must be less than 256")
+        if p2 > 255:
+            raise SPSDKTpError("P2 must be less than 256")
+        if le > 65535:
+            raise SPSDKTpError("LE must be less than 65536")
+
         if data:
-            assert len(data) < 65535
+            if len(data) > 65535:
+                raise SPSDKTpError("Data length must be less than 65536")
 
         self.cla = cla
         self.ins = ins
@@ -91,18 +104,22 @@ class SmartCardAPDU:
         fmt = "<BBBB"
         ret = pack(fmt, self.cla, self.ins, self.p1, self.p2)
         if self.data:
-            ret += self.lc.to_bytes(length=3 if self.is_extended else 1, byteorder="big")
+            ret += self.lc.to_bytes(
+                length=3 if self.is_extended else 1, byteorder=Endianness.BIG.value
+            )
             ret += self.data
         if self.le:
-            ret += self.le.to_bytes(length=2 if self.is_extended else 1, byteorder="big")
+            ret += self.le.to_bytes(
+                length=2 if self.is_extended else 1, byteorder=Endianness.BIG.value
+            )
         return ret
 
     @classmethod
     def get_status_description(cls, code: int) -> str:
         """Return text description of status code."""
-        desc = StatusCodes.desc(code)
+        desc = StatusCodes.get_description(code)
         if not desc:
-            desc = StatusCodes.desc(code & 0xFF00, "Unknown")
+            desc = StatusCodes.get_description(code & 0xFF00, "Unknown")
         return f"{hex(code)}: {desc}"
 
     @classmethod
@@ -175,7 +192,7 @@ class GetProductionCounter(SmartCardAPDU):
     @staticmethod
     def format(response: bytes) -> int:
         """Format the `transmit` response into `int`."""
-        return int.from_bytes(response, byteorder="big")
+        return int.from_bytes(response, byteorder=Endianness.BIG.value)
 
 
 class GetProductionRemainder(SmartCardAPDU):
@@ -188,7 +205,33 @@ class GetProductionRemainder(SmartCardAPDU):
     @staticmethod
     def format(response: bytes) -> int:
         """Format the `transmit` response into `int`."""
-        return int.from_bytes(response, byteorder="big")
+        return int.from_bytes(response, byteorder=Endianness.BIG.value)
+
+
+class GetSealState(SmartCardAPDU):
+    """Get current card seal state."""
+
+    def __init__(self) -> None:
+        """Get current card seal state."""
+        super().__init__(cla=0x00, ins=0xCA, p1=0x01, p2=0x19)
+
+    @staticmethod
+    def format(response: bytes) -> bool:
+        """Format the `transmit` response into `bool`."""
+        return response == b"\x01"
+
+
+class GetFamily(SmartCardAPDU):
+    """Get family set in the smart card."""
+
+    def __init__(self) -> None:
+        """Get family set in the smart card."""
+        super().__init__(cla=0x00, ins=0xCA, p1=0x01, p2=0x1A)
+
+    @staticmethod
+    def format(response: bytes) -> str:
+        """Format the `transmit` response into `str`."""
+        return response.decode("utf-8")
 
 
 class Select(SmartCardAPDU):
@@ -228,7 +271,7 @@ class GetSerialNumber(SmartCardAPDU):
     @staticmethod
     def format(response: bytes) -> int:
         """Format the `transmit` response into `int`."""
-        return int.from_bytes(response, byteorder="big")
+        return int.from_bytes(response, byteorder=Endianness.BIG.value)
 
 
 class GetAppletVersion(SmartCardAPDU):
@@ -257,7 +300,7 @@ class GetFreeMemory(SmartCardAPDU):
     @staticmethod
     def format(response: bytes) -> int:
         """Format the `transmit` response into `int`."""
-        return int.from_bytes(response, byteorder="big")
+        return int.from_bytes(response, byteorder=Endianness.BIG.value)
 
 
 class Echo(SmartCardAPDU):
@@ -278,7 +321,7 @@ class ResizeNVMBuffer(SmartCardAPDU):
 
     def __init__(self, new_length: int) -> None:
         """Resize NVM buffer to `new_length`."""
-        length_data = new_length.to_bytes(length=2, byteorder="big")
+        length_data = new_length.to_bytes(length=2, byteorder=Endianness.BIG.value)
         super().__init__(cla=0x80, ins=0x84, p1=0x00, p2=0x00, data=length_data)
 
 
@@ -295,7 +338,7 @@ class ResizeTransientBuffer(SmartCardAPDU):
 
     def __init__(self, new_length: int) -> None:
         """Resize NVM buffer to `new_length`."""
-        length_data = new_length.to_bytes(length=2, byteorder="big")
+        length_data = new_length.to_bytes(length=2, byteorder=Endianness.BIG.value)
         super().__init__(cla=0x80, ins=0x84, p1=0x00, p2=0x01, data=length_data)
 
 
@@ -315,7 +358,7 @@ class DeleteTransientBuffer(SmartCardAPDU):
 class CreateFileSystem(SmartCardAPDU):
     """Create File System on applet. Turns applet into PERSONALIZATION mode."""
 
-    def __init__(self, objects_count: int = 15) -> None:
+    def __init__(self, objects_count: int = 18) -> None:
         """Create File System on applet."""
         super().__init__(cla=0x80, ins=0xE1, p1=00, p2=objects_count)
 
@@ -345,7 +388,7 @@ class FinalizeFileSystem(SmartCardAPDU):
         super().__init__(cla=0x80, ins=0x44, p1=0x00, p2=0x00)
 
 
-def int_to_p1p2(param: int) -> Tuple[int, int]:
+def int_to_p1p2(param: int) -> tuple[int, int]:
     """Converts integer into the bytes (p1, p2)."""
     p1 = (param >> 8) & 0xFF
     p2 = param & 0xFF

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2021-2023 NXP
+# Copyright 2021-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 """Trust Provisioning HOST application support."""
@@ -17,17 +17,24 @@ import time
 from functools import partial
 from typing import Callable, Optional, Sequence
 
-from spsdk import SPSDKError
-from spsdk.crypto import EllipticCurvePublicKey, serialization
-from spsdk.crypto.loaders import Encoding, extract_public_key, load_pem_public_key
-from spsdk.tp.data_container import AuditLog, DataEntry, PayloadType
-from spsdk.utils.database import Database
-from spsdk.utils.misc import Timeout, value_to_int, write_file
-
-from . import TP_DATA_FOLDER, SPSDKTpError, TpDevInterface, TpTargetInterface
-from .adapters.tptarget_blhost import TpTargetBlHost
-from .adapters.utils import detect_new_usb_path, get_current_usb_paths, update_usb_path
-from .data_container import AuditLogCounter, AuditLogRecord, Container
+from spsdk.crypto.crypto_types import SPSDKEncoding
+from spsdk.crypto.keys import PublicKeyEcc
+from spsdk.crypto.utils import extract_public_key
+from spsdk.exceptions import SPSDKError
+from spsdk.tp.adapters.tptarget_blhost import TpTargetBlHost
+from spsdk.tp.adapters.utils import detect_new_usb_path, get_current_usb_paths, update_usb_path
+from spsdk.tp.data_container import (
+    AuditLog,
+    AuditLogCounter,
+    AuditLogRecord,
+    Container,
+    DataEntry,
+    PayloadType,
+)
+from spsdk.tp.exceptions import SPSDKTpError
+from spsdk.tp.tp_intf import TpDevInterface, TpTargetInterface
+from spsdk.utils.database import DatabaseManager, Features, get_db
+from spsdk.utils.misc import Timeout, write_file
 
 logger = logging.getLogger(__name__)
 
@@ -59,32 +66,28 @@ class TrustProvisioningHost:
         prov_fw: bytes,
         family: str,
         timeout: int = 60,
-        database: Optional[Database] = None,
         skip_test: bool = True,
         keep_target_open: bool = True,
+        skip_usb_enumeration: bool = False,
     ) -> None:
         """Method loads the provisioning firmware into device.
 
         :param prov_fw: Provisioning Firmware data
         :param family: Chip family
         :param timeout: Timeout for loading provisioning firmware operation in seconds.
-        :param database: Database of all supported devices (automatic lookup if not specified)
         :param skip_test: Skip test for checking that OEM Provisioning Firmware booted-up
         :param keep_target_open: Keep target device open
+        :param skip_usb_enumeration: Skip USB enumeration after loading the Provisioning firmware
         :raises SPSDKTpError: The Provisioning firmware doesn't boot
         """
-        if database is None:
-            logger.debug("Looking up device in database")
-            database = Database(os.path.join(TP_DATA_FOLDER, "database.yaml"))
-        if family not in database.devices.device_names:
-            raise SPSDKTpError(f"Database info missing for '{family}'")
+        db = get_db(family, "latest")
         try:
             if not self.tptarget.is_open:
                 self.tptarget.open()
             self.info_print("1.1.Step - Updating CFPA page")
-            self.update_cfpa_page(family=family, database=database)
+            self.update_cfpa_page(family=family, database=db)
             self.info_print("1.2.Step - Erase memory for provisioning firmware")
-            self.erase_memory(family=family, database=database)
+            self.erase_memory(database=db)
             self.info_print("1.3.Step - Loading OEM provisioning firmware")
         except SPSDKError as e:
             self.tptarget.close()
@@ -93,12 +96,14 @@ class TrustProvisioningHost:
         try:
             if self.tptarget.uses_usb:
                 initial_usb_set = get_current_usb_paths()
+            else:
+                initial_usb_set = None
 
             self.tptarget.load_sb_file(prov_fw, timeout)
             # Need to reset the connection due to re-init on the MCU side
             self.tptarget.close()
 
-            if self.tptarget.uses_usb:
+            if self.tptarget.uses_usb and not skip_usb_enumeration:
                 assert isinstance(self.tptarget, TpTargetBlHost)
                 new_usb_path = detect_new_usb_path(initial_set=initial_usb_set)
                 update_usb_path(self.tptarget, new_usb_path=new_usb_path)
@@ -110,7 +115,7 @@ class TrustProvisioningHost:
                 self.info_print("1.4.Step - Checking whether provisioning firmware booted.")
                 self.tptarget.open()
                 if not self.tptarget.check_provisioning_firmware():
-                    raise SPSDKError()
+                    raise SPSDKError("Provisioning firmware did not boot properly")
 
             if keep_target_open and not self.tptarget.is_open:
                 self.tptarget.open()
@@ -118,26 +123,26 @@ class TrustProvisioningHost:
         except SPSDKError as e:
             self.tptarget.close()
             raise SPSDKTpError(
-                "Can't load/connect to the TrustProvisioning Firmware. "
+                f"Can't load/connect to the TrustProvisioning Firmware. Error: {e}\n"
                 "Please make sure your device supports TrustProvisioning."
             ) from e
 
-    def update_cfpa_page(self, family: str, database: Database) -> None:
+    def update_cfpa_page(self, family: str, database: Features) -> None:
         """Update CFPA page according to chip family."""
-        if not database.get_device_value("need_cfpa_update", family):
+        if not database.get_bool(DatabaseManager.TP, "need_cfpa_update"):
             logger.info("CFPA update not required")
             return
 
-        cfpa_address = value_to_int(database.get_device_value("cfpa_address", family))
-        cfpa_size = value_to_int(database.get_device_value("cfpa_size", family))
-        cfpa_version_offset = value_to_int(database.get_device_value("version_offset", family))
-        cfpa_revoke_offset = value_to_int(database.get_device_value("revoke_offset", family))
+        cfpa_address = database.get_int(DatabaseManager.PFR, ["cfpa", "address"])
+        cfpa_size = database.get_int(DatabaseManager.PFR, ["cfpa", "size"])
+        cfpa_version_offset = database.get_int(DatabaseManager.TP, "version_offset")
+        cfpa_revoke_offset = database.get_int(DatabaseManager.TP, "revoke_offset")
 
         # change bytes to bytearray to make it writeable
         cfpa_data = bytearray(self.tptarget.read_memory(cfpa_address, cfpa_size))
 
         # CFPA REVOKE field update
-        if database.get_device_value("need_revoke_update", family):
+        if database.get_bool(DatabaseManager.TP, "need_revoke_update"):
             cfpa_revoke: int = struct.unpack_from("<L", cfpa_data, offset=cfpa_revoke_offset)[0]
             if cfpa_revoke & 0x55 == 0x55:
                 logger.info("RKTH_REVOKE is already set, no need to update CFPA")
@@ -156,14 +161,14 @@ class TrustProvisioningHost:
         self.tptarget.write_memory(cfpa_address, data=bytes(cfpa_data))
         logger.info("CFPA update completed")
 
-    def erase_memory(self, family: str, database: Database) -> None:
+    def erase_memory(self, database: Features) -> None:
         """Erase part(s) of flash memory if needed."""
-        if not database.get_device_value("erase_memory", family):
+        if not database.get_bool(DatabaseManager.TP, "erase_memory"):
             logger.info("Erasing memory is not needed")
             return
 
-        start = value_to_int(database.get_device_value("erase_memory_start", family))
-        length = value_to_int(database.get_device_value("erase_memory_length", family))
+        start = database.get_int(DatabaseManager.TP, "erase_memory_start")
+        length = database.get_int(DatabaseManager.TP, "erase_memory_length")
 
         self.tptarget.erase_memory(address=start, length=length)
         logger.info("Erasing memory completed")
@@ -190,12 +195,6 @@ class TrustProvisioningHost:
         """
         try:
             loc_timeout = Timeout(timeout, "s")
-
-            logger.debug("Looking up device in database")
-            database = Database(os.path.join(TP_DATA_FOLDER, "database.yaml"))
-            if family not in database.devices.device_names:
-                raise SPSDKTpError(f"Database info missing for '{family}'")
-
             logger.debug("Opening TP DEVICE interface")
             self.tpdev.open()
             audit_log_dirname = os.path.dirname(os.path.abspath(audit_log))
@@ -217,9 +216,9 @@ class TrustProvisioningHost:
                     prov_fw=prov_fw,
                     family=family,
                     timeout=loc_timeout.get_rest_time_ms(True),
-                    database=database,
                     skip_test=True,
                     keep_target_open=True,
+                    skip_usb_enumeration=False,
                 )
 
             self.info_print("2.Step - Get the initial challenge from TP device.")
@@ -227,8 +226,7 @@ class TrustProvisioningHost:
 
             logger.info(f"TP Challenge:\n{Container.parse(challenge)}")
             if save_debug_data:
-                with open("x_challenge.bin", "wb") as f:
-                    f.write(challenge)
+                write_file(challenge, "x_challenge.bin", "wb")
 
             self.info_print("3.Step - Prove a genuinity in TP target.")
             tp_data = self.tptarget.prove_genuinity_challenge(
@@ -237,8 +235,7 @@ class TrustProvisioningHost:
 
             logger.info(f"TP Response:\n{Container.parse(tp_data)}")
             if save_debug_data:
-                with open("x_tp_response.bin", "wb") as f:
-                    f.write(tp_data)
+                write_file(tp_data, "x_tp_response.bin", "wb")
 
             self.info_print("4.Step - Authenticate TP response from TP target.")
             wrapped_data = self.tpdev.authenticate_response(
@@ -247,8 +244,7 @@ class TrustProvisioningHost:
 
             logger.info(f"TP ISP WRAPPED DATA:\n{Container.parse(wrapped_data)}")
             if save_debug_data:
-                with open("x_wrapped_data.bin", "wb") as f:
-                    f.write(wrapped_data)
+                write_file(wrapped_data, "x_wrapped_data.bin", "wb")
 
             self.info_print("5.Step - Create Audit Log record.")
             self.create_audit_log_record(wrapped_data, audit_log)
@@ -292,10 +288,10 @@ class TrustProvisioningHost:
         skip_nxp: bool = False,
         skip_oem: bool = False,
         cert_index: Optional[int] = None,
-        encoding: Encoding = Encoding.PEM,
+        encoding: SPSDKEncoding = SPSDKEncoding.PEM,
         max_processes: Optional[int] = None,
         info_print: Callable[[str], None] = lambda x: None,
-        force_rewrite: bool = False,
+        force_rewrite: bool = True,
     ) -> AuditLogCounter:
         """Verifying audit log with given key (public/private).
 
@@ -305,7 +301,7 @@ class TrustProvisioningHost:
         :param skip_nxp: Skip extracting the NXP Devattest certificates
         :param skip_oem: Skip extracting the OEM x509 Devattest certificates
         :param cert_index: Select single OEM certificate to extract, default None = all certificates
-        :param encoding: Certificate encoding, defaults to Encoding.PEM
+        :param encoding: Certificate encoding, defaults to SPSDK_Encoding.PEM
         :param max_processes: Maximum number od parallel process to use, defaults to CPU count
         :param info_print: Method for printing messages
         :param force_rewrite: Skip checking for empty destination directory and rewrite existing content
@@ -317,11 +313,9 @@ class TrustProvisioningHost:
             logger.info(f"Extracting public key from {audit_log_key}")
 
             log_key = extract_public_key(audit_log_key)
+            assert isinstance(log_key, PublicKeyEcc)
             # PublicKey can't be passed to other processes we have serialize it
-            log_key_pem_data = log_key.public_bytes(
-                encoding=Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo
-            )
-            assert isinstance(log_key, EllipticCurvePublicKey)
+            log_key_data = log_key.export()
 
             if destination:
                 os.makedirs(destination, exist_ok=True)
@@ -354,7 +348,7 @@ class TrustProvisioningHost:
                 summary_counter = _verify_extract_chain(
                     audit_log=audit_log,
                     log_slice=slice(0, log_record_count),
-                    public_key_pem_data=log_key_pem_data,
+                    public_key_data=log_key_data,
                     store_cert_method=store_certificate_method,
                 )
             else:
@@ -368,7 +362,7 @@ class TrustProvisioningHost:
                             _verify_extract_chain,
                             audit_log=audit_log,
                             log_slice=log_slice,
-                            public_key_pem_data=log_key_pem_data,
+                            public_key_data=log_key_data,
                             store_cert_method=store_certificate_method,
                         ): log_slice
                         for log_slice in log_slices
@@ -443,14 +437,16 @@ class TrustProvisioningHost:
         response_file: str,
         timeout: int = 60,
         challenge: Optional[bytes] = None,
-        oem_id_key_count: int = 0,
+        oem_key_flags: int = 0,
+        save_debug_data: bool = False,
     ) -> None:
         """Retrieve TP_RESPONSE from the target.
 
         :param response_file: Path where to store TP_RESPONSE
         :param timeout: The timeout of operation is seconds, defaults to 60
         :param challenge: Challenge for the response, defaults to None
-        :param oem_id_key_count: Number of OEM keys to include in the response, defaults to 0
+        :param oem_key_flags: OEM Key flags used for generating the response, defaults to 0
+        :param save_debug_data: Save transmitted data in CWD for debugging purposes
         :raises SPSDKTpError: Failure to retrieve the response
         """
         try:
@@ -460,17 +456,21 @@ class TrustProvisioningHost:
 
             challenge = challenge or secrets.token_bytes(16)
             if len(challenge) != 16:
-                raise SPSDKTpError(f"Challenge has to be 16B long")
+                raise SPSDKTpError("Challenge has to be 16B long")
 
             challenge_container = Container()
             challenge_container.add_entry(
                 DataEntry(
                     payload=challenge,
-                    payload_type=PayloadType.NXP_EPH_CHALLENGE_DATA_RND,
-                    extra=oem_id_key_count << 2,
+                    payload_type=PayloadType.NXP_EPH_CHALLENGE_DATA_RND.tag,
+                    extra=oem_key_flags,
                 )
             )
             logger.info(f"TP Challenge:\n{challenge_container}")
+
+            if save_debug_data:
+                with open("x_challenge.bin", "wb") as f:
+                    f.write(challenge_container.export())
 
             tp_response = self.tptarget.prove_genuinity_challenge(
                 challenge=challenge_container.export(),
@@ -503,18 +503,19 @@ def _get_log_slices(log_length: int, process_count: int) -> Sequence[slice]:
 
 def _verify_extract_chain(
     audit_log: str,
-    public_key_pem_data: bytes,
+    public_key_data: bytes,
     store_cert_method: Callable[[AuditLogRecord], AuditLogCounter],
     log_slice: slice,
 ) -> AuditLogCounter:
     """Verify content of AuditLog and optionally store certificates."""
-    public_key = load_pem_public_key(public_key_pem_data)
-    assert isinstance(public_key, EllipticCurvePublicKey)
     counter = AuditLogCounter()
 
     # if the current slice is not at the begging of file
     # we have to fetch previous record for chain verification
     # if the current slice is the first one in log, the starting hash should be 0
+
+    public_key = PublicKeyEcc.parse(public_key_data)
+
     start = log_slice.start
     fetch_previous = False
     if start != 0:
@@ -532,7 +533,6 @@ def _verify_extract_chain(
             raise SPSDKTpError(f"Log entry #{i} has an invalid signature!")
         if record.start_hash != previous_hash:
             if ALLOW_ARBITRARY_START and (i == 1):
-                # TODO: need to get confirmation on this one
                 pass
             else:
                 raise SPSDKTpError(f"Audit log chain is broken between records #{i - 1} - #{i}")
@@ -548,8 +548,8 @@ def _extract_certificates(
     skip_nxp: bool = False,
     skip_oem: bool = False,
     cert_index: Optional[int] = None,
-    encoding: Encoding = Encoding.PEM,
-    force_rewrite: bool = False,
+    encoding: SPSDKEncoding = SPSDKEncoding.PEM,
+    force_rewrite: bool = True,
 ) -> AuditLogCounter:
     """Extract certificates from the audit log into destination_dir.
 
@@ -558,7 +558,7 @@ def _extract_certificates(
     :param skip_nxp: Skip extracting the NXP Devattest certificates
     :param skip_oem: Skip extracting the OEM x509 Devattest certificates
     :param info_print: Method for printing messages
-    :param encoding: Certificate encoding, defaults to Encoding.PEM
+    :param encoding: Certificate encoding, defaults to SPSDK_Encoding.PEM
     :raises SPSDKTpError: Destination directory doesn't exist
     :return: Number of generated NXP and OEM certificates
     """
@@ -584,7 +584,7 @@ def _extract_certificates(
     return counter
 
 
-def _write_cert_data(cert_data: bytes, name: str, path: str, force_rewrite: bool) -> None:
+def _write_cert_data(cert_data: bytes, name: str, path: str, force_rewrite: bool = True) -> None:
     """Write certificate data into a file.
 
     :param cert_data: Certificate data
@@ -602,17 +602,17 @@ def _write_cert_data(cert_data: bytes, name: str, path: str, force_rewrite: bool
     write_file(cert_data, destination, mode="wb")
 
 
-def _encode_cert_data(cert_data: bytes, encoding: Encoding = Encoding.PEM) -> bytes:
+def _encode_cert_data(cert_data: bytes, encoding: SPSDKEncoding = SPSDKEncoding.PEM) -> bytes:
     """Encode certificate data with given encoding.
 
     :param cert_data: Certificate binary data (DER)
-    :param encoding: Output encoding, defaults to Encoding.PEM
+    :param encoding: Output encoding, defaults to SPSDK_Encoding.PEM
     :raises SPSDKTpError: Unsupported encoding
     :return: Encoded certificate data
     """
-    if encoding == Encoding.DER:
+    if encoding == SPSDKEncoding.DER:
         return cert_data
-    if encoding == Encoding.PEM:
+    if encoding == SPSDKEncoding.PEM:
         data = base64.b64encode(cert_data)
         lines = [data[i : i + 64] for i in range(0, len(data), 64)]
         lines.insert(0, b"-----BEGIN CERTIFICATE-----")

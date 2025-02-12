@@ -1,15 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2021-2023 NXP
+# Copyright 2021-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
 """Trust provisioning host adapters interfaces."""
-from typing import Any, Dict, List, Optional, Type, Union
+from typing import Any, Optional, Type, Union
 
-from .data_container.audit_log import AuditLog
-from .exceptions import SPSDKTpError
+from spsdk.tp.data_container.audit_log import AuditLog
+from spsdk.tp.exceptions import SPSDKTpError
 
 
 class TpIntfDescription:
@@ -20,7 +20,7 @@ class TpIntfDescription:
         name: str,
         intf: Optional[Union[Type["TpDevInterface"], Type["TpTargetInterface"]]],
         description: str,
-        settings: Optional[Dict],
+        settings: Optional[dict],
         version: str = "0.0.0",
     ) -> None:
         """Root Of Trust device description.
@@ -38,7 +38,7 @@ class TpIntfDescription:
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__}: id={self.get_id()}, version={self.version}>"
 
-    def as_dict(self) -> Dict[str, Any]:
+    def as_dict(self) -> dict[str, Any]:
         """Returns whole record as dictionary.
 
         :return: All variables of class in dictionary.
@@ -56,10 +56,13 @@ class TpIntfDescription:
         """Return the ID hash of the interface."""
         raise NotImplementedError()
 
-    def create_interface(self) -> Union["TpDevInterface", "TpTargetInterface"]:
+    def create_interface(
+        self, *args: Union[int, str], **kwargs: Union[int, str]
+    ) -> Union["TpDevInterface", "TpTargetInterface"]:
         """Return TP Device or Target associated with this descriptor."""
-        assert self.intf
-        return self.intf(self)
+        if not self.intf:
+            raise SPSDKTpError("Interface is not defined.")
+        return self.intf(self, *args, **kwargs)
 
 
 class TpInterface:
@@ -68,7 +71,7 @@ class TpInterface:
     NAME = "Interface"
 
     @classmethod
-    def get_connected_interfaces(cls, settings: Optional[Dict] = None) -> List[TpIntfDescription]:
+    def get_connected_interfaces(cls, settings: Optional[dict] = None) -> list[TpIntfDescription]:
         """Get all connected TP devices of this adapter.
 
         :param settings: Possible settings to determine the way to find connected device, defaults to None.
@@ -114,7 +117,7 @@ class TpInterface:
         raise NotImplementedError()
 
     @classmethod
-    def get_validation_schemas(cls) -> List[Dict[str, Any]]:
+    def get_validation_schemas(cls) -> list[dict[str, Any]]:
         """Return all additional validation schemas for interface.
 
         return: List of all additional validation schemas.

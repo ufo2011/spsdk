@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2021-2023 NXP
+# Copyright 2021-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -15,14 +15,16 @@ import re
 import subprocess
 import sys
 from getpass import getpass
-from typing import List, NamedTuple, Optional
+from typing import NamedTuple, Optional
 
 from cachier import cachier
 from cryptography.hazmat.primitives import hashes
 from jira import JIRA, Issue
 
-JIRA_SERVER = "https://jira.sw.nxp.com"
+from spsdk.exceptions import SPSDKError
+
 TICKET_REGEX = re.compile(r"(SPSDK-\d+)")
+JIRA_SERVER = "https://jira.sw.nxp.com"
 
 
 class RNParams(NamedTuple):
@@ -65,19 +67,18 @@ class TicketRecord(NamedTuple):
         )
 
 
-# pylint: disable=not-an-iterable, no-member
-class RecordsList(List[TicketRecord]):
+class RecordsList(list[TicketRecord]):
     """JIRA records list."""
 
-    def get_components(self) -> List[str]:
+    def get_components(self) -> list[str]:
         """Get component names from data."""
         return self.get_attributes("component")
 
-    def get_types(self) -> List[str]:
+    def get_types(self) -> list[str]:
         """Get issue type names from data."""
         return self.get_attributes("issue_type")
 
-    def get_attributes(self, attribute_name: str) -> List[str]:
+    def get_attributes(self, attribute_name: str) -> list[str]:
         """Get all attributes with `attribute_name` from data."""
         group = [getattr(item, attribute_name) for item in self]
         return sorted(list(set(group)))
@@ -89,18 +90,18 @@ class RecordsList(List[TicketRecord]):
     def save(self, file_path: str) -> None:
         """Store data for later custom re-use/inspection."""
         # to load data back, use object_hook=lambda x: TicketRecord(**x)
-        with open(file_path, "w") as f:
+        with open(file_path, "w", encoding="utf-8") as f:
             json.dump([x._asdict() for x in self], f, indent=2)
 
     @classmethod
     def load(cls, file_path: str) -> "RecordsList":
         """Load previously saved RecordList."""
-        with open(file_path) as f:
+        with open(file_path, encoding="utf-8") as f:
             data = json.load(f, object_hook=lambda x: TicketRecord(**x))
         return cls(data)
 
 
-def parse_inputs(input_args: Optional[List[str]] = None) -> RNParams:
+def parse_inputs(input_args: Optional[list[str]] = None) -> RNParams:
     """Parse user inputs."""
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -184,7 +185,7 @@ def get_commit_messages(since: str, till: str) -> str:
     return output
 
 
-def get_jira_ids(git_output: str) -> List[str]:
+def get_jira_ids(git_output: str) -> list[str]:
     """Parse text for JIRA ids. see: `TICKET_REGEX`."""
     logging.info("Extracting JIRA ticket ids from commit messages")
     ids = re.findall(TICKET_REGEX, git_output)
@@ -193,7 +194,7 @@ def get_jira_ids(git_output: str) -> List[str]:
     return ids
 
 
-def ticket_info_param_hasher(args: tuple, kwargs: dict) -> int:
+def ticket_info_hasher(args: tuple, kwargs: dict) -> str:
     """Helper function providing hash value of arguments for `get_ticket_info` function.
 
     To optimize caching persistent caching, we need function with consistent return values.
@@ -201,21 +202,21 @@ def ticket_info_param_hasher(args: tuple, kwargs: dict) -> int:
     we use MD5 hashing.
     """
     to_hash: str = kwargs["ticket"] if "ticket" in kwargs else args[0]
-    digest = hashes.Hash(hashes.MD5())
+    digest = hashes.Hash(hashes.MD5())  # nosec
     digest.update(to_hash.encode("utf-8"))
-    hash_val = int.from_bytes(digest.finalize(), "big")
-    logging.debug(f"cache param hashing: {to_hash} -> {hash_val}")
-    return hash_val
+    digest_string = digest.finalize().hex()
+    logging.debug(f"cache param hashing: {to_hash} -> {digest_string}")
+    return digest_string
 
 
-@cachier(hash_params=ticket_info_param_hasher)
+@cachier(hash_func=ticket_info_hasher)
 def get_ticket_info(ticket: str, jira: Optional[JIRA]) -> TicketRecord:
     """Extract info for `ticket` from JIRA.
 
     The `@cachier` decorator produces persistent cache to alleviate load on JIRA server.
     """
     if not jira:
-        raise RuntimeError(f"Info for {ticket} is not pre-recorded, can't work in offline mode")
+        raise SPSDKError(f"Info for {ticket} is not pre-recorded, can't work in offline mode")
     logging.info(f"Fetching info for ticket: {ticket}")
     issue = jira.issue(ticket)
     return TicketRecord.from_jira_issue(issue=issue)
@@ -234,6 +235,7 @@ def main() -> None:
         logging.info("No tickets found in commit messages.")
         sys.exit(1)
 
+    password = None
     # ask for password if running in online mode, user doesn't uses netrc, but specifies username
     if not args.offline and args.user:
         password = getpass(f"Enter password for '{args.user}': ")

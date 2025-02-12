@@ -1,63 +1,42 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2019-2023 NXP
+# Copyright 2019-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 """Module for creation commands."""
 
-from abc import abstractmethod
 from enum import Enum as BuiltinEnum
 from struct import calcsize, pack, unpack_from
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Type, Union
+from typing import Any, Mapping, Optional, Type, Union
 
-from spsdk import SPSDKError
+from typing_extensions import Self
+
+from spsdk.exceptions import SPSDKError, SPSDKValueError
 from spsdk.sbfile.sb31.constants import EnumCmdTag
-from spsdk.utils.easy_enum import Enum
-from spsdk.utils.misc import align_block, load_binary, value_to_int
+from spsdk.utils.abstract import BaseClass
+from spsdk.utils.database import DatabaseManager
+from spsdk.utils.misc import (
+    Endianness,
+    align_block,
+    load_binary,
+    load_text,
+    value_to_bytes,
+    value_to_int,
+)
+from spsdk.utils.spsdk_enum import SpsdkEnum
 
 ########################################################################################################################
 # Main Class
 ########################################################################################################################
 
 
-class MainCmd:
+class MainCmd(BaseClass):
     """Functions for creating cmd intended for inheritance."""
-
-    def __eq__(self, obj: object) -> bool:
-        """Comparison of values."""
-        return isinstance(obj, self.__class__) and vars(obj) == vars(self)
-
-    def __str__(self) -> str:
-        """Get info of command."""
-        return self.info()
-
-    @abstractmethod
-    def info(self) -> str:
-        """Get info of command.
-
-        :raises NotImplementedError: Derived class has to implement this method
-        """
-        raise NotImplementedError("Derived class has to implement this method.")
-
-    def export(self) -> bytes:
-        """Export command as bytes.
-
-        :raises NotImplementedError: Derived class has to implement this method
-        """
-        raise NotImplementedError("Derived class has to implement this method.")
-
-    @classmethod
-    def parse(cls, data: bytes, offset: int = 0) -> object:
-        """Parse command from bytes array.
-
-        :raises NotImplementedError: Derived class has to implement this method
-        """
-        raise NotImplementedError("Derived class has to implement this method.")
 
     @classmethod
     def load_from_config(
-        cls, config: Dict[str, Any], search_paths: Optional[List[str]] = None
+        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
     ) -> "MainCmd":
         """Load configuration from dictionary.
 
@@ -105,7 +84,7 @@ class BaseCmd(MainCmd):
             raise SPSDKError("Invalid length")
         self._length = value
 
-    def __init__(self, address: int, length: int, cmd_tag: int = EnumCmdTag.NONE) -> None:
+    def __init__(self, address: int, length: int, cmd_tag: EnumCmdTag = EnumCmdTag.NONE) -> None:
         """Constructor for Commands header.
 
         :param address: Input address
@@ -116,7 +95,10 @@ class BaseCmd(MainCmd):
         self._length = length
         self.cmd_tag = cmd_tag
 
-    def info(self) -> str:
+    def __repr__(self) -> str:
+        return f"SB3.1 Command: {self.__class__.__name__}"
+
+    def __str__(self) -> str:
         """Get info of command.
 
         :raises NotImplementedError: Derived class has to implement this method
@@ -125,23 +107,27 @@ class BaseCmd(MainCmd):
 
     def export(self) -> bytes:
         """Export command as bytes."""
-        return pack(self.FORMAT, self.TAG, self.address, self.length, self.cmd_tag)
+        return pack(self.FORMAT, self.TAG, self.address, self.length, self.cmd_tag.tag)
 
     @classmethod
-    def header_parse(cls, cmd_tag: int, data: bytes, offset: int = 0) -> Tuple[int, int]:
+    def parse(cls, data: bytes) -> Self:
+        """Deserialize object from bytes array."""
+        raise NotImplementedError("Derived class has to implement this method.")
+
+    @classmethod
+    def header_parse(cls, cmd_tag: EnumCmdTag, data: bytes) -> tuple[int, int]:
         """Parse header command from bytes array.
 
         :param data: Input data as bytes array
-        :param offset: The offset of input data
         :param cmd_tag: Information about command tag
         :raises SPSDKError: Raised if tag is not equal to required TAG
         :raises SPSDKError: Raised if cmd is not equal EnumCmdTag
         :return: Tuple
         """
-        tag, address, length, cmd = unpack_from(cls.FORMAT, data, offset)
+        tag, address, length, cmd = unpack_from(cls.FORMAT, data)
         if tag != cls.TAG:
             raise SPSDKError("TAG is not valid.")
-        if cmd != cmd_tag:
+        if cmd != cmd_tag.tag:
             raise SPSDKError("Values are not same.")
         return address, length
 
@@ -154,7 +140,7 @@ class CmdLoadBase(BaseCmd):
 
     HAS_MEMORY_ID_BLOCK = True
 
-    def __init__(self, cmd_tag: int, address: int, data: bytes, memory_id: int = 0) -> None:
+    def __init__(self, cmd_tag: EnumCmdTag, address: int, data: bytes, memory_id: int = 0) -> None:
         """Constructor for command.
 
         :param cmd_tag: Command tag for the derived class
@@ -175,9 +161,9 @@ class CmdLoadBase(BaseCmd):
         data = align_block(data, alignment=16)
         return data
 
-    def info(self) -> str:
+    def __str__(self) -> str:
         """Get info about the load command."""
-        msg = f"{EnumCmdTag.name(self.cmd_tag)}: "
+        msg = f"{self.cmd_tag.label}: "
         if self.HAS_MEMORY_ID_BLOCK:
             msg += f"Address=0x{self.address:08X}, Length={self.length}, Memory ID={self.memory_id}"
         else:
@@ -185,12 +171,12 @@ class CmdLoadBase(BaseCmd):
         return msg
 
     @classmethod
-    def _extract_data(cls, data: bytes, offset: int = 0) -> Tuple[int, int, bytes, int, int]:
+    def _extract_data(cls, data: bytes) -> tuple[int, int, bytes, int, int]:
         tag, address, length, cmd = unpack_from(cls.FORMAT, data)
         memory_id = 0
         if tag != cls.TAG:
             raise SPSDKError(f"Invalid TAG, expected: {cls.TAG}")
-        offset += BaseCmd.SIZE
+        offset = BaseCmd.SIZE
         if cls.HAS_MEMORY_ID_BLOCK:
             memory_id, pad0, pad1, pad2 = unpack_from("<4L", data, offset=offset)
             if not pad0 == pad1 == pad2 == 0:
@@ -200,16 +186,16 @@ class CmdLoadBase(BaseCmd):
         return address, length, load_data, cmd, memory_id
 
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0) -> "CmdLoadBase":
+    def parse(cls, data: bytes) -> Self:
         """Parse command from bytes array.
 
         :param data: Input data as bytes array
-        :param offset: The offset of input data
         :return: CmdLoad
         :raises SPSDKError: Invalid cmd_tag was found
         """
-        address, _, data, cmd_tag, memory_id = cls._extract_data(data, offset)
-        if cmd_tag not in [
+        address, _, data, cmd_tag, memory_id = cls._extract_data(data)
+        cmd_tag_enum = EnumCmdTag.from_tag(cmd_tag)
+        if cmd_tag_enum not in [
             EnumCmdTag.LOAD,
             EnumCmdTag.LOAD_CMAC,
             EnumCmdTag.LOAD_HASH_LOCKING,
@@ -217,16 +203,16 @@ class CmdLoadBase(BaseCmd):
             EnumCmdTag.PROGRAM_FUSES,
             EnumCmdTag.PROGRAM_IFR,
         ]:
-            raise SPSDKError(f"Invalid cmd_tag found: {cmd_tag}")
+            raise SPSDKError(f"Invalid cmd_tag found: {cmd_tag_enum}")
         if cls == CmdLoadBase:
-            return cls(cmd_tag=cmd_tag, address=address, data=data, memory_id=memory_id)
+            return cls(cmd_tag=cmd_tag_enum, address=address, data=data, memory_id=memory_id)
         # pylint: disable=no-value-for-parameter
         return cls(address=address, data=data, memory_id=memory_id)  # type: ignore
 
     # pylint: disable=redundant-returns-doc
     @classmethod
     def load_from_config(
-        cls, config: Dict[str, Any], search_paths: Optional[List[str]] = None
+        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
     ) -> MainCmd:
         """Load configuration from dictionary.
 
@@ -234,7 +220,7 @@ class CmdLoadBase(BaseCmd):
         :param search_paths: List of paths where to search for the file, defaults to None
         :return: Command object loaded from configuration.
         """
-        assert False
+        raise NotImplementedError("Derived class has to implement this method.")
 
 
 class CmdErase(BaseCmd):
@@ -250,7 +236,7 @@ class CmdErase(BaseCmd):
         super().__init__(cmd_tag=EnumCmdTag.ERASE, address=address, length=length)
         self.memory_id = memory_id
 
-    def info(self) -> str:
+    def __str__(self) -> str:
         """Get info of command."""
         return (
             f"ERASE: Address=0x{self.address:08X}, Length={self.length}, Memory ID={self.memory_id}"
@@ -263,23 +249,22 @@ class CmdErase(BaseCmd):
         return data
 
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0) -> "CmdErase":
+    def parse(cls, data: bytes) -> Self:
         """Parse command from bytes array.
 
         :param data: Input data as bytes array
-        :param offset: The offset of input data
         :return: CmdErase
         :raises SPSDKError: Invalid padding
         """
-        address, length = cls.header_parse(data=data, offset=offset, cmd_tag=EnumCmdTag.ERASE)
-        memory_id, pad0, pad1, pad2 = unpack_from("<4L", data, offset=offset + 16)
+        address, length = cls.header_parse(data=data, cmd_tag=EnumCmdTag.ERASE)
+        memory_id, pad0, pad1, pad2 = unpack_from("<4L", data, offset=16)
         if not pad0 == pad1 == pad2 == 0:
             raise SPSDKError("Invalid padding")
         return cls(address=address, length=length, memory_id=memory_id)
 
     @classmethod
     def load_from_config(
-        cls, config: Dict[str, Any], search_paths: Optional[List[str]] = None
+        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
     ) -> "CmdErase":
         """Load configuration from dictionary.
 
@@ -307,7 +292,7 @@ class CmdLoad(CmdLoadBase):
 
     @classmethod
     def load_from_config(
-        cls, config: Dict[str, Any], search_paths: Optional[List[str]] = None
+        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
     ) -> Union["CmdLoad", "CmdLoadHashLocking", "CmdLoadCmac"]:
         """Load configuration from dictionary.
 
@@ -334,8 +319,14 @@ class CmdLoad(CmdLoadBase):
             data = load_binary(config["file"], search_paths=search_paths)
             return CmdLoad(address=address, data=data, memory_id=memory_id)
         if config.get("values"):
-            values = [value_to_int(s, 0) for s in config["values"].split(",")]
+            if isinstance(config["values"], int):
+                values = [config["values"]]
+            else:
+                values = [value_to_int(s, 0) for s in config["values"].split(",")]
             data = pack(f"<{len(values)}L", *values)
+            return CmdLoad(address=address, data=data, memory_id=memory_id)
+        if config.get("value"):
+            data = value_to_bytes(config["value"], endianness=Endianness.LITTLE)
             return CmdLoad(address=address, data=data, memory_id=memory_id)
 
         raise SPSDKError(f"Unsupported LOAD command args: {config}")
@@ -351,24 +342,23 @@ class CmdExecute(BaseCmd):
         """
         super().__init__(cmd_tag=EnumCmdTag.EXECUTE, address=address, length=0)
 
-    def info(self) -> str:
+    def __str__(self) -> str:
         """Get info of command."""
         return f"EXECUTE: Address=0x{self.address:08X}"
 
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0) -> "CmdExecute":
+    def parse(cls, data: bytes) -> Self:
         """Parse command from bytes array.
 
         :param data: Input data as bytes array
-        :param offset: The offset of input data
         :return: CmdExecute
         """
-        address, _ = cls.header_parse(data=data, offset=offset, cmd_tag=EnumCmdTag.EXECUTE)
+        address, _ = cls.header_parse(data=data, cmd_tag=EnumCmdTag.EXECUTE)
         return cls(address=address)
 
     @classmethod
     def load_from_config(
-        cls, config: Dict[str, Any], search_paths: Optional[List[str]] = None
+        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
     ) -> "CmdExecute":
         """Load configuration from dictionary.
 
@@ -390,24 +380,23 @@ class CmdCall(BaseCmd):
         """
         super().__init__(cmd_tag=EnumCmdTag.CALL, address=address, length=0)
 
-    def info(self) -> str:
+    def __str__(self) -> str:
         """Get info of command."""
         return f"CALL: Address=0x{self.address:08X}"
 
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0) -> "CmdCall":
+    def parse(cls, data: bytes) -> Self:
         """Parse command from bytes array.
 
         :param data: Input data as bytes array
-        :param offset: The offset of input data
         :return: CmdCall
         """
-        address, _ = cls.header_parse(data=data, offset=offset, cmd_tag=EnumCmdTag.CALL)
+        address, _ = cls.header_parse(data=data, cmd_tag=EnumCmdTag.CALL)
         return cls(address=address)
 
     @classmethod
     def load_from_config(
-        cls, config: Dict[str, Any], search_paths: Optional[List[str]] = None
+        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
     ) -> "CmdCall":
         """Load configuration from dictionary.
 
@@ -434,15 +423,15 @@ class CmdProgFuses(CmdLoadBase):
         self.length //= 4
 
     @classmethod
-    def _extract_data(cls, data: bytes, offset: int = 0) -> Tuple[int, int, bytes, int, int]:
+    def _extract_data(cls, data: bytes) -> tuple[int, int, bytes, int, int]:
         tag, address, length, cmd = unpack_from(cls.FORMAT, data)
         length *= 4
         memory_id = 0
         if tag != cls.TAG:
             raise SPSDKError(f"Invalid TAG, expected: {cls.TAG}")
-        offset += BaseCmd.SIZE
+        offset = BaseCmd.SIZE
         if cls.HAS_MEMORY_ID_BLOCK:
-            memory_id, pad0, pad1, pad2 = unpack_from("<4L", data, offset=offset)
+            memory_id, pad0, pad1, pad2 = unpack_from("<4L", data)
             if pad0 != pad1 != pad2 != 0:
                 raise SPSDKError("Invalid padding")
             offset += 16
@@ -450,19 +439,18 @@ class CmdProgFuses(CmdLoadBase):
         return address, length, load_data, cmd, memory_id
 
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0) -> "CmdProgFuses":
+    def parse(cls, data: bytes) -> Self:
         """Parse command from bytes array.
 
         :param data: Input data as bytes array
-        :param offset: The offset of input data
         :return: CmdProgFuses
         """
-        address, _, data, _, _ = cls._extract_data(data=data, offset=offset)
+        address, _, data, _, _ = cls._extract_data(data=data)
         return cls(address=address, data=data)
 
     @classmethod
     def load_from_config(
-        cls, config: Dict[str, Any], search_paths: Optional[List[str]] = None
+        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
     ) -> "CmdProgFuses":
         """Load configuration from dictionary.
 
@@ -471,7 +459,10 @@ class CmdProgFuses(CmdLoadBase):
         :return: Command object loaded from configuration.
         """
         address = value_to_int(config["address"], 0)
-        fuses = [value_to_int(fuse, 0) for fuse in config["values"].split(",")]
+        if isinstance(config["values"], int):
+            fuses = [config["values"]]
+        else:
+            fuses = [value_to_int(fuse, 0) for fuse in config["values"].split(",")]
         data = pack(f"<{len(fuses)}L", *fuses)
         return CmdProgFuses(address=address, data=data)
 
@@ -490,19 +481,18 @@ class CmdProgIfr(CmdLoadBase):
         super().__init__(cmd_tag=EnumCmdTag.PROGRAM_IFR, address=address, data=data)
 
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0) -> "CmdProgIfr":
+    def parse(cls, data: bytes) -> Self:
         """Parse command from bytes array.
 
         :param data: Input data as bytes array
-        :param offset: The offset of input data
         :return: CmdProgFuses
         """
-        address, _, data, _, _ = cls._extract_data(data=data, offset=offset)
+        address, _, data, _, _ = cls._extract_data(data=data)
         return cls(address=address, data=data)
 
     @classmethod
     def load_from_config(
-        cls, config: Dict[str, Any], search_paths: Optional[List[str]] = None
+        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
     ) -> "CmdProgIfr":
         """Load configuration from dictionary.
 
@@ -511,7 +501,18 @@ class CmdProgIfr(CmdLoadBase):
         :return: Command object loaded from configuration.
         """
         address = value_to_int(config["address"], 0)
-        data = load_binary(config["file"], search_paths=search_paths)
+        if config.get("file"):
+            data = load_binary(config["file"], search_paths=search_paths)
+        elif config.get("values"):
+            if isinstance(config["values"], int):
+                values = [config["values"]]
+            else:
+                values = [value_to_int(s, 0) for s in config["values"].split(",")]
+            data = pack(f"<{len(values)}L", *values)
+        elif config.get("value"):
+            data = value_to_bytes(config["value"], endianness=Endianness.LITTLE)
+        else:
+            raise SPSDKError(f"Unsupported PROGRAM_IFR command args: {config}")
         return CmdProgIfr(address=address, data=data)
 
 
@@ -534,7 +535,7 @@ class CmdLoadCmac(CmdLoadBase):
 
     @classmethod
     def load_from_config(
-        cls, config: Dict[str, Any], search_paths: Optional[List[str]] = None
+        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
     ) -> "CmdLoadCmac":
         """Load configuration from dictionary.
 
@@ -574,7 +575,7 @@ class CmdCopy(BaseCmd):
         self.memory_id_from = memory_id_from
         self.memory_id_to = memory_id_to
 
-    def info(self) -> str:
+    def __str__(self) -> str:
         """Get info of command."""
         return (
             f"COPY: Address=0x{self.address:08X}, Length={self.length}, "
@@ -589,17 +590,16 @@ class CmdCopy(BaseCmd):
         return data
 
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0) -> "CmdCopy":
+    def parse(cls, data: bytes) -> Self:
         """Parse command from bytes array.
 
         :param data: Input data as bytes array
-        :param offset: The offset of input data
         :return: CmdCopy
         :raises SPSDKError: Invalid padding
         """
-        address, length = cls.header_parse(data=data, offset=offset, cmd_tag=EnumCmdTag.COPY)
+        address, length = cls.header_parse(data=data, cmd_tag=EnumCmdTag.COPY)
         destination_address, memory_id_from, memory_id_to, pad0 = unpack_from(
-            "<4L", data, offset=offset + 16
+            "<4L", data, offset=16
         )
         if pad0 != 0:
             raise SPSDKError("Invalid padding")
@@ -613,7 +613,7 @@ class CmdCopy(BaseCmd):
 
     @classmethod
     def load_from_config(
-        cls, config: Dict[str, Any], search_paths: Optional[List[str]] = None
+        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
     ) -> "CmdCopy":
         """Load configuration from dictionary.
 
@@ -660,7 +660,7 @@ class CmdLoadHashLocking(CmdLoadBase):
 
     @classmethod
     def load_from_config(
-        cls, config: Dict[str, Any], search_paths: Optional[List[str]] = None
+        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
     ) -> "CmdLoadHashLocking":
         """Load configuration from dictionary.
 
@@ -687,6 +687,12 @@ class CmdLoadKeyBlob(BaseCmd):
         NXP_CUST_KEK_INT_SK = 16
         NXP_CUST_KEK_EXT_SK = 17
 
+    class _KeyWrapsV2(BuiltinEnum):
+        """KeyWrap IDs used by the CmdLoadKeyBlob command."""
+
+        NXP_CUST_KEK_INT_SK = 18
+        NXP_CUST_KEK_EXT_SK = 19
+
     class KeyTypes(BuiltinEnum):
         """KeyTypes for NXP_CUST_KEK_INT_SK, NXP_CUST_KEK_EXT_SK."""
 
@@ -701,10 +707,16 @@ class CmdLoadKeyBlob(BaseCmd):
         :param key_name: NXP_CUST_KEK_INT_SK or NXP_CUST_KEK_EXT_SK
         :return: integer value representing key
         """
-        key_wraps = cls._KeyWraps
+        database = DatabaseManager().db.devices.get(family).revisions.get("latest")
+        key_wraps_version = database.get_int(DatabaseManager.SB31, "key_wraps_version")
+        key_wraps = {1: cls._KeyWraps, 2: cls._KeyWrapsV2}.get(key_wraps_version)
+        if key_wraps is None:
+            raise SPSDKValueError(f"KeyWraps version {key_wraps_version} is not defined")
         return key_wraps[key_name.name].value
 
-    def __init__(self, offset: int, data: bytes, key_wrap_id: int) -> None:
+    def __init__(
+        self, offset: int, data: bytes, key_wrap_id: int, plain_input: bool = False
+    ) -> None:
         """Constructor for command.
 
         :param offset: Input offset
@@ -714,10 +726,21 @@ class CmdLoadKeyBlob(BaseCmd):
         super().__init__(cmd_tag=EnumCmdTag.LOAD_KEY_BLOB, address=offset, length=len(data))
         self.key_wrap_id = key_wrap_id
         self.data = data
+        self.plain_input = plain_input
 
-    def info(self) -> str:
+    def __str__(self) -> str:
         """Get info of command."""
         return f"LOAD_KEY_BLOB: Offset=0x{self.address:08X}, Length={self.length}, Key wrap ID={self.key_wrap_id}"
+
+    @property
+    def length(self) -> int:
+        """Get data length."""
+        return len(self.data)
+
+    @length.setter
+    def length(self, value: int) -> None:
+        """Set data length."""
+        raise SPSDKError(f"Length property for {self.__class__.__name__} is read-only")
 
     def export(self) -> bytes:
         """Export command as bytes."""
@@ -727,7 +750,7 @@ class CmdLoadKeyBlob(BaseCmd):
             self.address,
             self.key_wrap_id,
             self.length,
-            self.cmd_tag,
+            self.cmd_tag.tag,
         )
         result_data += self.data
 
@@ -735,22 +758,21 @@ class CmdLoadKeyBlob(BaseCmd):
         return result_data
 
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0) -> "CmdLoadKeyBlob":
+    def parse(cls, data: bytes) -> Self:
         """Parse command from bytes array.
 
         :param data: Input data as bytes array
-        :param offset: The offset of input data
         :return: CmdLoadKeyBlob
         """
         tag, cmpa_offset, key_wrap_id, length, cmd = unpack_from(  # pylint: disable=unused-variable
-            cls.FORMAT, data, offset
+            cls.FORMAT, data
         )
-        key_blob_data = unpack_from(f"<{length}s", data, offset + cls.SIZE)[0]
+        key_blob_data = unpack_from(f"<{length}s", data, cls.SIZE)[0]
         return cls(offset=cmpa_offset, key_wrap_id=key_wrap_id, data=key_blob_data)
 
     @classmethod
     def load_from_config(
-        cls, config: Dict[str, Any], search_paths: Optional[List[str]] = None
+        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
     ) -> "CmdLoadKeyBlob":
         """Load configuration from dictionary.
 
@@ -758,13 +780,22 @@ class CmdLoadKeyBlob(BaseCmd):
         :param search_paths: List of paths where to search for the file, defaults to None
         :return: Command object loaded from configuration.
         """
-        data = load_binary(config["file"], search_paths=search_paths)
         offset = value_to_int(config["offset"], 0)
         key_wrap_name = config["wrappingKeyId"]
         family = config["family"]
-
         key_wrap_id = cls.get_key_id(family, cls.KeyTypes[key_wrap_name])
-        return CmdLoadKeyBlob(offset=offset, data=data, key_wrap_id=key_wrap_id)
+        file = config["file"]
+        plain_input: str = config.get("plainInput", "bin")
+
+        if plain_input == "hex":
+            hex_data = load_text(path=file, search_paths=search_paths)
+            data = bytes.fromhex(hex_data)
+        else:
+            data = load_binary(path=file, search_paths=search_paths)
+
+        return CmdLoadKeyBlob(
+            offset=offset, data=data, key_wrap_id=key_wrap_id, plain_input=plain_input != "no"
+        )
 
 
 class CmdConfigureMemory(BaseCmd):
@@ -779,30 +810,27 @@ class CmdConfigureMemory(BaseCmd):
         super().__init__(address=address, length=0, cmd_tag=EnumCmdTag.CONFIGURE_MEMORY)
         self.memory_id = memory_id
 
-    def info(self) -> str:
+    def __str__(self) -> str:
         """Get info of command."""
         return f"CONFIGURE_MEMORY: Address=0x{self.address:08X}, Memory ID={self.memory_id}"
 
     def export(self) -> bytes:
         """Export command as bytes."""
-        return pack(self.FORMAT, self.TAG, self.memory_id, self.address, self.cmd_tag)
+        return pack(self.FORMAT, self.TAG, self.memory_id, self.address, self.cmd_tag.tag)
 
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0) -> "CmdConfigureMemory":
+    def parse(cls, data: bytes) -> Self:
         """Parse command from bytes array.
 
         :param data: Input data as bytes array
-        :param offset: The offset of input data
         :return: CmdConfigureMemory
         """
-        memory_id, address = cls.header_parse(
-            cmd_tag=EnumCmdTag.CONFIGURE_MEMORY, data=data, offset=offset
-        )
+        memory_id, address = cls.header_parse(cmd_tag=EnumCmdTag.CONFIGURE_MEMORY, data=data)
         return cls(address=address, memory_id=memory_id)
 
     @classmethod
     def load_from_config(
-        cls, config: Dict[str, Any], search_paths: Optional[List[str]] = None
+        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
     ) -> "CmdConfigureMemory":
         """Load configuration from dictionary.
 
@@ -829,7 +857,7 @@ class CmdFillMemory(BaseCmd):
         super().__init__(cmd_tag=EnumCmdTag.FILL_MEMORY, address=address, length=length)
         self.pattern = pattern
 
-    def info(self) -> str:
+    def __str__(self) -> str:
         """Get info of command."""
         return f"FILL_MEMORY: Address=0x{self.address:08X}, Length={self.length}, PATTERN={hex(self.pattern)}"
 
@@ -840,23 +868,22 @@ class CmdFillMemory(BaseCmd):
         return data
 
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0) -> "CmdFillMemory":
+    def parse(cls, data: bytes) -> Self:
         """Parse command from bytes array.
 
         :param data: Input data as bytes array
-        :param offset: The offset of input data
         :return: CmdErase
         :raises SPSDKError: Invalid padding
         """
-        address, length = cls.header_parse(data=data, offset=offset, cmd_tag=EnumCmdTag.FILL_MEMORY)
-        pattern, pad0, pad1, pad2 = unpack_from("<4L", data, offset=offset + 16)
+        address, length = cls.header_parse(data=data, cmd_tag=EnumCmdTag.FILL_MEMORY)
+        pattern, pad0, pad1, pad2 = unpack_from("<4L", data, offset=16)
         if pad0 != pad1 != pad2 != 0:
             raise SPSDKError("Invalid padding")
         return cls(address=address, length=length, pattern=pattern)
 
     @classmethod
     def load_from_config(
-        cls, config: Dict[str, Any], search_paths: Optional[List[str]] = None
+        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
     ) -> "CmdFillMemory":
         """Load configuration from dictionary.
 
@@ -873,7 +900,7 @@ class CmdFillMemory(BaseCmd):
 class CmdFwVersionCheck(BaseCmd):
     """Check counter value with stored value, if values are not same, SB file is rejected."""
 
-    class CounterID(Enum):
+    class CounterID(SpsdkEnum):
         """Counter IDs used by the CmdFwVersionCheck command."""
 
         NONE = (0, "none")
@@ -883,7 +910,7 @@ class CmdFwVersionCheck(BaseCmd):
         SNT = (4, "snt")
         BOOTLOADER = (5, "bootloader")
 
-    def __init__(self, value: int, counter_id: int) -> None:
+    def __init__(self, value: int, counter_id: CounterID) -> None:
         """Constructor for command.
 
         :param value: Input value
@@ -893,30 +920,27 @@ class CmdFwVersionCheck(BaseCmd):
         self.value = value
         self.counter_id = counter_id
 
-    def info(self) -> str:
+    def __str__(self) -> str:
         """Get info of command."""
         return f"FW_VERSION_CHECK: Value={self.value}, Counter ID={self.counter_id}"
 
     def export(self) -> bytes:
         """Export command as bytes."""
-        return pack(self.FORMAT, self.TAG, self.value, self.counter_id, self.cmd_tag)
+        return pack(self.FORMAT, self.TAG, self.value, self.counter_id.tag, self.cmd_tag.tag)
 
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0) -> "CmdFwVersionCheck":
+    def parse(cls, data: bytes) -> Self:
         """Parse command from bytes array.
 
         :param data: Input data as bytes array
-        :param offset: The offset of input data
         :return: CmdFwVersionCheck
         """
-        value, counter_id = cls.header_parse(
-            data=data, offset=offset, cmd_tag=EnumCmdTag.FW_VERSION_CHECK
-        )
-        return cls(value=value, counter_id=counter_id)
+        value, counter_id = cls.header_parse(data=data, cmd_tag=EnumCmdTag.FW_VERSION_CHECK)
+        return cls(value=value, counter_id=cls.CounterID.from_tag(counter_id))
 
     @classmethod
     def load_from_config(
-        cls, config: Dict[str, Any], search_paths: Optional[List[str]] = None
+        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
     ) -> "CmdFwVersionCheck":
         """Load configuration from dictionary.
 
@@ -926,8 +950,42 @@ class CmdFwVersionCheck(BaseCmd):
         """
         value = value_to_int(config["value"], 0)
         counter_id_str = config["counterId"]
-        counter_id = CmdFwVersionCheck.CounterID[counter_id_str]
+        counter_id = CmdFwVersionCheck.CounterID.from_label(counter_id_str)
         return CmdFwVersionCheck(value=value, counter_id=counter_id)
+
+
+class CmdReset(BaseCmd):
+    """Reset command, added for SBx."""
+
+    def __init__(self) -> None:
+        """Constructor for reset command."""
+        super().__init__(address=0, length=0, cmd_tag=EnumCmdTag.RESET)
+
+    def __str__(self) -> str:
+        """Get info about command."""
+        return "RESET"
+
+    @classmethod
+    def parse(cls, data: bytes) -> "CmdReset":
+        """Parse command from bytes array.
+
+        :param data: Input data as bytes array
+        :return: CmdReset
+        """
+        _, _ = cls.header_parse(data=data, cmd_tag=EnumCmdTag.RESET)
+        return cls()
+
+    @classmethod
+    def load_from_config(
+        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
+    ) -> "CmdReset":
+        """Load configuration from dictionary.
+
+        :param config: Dictionary with configuration fields.
+        :param search_paths: List of paths where to search for the file, defaults to None
+        :return: Command object loaded from configuration.
+        """
+        return CmdReset()
 
 
 class CmdSectionHeader(MainCmd):
@@ -948,7 +1006,10 @@ class CmdSectionHeader(MainCmd):
         self.length = length
         self._pad = 0
 
-    def info(self) -> str:
+    def __repr__(self) -> str:
+        return f"SB3.1 Command Section Header, Type:{self.section_type}"
+
+    def __str__(self) -> str:
         """Get info of Section header."""
         return f"Section header: UID=0x{self.section_uid:08X}, Type={self.section_type}, Length={self.length}"
 
@@ -957,23 +1018,22 @@ class CmdSectionHeader(MainCmd):
         return pack(self.FORMAT, self.section_uid, self.section_type, self.length, self._pad)
 
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0) -> "CmdSectionHeader":
+    def parse(cls, data: bytes) -> Self:
         """Parse command from bytes array.
 
         :param data: Input data as bytes array
-        :param offset: The offset of input data
         :raises SPSDKError: Raised when FORMAT is bigger than length of the data without offset
         :return: CmdSectionHeader
         """
-        if calcsize(cls.FORMAT) > len(data) - offset:
+        if calcsize(cls.FORMAT) > len(data):
             raise SPSDKError("FORMAT is bigger than length of the data without offset!")
-        section_uid, section_type, length, _ = unpack_from(cls.FORMAT, data, offset)
+        section_uid, section_type, length, _ = unpack_from(cls.FORMAT, data)
         return cls(section_uid=section_uid, section_type=section_type, length=length)
 
     # pylint: disable=redundant-returns-doc
     @classmethod
     def load_from_config(
-        cls, config: Dict[str, Any], search_paths: Optional[List[str]] = None
+        cls, config: dict[str, Any], search_paths: Optional[list[str]] = None
     ) -> "CmdSectionHeader":
         """Load configuration from dictionary.
 
@@ -985,7 +1045,7 @@ class CmdSectionHeader(MainCmd):
         raise SPSDKError("Section header cannot be loaded from configuration.")
 
 
-TAG_TO_CLASS: Mapping[int, Type[BaseCmd]] = {
+TAG_TO_CLASS: Mapping[EnumCmdTag, Type[BaseCmd]] = {
     EnumCmdTag.ERASE: CmdErase,
     EnumCmdTag.LOAD: CmdLoad,
     EnumCmdTag.EXECUTE: CmdExecute,
@@ -999,6 +1059,7 @@ TAG_TO_CLASS: Mapping[int, Type[BaseCmd]] = {
     EnumCmdTag.CONFIGURE_MEMORY: CmdConfigureMemory,
     EnumCmdTag.FILL_MEMORY: CmdFillMemory,
     EnumCmdTag.FW_VERSION_CHECK: CmdFwVersionCheck,
+    EnumCmdTag.RESET: CmdReset,
 }
 
 CFG_NAME_TO_CLASS: Mapping[str, Type[BaseCmd]] = {
@@ -1015,25 +1076,27 @@ CFG_NAME_TO_CLASS: Mapping[str, Type[BaseCmd]] = {
     "configureMemory": CmdConfigureMemory,
     "fillMemory": CmdFillMemory,
     "checkFwVersion": CmdFwVersionCheck,
+    "reset": CmdReset,
 }
+
 
 ########################################################################################################################
 # Command parser from raw data
 ########################################################################################################################
-def parse_command(data: bytes, offset: int = 0) -> object:
+def parse_command(data: bytes) -> object:
     """Parse command from bytes array.
 
     :param data: Input data as bytes array
-    :param offset: The offset of input data
     :raises SPSDKError: Raised when tag is not in cmd_class
     :raises SPSDKError: Raised when tag is invalid
     :return: object
     """
     #  verify that first 4 bytes of frame are 55aaaa55
-    tag = unpack_from("<L", data, offset=offset)[0]
+    tag = unpack_from("<L", data)[0]
     if tag != BaseCmd.TAG:
         raise SPSDKError("Invalid tag.")
-    cmd_tag = unpack_from("<L", data, offset=offset + 12)[0]
-    if cmd_tag not in TAG_TO_CLASS:
+    cmd_tag = unpack_from("<L", data, offset=12)[0]
+    enum_cmd_tag = EnumCmdTag.from_tag(cmd_tag)
+    if enum_cmd_tag not in TAG_TO_CLASS:
         raise SPSDKError(f"Invalid command tag: {cmd_tag}")
-    return TAG_TO_CLASS[cmd_tag].parse(data, offset)
+    return TAG_TO_CLASS[enum_cmd_tag].parse(data)

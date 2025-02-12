@@ -1,18 +1,19 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2019-2021 NXP
+# Copyright 2019-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 """File including constants."""
 
-from spsdk.utils.easy_enum import Enum
-
+from spsdk.utils.spsdk_enum import SpsdkEnum
 
 ########################################################################################################################
 # Enums version 3.1
 ########################################################################################################################
-class EnumCmdTag(Enum):
+
+
+class EnumCmdTag(SpsdkEnum):
     """Contains commands tags."""
 
     NONE = (0x00, "NONE")
@@ -29,3 +30,12 @@ class EnumCmdTag(Enum):
     CONFIGURE_MEMORY = (0x0B, "CONFIGURE_MEMORY")
     FILL_MEMORY = (0x0C, "FILL_MEMORY")
     FW_VERSION_CHECK = (0x0D, "FW_VERSION_CHECK")
+    # RESET added in SBx
+    RESET = (0x0E, "RESET")
+
+
+class EnumDevHSMType(SpsdkEnum):
+    """Contains Types of DevHSM provisioning specification."""
+
+    INTERNAL = (1, "INTERNAL_DEVHSM_PROVISIONING")
+    EXTERNAL = (2, "EXTERNAL_DEVHSM_PROVISIONING")

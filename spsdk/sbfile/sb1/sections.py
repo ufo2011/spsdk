@@ -1,19 +1,20 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2020-2023 NXP
+# Copyright 2020-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
 """Boot Selection for SB file."""
 
-from typing import List, Sequence
+from typing import Sequence
 
-from spsdk.utils.crypto.abstract import BaseClass
-from spsdk.utils.misc import DebugInfo
+from typing_extensions import Self
 
-from ..misc import SecBootBlckSize
-from ..sb2.commands import (
+from spsdk.sbfile.misc import SecBootBlckSize
+from spsdk.sbfile.sb1.commands import parse_v1_command
+from spsdk.sbfile.sb1.headers import BootSectionHeaderV1, SecureBootFlagsV1
+from spsdk.sbfile.sb2.commands import (
     CmdBaseClass,
     CmdCall,
     CmdErase,
@@ -25,8 +26,7 @@ from ..sb2.commands import (
     CmdProg,
     CmdReset,
 )
-from .commands import parse_v1_command
-from .headers import BootSectionHeaderV1, SecureBootFlagsV1
+from spsdk.utils.abstract import BaseClass
 
 
 class BootSectionV1(BaseClass):
@@ -39,7 +39,7 @@ class BootSectionV1(BaseClass):
         :param flags: see SecureBootFlagsV1
         """
         self._header = BootSectionHeaderV1(section_id, flags)
-        self._commands: List[CmdBaseClass] = []
+        self._commands: list[CmdBaseClass] = []
 
     @property
     def section_id(self) -> int:
@@ -84,15 +84,18 @@ class BootSectionV1(BaseClass):
         result = self._header.raw_size + self.cmd_size
         return result
 
-    def info(self) -> str:
+    def __repr__(self) -> str:
+        return f"BootSection-V1, ID: {self._header.section_id}"
+
+    def __str__(self) -> str:
         """Return string representation."""
         result = "[BootSection-V1]\n"
         result += f"ID: {self._header.section_id}\n"
         result += f"NumBlocks: {self._header.num_blocks}\n"
-        result += self._header.info() + "\n"
+        result += str(self._header) + "\n"
         result += "[BootSection-commands]\n"
         for cmd in self._commands:
-            result += cmd.info()
+            result += str(cmd)
         return result
 
     @property
@@ -125,35 +128,30 @@ class BootSectionV1(BaseClass):
         """Update settings."""
         self._header.num_blocks = SecBootBlckSize.to_num_blocks(self.cmd_size)
 
-    def export(self, dbg_info: DebugInfo = DebugInfo.disabled()) -> bytes:
+    def export(self) -> bytes:
         """Return binary representation of the class (serialization)."""
         self.update()
-        dbg_info.append_section("Section")
         data = self._header.export()
-        dbg_info.append_binary_data("Section-header", data)
-        dbg_info.append_section("Commands")
         for cmd in self._commands:
-            cmd_data = cmd.export(dbg_info)
-            data += cmd_data
+            data += cmd.export()
         return data
 
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0) -> "BootSectionV1":
+    def parse(cls, data: bytes) -> Self:
         """Deserialization from binary format.
 
         :param data: to be parsed
-        :param offset: to start parsing
         :return: the parsed instance
         """
-        header = BootSectionHeaderV1.parse(data, offset)
-        result = BootSectionV1(0)
+        header = BootSectionHeaderV1.parse(data)
+        result = cls(0)
         result._header = header
         # commands
-        cmd_base = offset + header.raw_size
+        cmd_base = header.raw_size
         cmd_ofs = 0
         end_ofs = result._header.num_blocks * SecBootBlckSize.BLOCK_SIZE
         while cmd_ofs < end_ofs:
-            cmd = parse_v1_command(data, cmd_base + cmd_ofs)
+            cmd = parse_v1_command(data[cmd_base + cmd_ofs :])
             result.append(cmd)
             cmd_ofs += cmd.raw_size
         return result

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2021-2023 NXP
+# Copyright 2021-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -9,12 +9,13 @@
 
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Optional, Union
 
 from libusbsio.libusbsio import LIBUSBSIO
 
-from spsdk.mboot.interfaces.usb import USB_DEVICES as MB_USB_DEVICES
-from spsdk.sdp.interfaces.usb import USB_DEVICES as SDP_USB_DEVICES
+from spsdk.mboot.interfaces.usb import MbootUSBInterface
+from spsdk.sdp.interfaces.usb import SdpUSBInterface
+from spsdk.utils.database import UsbId
 from spsdk.utils.misc import get_hash
 
 # for backward-compatibility
@@ -38,12 +39,8 @@ class DeviceDescription(ABC):
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({vars(self)})"
 
-    def __str__(self) -> str:
-        """Should return the string from info function."""
-        return self.info()
-
     @abstractmethod  # pragma: no cover
-    def info(self) -> str:
+    def __str__(self) -> str:
         """Shall return a string describing the device, e.g. Name: <name>; ID: <id>."""
 
 
@@ -66,7 +63,7 @@ class UartDeviceDescription(DeviceDescription):
         self.name = name or "Unknown port"
         self.dev_type = dev_type or "Unknown device type"
 
-    def info(self) -> str:
+    def __str__(self) -> str:
         """Returns a formatted device description string.
 
         :return: Text information about UART device.
@@ -115,7 +112,7 @@ class USBDeviceDescription(DeviceDescription):
         self.serial = serial
         self.path_hash = get_hash(original_path) if original_path else "N/A"
 
-    def info(self) -> str:
+    def __str__(self) -> str:
         """Returns a formatted device description string.
 
         :return: Text information of USB device.
@@ -128,6 +125,97 @@ class USBDeviceDescription(DeviceDescription):
             f"Path Hash: {self.path_hash}\n"
             f"Name: {self.name}\n"
             f"Serial number: {self.serial}"
+        )
+
+
+class UUUDeviceDescription:
+    """Simple container holding information about UUU device.
+
+    This container should be used instead of any UUU API related objects, as
+    this container will be the same all the time compared to specific UUU API
+    implementations.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        chip: str,
+        pro: str,
+        vid: int,
+        pid: int,
+        bcd: int,
+        serial_no: str,
+    ) -> None:
+        """Constructor.
+
+        :param path: The path to the USB device.
+        :param chip: The chip of the USB device.
+        :param pro: The product of the USB device.
+        :param vid: The vendor ID of the USB device.
+        :param pid: The product ID of the USB device.
+        :param bcd: The device release number in binary-coded decimal.
+        :param serial_no: The serial number of the USB device.
+        """
+        self.path = path
+        self.chip = chip
+        self.pro = pro
+        self.vid = vid
+        self.pid = pid
+        self.bcd = bcd
+        self.serial_no = serial_no
+
+    def __str__(self) -> str:
+        """Returns a formatted device description string.
+
+        :return: Text information of UUU device.
+        """
+        return (
+            f"Path: {self.path}\n"
+            f"Chip: {self.chip}\n"
+            f"Product: {self.pro}\n"
+            f"Vendor ID: 0x{self.vid:04x}\n"
+            f"Product ID: 0x{self.pid:04x}\n"
+            f"BCD: {self.bcd}\n"
+            f"Serial Number: {self.serial_no}"
+        )
+
+
+class SDIODeviceDescription(DeviceDescription):
+    """Simple container holding information about SDIO device.
+
+    This container should be used instead of any SDIO API related objects, as
+    this container will be the same all the time compared to specific SDIO API
+    implementations.
+    """
+
+    def __init__(
+        self,
+        vid: int,
+        pid: int,
+        path: str,
+    ) -> None:
+        """Constructor.
+
+        :param vid: Vendor ID
+        :param pid: Product ID
+
+        See :py:func:`get_usb_device_name` function to getg the name from
+        VID and PID.
+        See :py:func:`convert_usb_path` function to provide a proper path string.
+        """
+        self.vid = vid
+        self.pid = pid
+        self.path = path
+
+    def __str__(self) -> str:
+        """Returns a formatted device description string.
+
+        :return: Text information of SDIO device.
+        """
+        return (
+            f"Vendor ID: 0x{self.vid:04x}\n"
+            f"Product ID: 0x{self.pid:04x}\n"
+            f"Path: {self.path}\n"
         )
 
 
@@ -153,7 +241,7 @@ class SIODeviceDescription(DeviceDescription):
         self.release_number = self._info.release_number
         self.path_hash = get_hash(self._info.path)
 
-    def info(self) -> str:
+    def __str__(self) -> str:
         """Returns a formatted device description string.
 
         :return: Text description of SIO device.
@@ -171,8 +259,8 @@ class SIODeviceDescription(DeviceDescription):
 
 
 def get_usb_device_name(
-    vid: int, pid: int, device_names: Optional[Dict[str, Tuple[int, int]]] = None
-) -> List[str]:
+    vid: int, pid: int, device_names: Optional[dict[str, list[UsbId]]] = None
+) -> list[str]:
     """Returns 'name' device identifier based on VID/PID, from dicts.
 
     Searches provided dictionary for device name based on VID/PID. If the dict
@@ -189,18 +277,18 @@ def get_usb_device_name(
 
     :return: list containing device names with corresponding VID/PID
     """
-    nxp_device_names = []
-    if device_names is None:
-        for dname, vid_pid in MB_USB_DEVICES.items():
-            if vid_pid[0] == vid and vid_pid[1] == pid:
-                nxp_device_names.append(dname)
+    nxp_device_names = set()
 
-        for dname, vid_pid in SDP_USB_DEVICES.items():
-            if vid_pid[0] == vid and vid_pid[1] == pid:
-                nxp_device_names.append(dname)
-    else:
-        for dname, vid_pid in device_names.items():
-            if vid_pid[0] == vid and vid_pid[1] == pid:
-                nxp_device_names.append(dname)
+    def find_device_names(device_names: dict[str, list[UsbId]]) -> set:
+        dnames = set()
+        for dname, usb_configs in device_names.items():
+            for cfg in usb_configs:
+                if cfg.vid == vid and cfg.pid == pid:
+                    dnames.add(dname)
+        return dnames
 
-    return nxp_device_names
+    if device_names:
+        return list(find_device_names(device_names))
+    nxp_device_names.update(find_device_names(MbootUSBInterface.get_devices()))
+    nxp_device_names.update(find_device_names(SdpUSBInterface.get_devices()))
+    return list(nxp_device_names)

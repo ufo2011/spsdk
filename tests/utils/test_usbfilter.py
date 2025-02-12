@@ -1,14 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2021-2022 NXP
+# Copyright 2021-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from spsdk.mboot.interfaces.usb import USB_DEVICES
+from spsdk.mboot.interfaces.usb import MbootUSBInterface
 from spsdk.utils.usbfilter import NXPUSBDeviceFilter, USBDeviceFilter
 
 common_use_cases = [
@@ -195,11 +195,16 @@ def test_usb_match_linux_nxp(filter_usb_id: str, vid: str, pid: str, path: str, 
 
 @pytest.mark.parametrize(
     "filter_usb_id, vid, pid, path, expected",
-    [("MKL27", "0x15a2", "0x0073", b"//", True), ("Nonsense", "0x15a2", "0x0073", b"//", False)],
+    [
+        ("lpc55s36", "0x1FC9", "0x0025", b"//", True),
+        ("Nonsense", "0x1FC9", "0x0025", b"//", False),
+    ],
 )
 def test_device_name_win(filter_usb_id: str, vid: str, pid: str, path: str, expected: bool):
     with patch("platform.system", MagicMock(return_value="Windows")):
-        usb_filter = NXPUSBDeviceFilter(usb_id=filter_usb_id, nxp_device_names=USB_DEVICES)
+        usb_filter = NXPUSBDeviceFilter(
+            usb_id=filter_usb_id, nxp_device_names=MbootUSBInterface.get_devices()
+        )
         g_virtual_hid_device = {"vendor_id": int(vid, 0), "product_id": int(pid, 0), "path": path}
 
         assert usb_filter.compare(g_virtual_hid_device) == expected
@@ -207,11 +212,16 @@ def test_device_name_win(filter_usb_id: str, vid: str, pid: str, path: str, expe
 
 @pytest.mark.parametrize(
     "filter_usb_id, vid, pid, path, expected",
-    [("MKL27", "0x15a2", "0x0073", b"//", True), ("Nonsense", "0x15a2", "0x0073", b"//", False)],
+    [
+        ("lpc55s36", "0x1FC9", "0x0025", b"//", True),
+        ("Nonsense", "0x1FC9", "0x0025", b"//", False),
+    ],
 )
 def test_device_name_mac(filter_usb_id: str, vid: str, pid: str, path: str, expected: bool):
     with patch("platform.system", MagicMock(return_value="Darwin")):
-        usb_filter = NXPUSBDeviceFilter(usb_id=filter_usb_id, nxp_device_names=USB_DEVICES)
+        usb_filter = NXPUSBDeviceFilter(
+            usb_id=filter_usb_id, nxp_device_names=MbootUSBInterface.get_devices()
+        )
         g_virtual_hid_device = {"vendor_id": int(vid, 0), "product_id": int(pid, 0), "path": path}
 
         assert usb_filter.compare(g_virtual_hid_device) == expected
@@ -219,11 +229,16 @@ def test_device_name_mac(filter_usb_id: str, vid: str, pid: str, path: str, expe
 
 @pytest.mark.parametrize(
     "filter_usb_id, vid, pid, path, expected",
-    [("MKL27", "0x15a2", "0x0073", b"0:0", True), ("Nonsense", "0x15a2", "0x0073", b"0:0", False)],
+    [
+        ("lpc55s36", "0x1FC9", "0x0025", b"0:0", True),
+        ("Nonsense", "0x1FC9", "0x0025", b"0:0", False),
+    ],
 )
 def test_device_name_linux(filter_usb_id: str, vid: str, pid: str, path: str, expected: bool):
     with patch("platform.system", MagicMock(return_value="Linux")):
-        usb_filter = NXPUSBDeviceFilter(usb_id=filter_usb_id, nxp_device_names=USB_DEVICES)
+        usb_filter = NXPUSBDeviceFilter(
+            usb_id=filter_usb_id, nxp_device_names=MbootUSBInterface.get_devices()
+        )
         g_virtual_hid_device = {"vendor_id": int(vid, 0), "product_id": int(pid, 0), "path": path}
 
         assert usb_filter.compare(g_virtual_hid_device) == expected
@@ -234,7 +249,6 @@ def test_device_name_linux(filter_usb_id: str, vid: str, pid: str, path: str, ex
     [("MKL27", "MKL27", True), ("Nonsense", "MKL27", False)],
 )
 def test_general_device_name(filter_usb_id: str, name: str, expected: bool):
-
     usb_filter = USBDeviceFilter(usb_id=filter_usb_id)
     g_virtual_hid_device = {"device_name": name}
 
@@ -246,7 +260,6 @@ def test_general_device_name(filter_usb_id: str, name: str, expected: bool):
     [("1234567", "1234567", True), ("Nonsense", "1234567", False)],
 )
 def test_general_device_serial_number(filter_usb_id: str, serial: str, expected: bool):
-
     usb_filter = USBDeviceFilter(usb_id=filter_usb_id)
     g_virtual_hid_device = {"serial_number": serial}
 

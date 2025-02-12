@@ -1,24 +1,23 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2021-2023 NXP
+# Copyright 2021-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
 from unittest.mock import MagicMock, patch
 
 import pytest
-from libusbsio import LIBUSBSIO
 
 import spsdk.utils.devicedescription as devicedescription
-from spsdk.mboot.interfaces.usb import USB_DEVICES as MB_USB_DEVICES
+from spsdk.mboot.interfaces.usb import MbootUSBInterface
 
 
 def test_uart_device_description():
     formatted_output = "Port: some name\nType: some type"
     dev = devicedescription.UartDeviceDescription(name="some name", dev_type="some type")
 
-    assert dev.info() == formatted_output
+    assert str(dev) == formatted_output
 
 
 def test_usb_device_description():
@@ -41,7 +40,18 @@ def test_usb_device_description():
         serial="12345678",
     )
 
-    assert dev.info() == formatted_output
+    assert str(dev) == formatted_output
+
+
+def test_sdio_device_description():
+    formatted_output = "Vendor ID: 0x000a\n" "Product ID: 0x0014\n" "Path: some_path\n"
+    dev = devicedescription.SDIODeviceDescription(
+        vid=10,
+        pid=20,
+        path="some_path",
+    )
+
+    assert str(dev) == formatted_output
 
 
 # Test SIO device description is done by NXPDEVSCAN tests :-)
@@ -65,26 +75,108 @@ def test_repr():
     "vid, pid, expected_result",
     [
         (0x1111, 0x2222, []),
-        (0x15A2, 0x0073, ["MKL27", "MXRT20", "MXRT50", "MXRT60"]),
-        (0x1FC9, 0x0135, ["IMXRT", "MXRT60"]),
+        (
+            0x15A2,
+            0x0073,
+            [
+                "mcxc141",
+                "mcxc142",
+                "mcxc143",
+                "mcxc144",
+                "mcxc242",
+                "mcxc243",
+                "mcxc244",
+                "mcxc443",
+                "mcxc444",
+                "mimxrt1010",
+                "mimxrt1015",
+                "mimxrt1020",
+                "mimxrt1024",
+                "mimxrt1040",
+                "mimxrt1043",
+                "mimxrt1046",
+                "mimxrt1050",
+                "mimxrt1060",
+                "mimxrt1064",
+                "mimxrt1165",
+                "mimxrt1166",
+                "mimxrt1171",
+                "mimxrt1172",
+                "mimxrt1173",
+                "mimxrt1175",
+                "mimxrt1176",
+                "mimxrt1181",
+                "mimxrt1182",
+                "mimxrt1187",
+                "mimxrt1189",
+                "mwct2014s",
+                "mwct2015s",
+                "mwct2016s",
+                "mwct2d16s",
+                "mwct2d17s",
+            ],
+        ),
+        (0x1FC9, 0x0135, ["mimxrt1040", "mimxrt1043", "mimxrt1046", "mimxrt1060", "mimxrt1064"]),
     ],
 )
-def test_get_device_name(vid, pid, expected_result):
+def test_get_device_name2(vid, pid, expected_result):
     """Verify search works and returns appropriate name based on VID/PID"""
-    assert devicedescription.get_usb_device_name(vid, pid) == expected_result
+    assert sorted(devicedescription.get_usb_device_name(vid, pid)) == sorted(expected_result)
 
 
 @pytest.mark.parametrize(
     "vid, pid, expected_result",
     [
         (0x1111, 0x2222, []),
-        (0x15A2, 0x0073, ["MKL27", "MXRT20", "MXRT50", "MXRT60"]),
-        (0x1FC9, 0x0135, ["IMXRT"]),
+        (
+            0x15A2,
+            0x0073,
+            [
+                "mcxc141",
+                "mcxc142",
+                "mcxc143",
+                "mcxc144",
+                "mcxc242",
+                "mcxc243",
+                "mcxc244",
+                "mcxc443",
+                "mcxc444",
+                "mimxrt1010",
+                "mimxrt1015",
+                "mimxrt1020",
+                "mimxrt1024",
+                "mimxrt1040",
+                "mimxrt1043",
+                "mimxrt1046",
+                "mimxrt1050",
+                "mimxrt1060",
+                "mimxrt1064",
+                "mimxrt1165",
+                "mimxrt1166",
+                "mimxrt1171",
+                "mimxrt1172",
+                "mimxrt1173",
+                "mimxrt1175",
+                "mimxrt1176",
+                "mimxrt1181",
+                "mimxrt1182",
+                "mimxrt1187",
+                "mimxrt1189",
+                "mwct2014s",
+                "mwct2015s",
+                "mwct2016s",
+                "mwct2d16s",
+                "mwct2d17s",
+            ],
+        ),
+        (0x1FC9, 0x0135, []),
     ],
 )
 def test_get_device_name(vid, pid, expected_result):
     """Verify search works and returns appropriate name based on VID/PID"""
-    assert devicedescription.get_usb_device_name(vid, pid, MB_USB_DEVICES) == expected_result
+    assert sorted(
+        devicedescription.get_usb_device_name(vid, pid, MbootUSBInterface.get_devices())
+    ) == sorted(expected_result)
 
 
 def test_path_conversion():

@@ -1,631 +1,74 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2021-2023 NXP
+# Copyright 2021-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
 """Module is used to generate initialization SB file."""
 
-import logging
 import os
 import sys
-from typing import Any, BinaryIO, Callable, Dict, List, Optional, Tuple
+from typing import Optional
 
 import click
 
-from spsdk import SPSDK_DATA_FOLDER, SPSDKError, SPSDKValueError
-from spsdk import __version__ as version
+from spsdk.apps.utils import spsdk_logger
 from spsdk.apps.utils.common_cli_options import (
     CommandsTreeGroup,
-    isp_interfaces,
     spsdk_apps_common_options,
+    spsdk_config_option,
+    spsdk_family_option,
+    spsdk_mboot_interface,
+    spsdk_output_option,
 )
-from spsdk.apps.utils.utils import catch_spsdk_error, format_raw_data, get_interface
-from spsdk.image import MBIMG_SCH_FILE, SB3_SCH_FILE
-from spsdk.mboot.commands import TrustProvKeyType, TrustProvOemKeyType
-from spsdk.mboot.interfaces import MBootInterface
+from spsdk.apps.utils.utils import (
+    INT,
+    SPSDKAppError,
+    catch_spsdk_error,
+    resolve_path_relative_to_config,
+)
+from spsdk.mboot.commands import TrustProvOemKeyType
 from spsdk.mboot.mcuboot import McuBoot
-from spsdk.sbfile.sb31.commands import CmdLoadKeyBlob
-from spsdk.sbfile.sb31.images import SecureBinary31Commands, SecureBinary31Header
-from spsdk.utils.crypto.cert_blocks import CertificateBlockHeader
-from spsdk.utils.crypto.common import crypto_backend
-from spsdk.utils.database import Database
-from spsdk.utils.misc import load_configuration, value_to_bool, value_to_int
-from spsdk.utils.schema_validator import ValidationSchemas, check_config
-
-logger = logging.getLogger(__name__)
-
-NXPDEVHSM_DATA_FOLDER: str = os.path.join(SPSDK_DATA_FOLDER, "nxpdevhsm")
-NXPDEVHSM_DATABASE_FILE: str = os.path.join(NXPDEVHSM_DATA_FOLDER, "database.yaml")
-
-
-class DeviceHsm:
-    """Class to handle device HSM provisioning procedure."""
-
-    DEVBUFF_BASE = 0x20007000
-    DEVBUFF_SIZE = 0x100
-
-    DEVBUFF_BASE0 = DEVBUFF_BASE
-    DEVBUFF_BASE1 = DEVBUFF_BASE0 + DEVBUFF_SIZE
-    DEVBUFF_BASE2 = DEVBUFF_BASE1 + DEVBUFF_SIZE
-    DEVBUFF_BASE3 = DEVBUFF_BASE2 + DEVBUFF_SIZE
-
-    DEVBUFF_GEN_MASTER_SHARE_INPUT_SIZE = 16
-    DEVBUFF_GEN_MASTER_ENC_SHARE_OUTPUT_SIZE = 48
-    DEVBUFF_GEN_MASTER_ENC_MASTER_SHARE_OUTPUT_SIZE = 64
-    DEVBUFF_GEN_MASTER_CUST_CERT_PUK_OUTPUT_SIZE = 64
-    DEVBUFF_HSM_GENKEY_KEYBLOB_SIZE = 48
-    DEVBUFF_HSM_GENKEY_KEYBLOB_PUK_SIZE = 64
-    DEVBUFF_USER_PCK_KEY_SIZE = 32
-    DEVBUFF_WRAPPED_USER_PCK_KEY_SIZE = 48
-    DEVBUFF_DATA_BLOCK_SIZE = 256
-    DEVBUFF_SB3_SIGNATURE_SIZE = 64
-
-    RESET_TIMEOUT = 500  # timeout for reset in milliseconds
-
-    def __init__(
-        self,
-        mboot: McuBoot,
-        user_pck: bytes,
-        oem_share_input: bytes,
-        info_print: Callable,
-        family: str,
-        container_conf: Optional[str] = None,
-        workspace: Optional[str] = None,
-        reset: bool = True,
-    ) -> None:
-        """Initialization of device HSM class. Its design to create provisioned SB3 file.
-
-        :param mboot: mBoot communication interface.
-        :param oem_share_input: OEM share input data.
-        :param user_pck: USER PCK key.
-        :param family: chip family
-        :param container_conf: Optional elftosb configuration file (to specify user list of SB commands).
-        :param workspace: Optional folder to store middle results.
-        :param reset: Reset device before and after DevHSM creation of SB3 file.
-        :raises SPSDKError: In case of any vulnerability.
-        """
-        self.database = Database(NXPDEVHSM_DATABASE_FILE)
-        self.mboot = mboot
-        self.user_pck = user_pck
-        self.oem_share_input = oem_share_input
-        self.info_print = info_print
-        self.workspace = workspace
-        self.reset = reset
-        self.container_conf_dir = os.path.dirname(container_conf) if container_conf else None
-        if self.workspace and not os.path.isdir(self.workspace):
-            os.mkdir(self.workspace)
-
-        # store input of OEM_SHARE_INPUT to workspace in case that is generated randomly
-        self.store_temp_res("OEM_SHARE_INPUT.BIN", self.oem_share_input)
-
-        # Default value that could be given from SB3 configuration container
-        self.timestamp = None
-        self.sb3_descr = "SB3 SB_KEK"
-        self.sb3_fw_ver = 0
-
-        # Check the configuration file and options to update by user config
-        self.config_data = None
-        if container_conf:
-            config_data = load_configuration(container_conf)
-            # validate input configuration
-            check_config(
-                config_data,
-                DeviceHsm.get_validation_schemas(),
-                search_paths=[os.path.dirname(container_conf)],
-            )
-            self.config_data = config_data
-            self.sb3_fw_ver = config_data.get("firmwareVersion") or self.sb3_fw_ver
-            self.sb3_descr = config_data.get("description") or self.sb3_descr
-            if "timestamp" in config_data:
-                self.timestamp = value_to_int(str(config_data.get("timestamp")))
-
-        self.wrapped_user_pck = bytes()
-        self.final_sb = bytes()
-        self.family = family
-
-    def update_keyblob_offset(self) -> int:
-        """Update keyblob offset based on family."""
-        return value_to_int(self.database.get_device_value("key_blob_offset", self.family))
-
-    def command_order(self) -> bool:
-        """Update command order based on family."""
-        return value_to_bool(self.database.get_device_value("order", self.family))
-
-    @classmethod
-    def get_validation_schemas(cls) -> List[Dict[str, Any]]:
-        """Create the list of validation schemas.
-
-        :return: List of validation schemas.
-        """
-        mbi_sch_cfg = ValidationSchemas().get_schema_file(MBIMG_SCH_FILE)
-        sb3_sch_cfg = ValidationSchemas().get_schema_file(SB3_SCH_FILE)
-
-        ret: List[Dict[str, Any]] = []
-        ret.extend([mbi_sch_cfg["firmware_version"]])
-        ret.extend([sb3_sch_cfg[x] for x in ["sb3_description", "sb3_commands", "sb3_test"]])
-        return ret
-
-    def create_sb3(self) -> None:
-        """Do device hsm process to create SB_KEK provisioning SB file."""
-        # 1: Initial target reset to ensure OEM_MASTER_SHARE works properly (not tainted by previous run)
-        if self.reset:
-            self.info_print(" 1: Resetting the target device")
-            self.mboot.reset(timeout=self.RESET_TIMEOUT)
-        else:
-            self.info_print(" 1: Initial target reset is disabled ")
-
-        # 2: Call GEN_OEM_MASTER_SHARE to generate encOemShare.bin (ENC_OEM_SHARE will be later put in place of ISK)
-        self.info_print(" 2: Generating OEM master share.")
-        oem_enc_share, _, _ = self.oem_generate_master_share(self.oem_share_input)
-
-        # 3: Call hsm_gen_key to generate 48 bytes FW signing key
-        self.info_print(" 3: Generating 48 bytes FW signing keys.")
-        cust_fw_auth_prk, cust_fw_auth_puk = self.generate_key(
-            TrustProvOemKeyType.MFWISK, "CUST_FW_AUTH"
-        )
-
-        # 4: Call hsm_gen_key to generate 48 bytes FW encryption key
-        self.info_print(" 4: Generating 48 bytes FW encryption keys.")
-        cust_fw_enc_prk, _ = self.generate_key(TrustProvOemKeyType.MFWENCK, "CUST_FW_ENC_SK")
-
-        # 5: Call hsm_store_key to generate user defined CUST_MK_SK (aka PCK).
-        # Will be stored into PFR using loadKeyBlob SB3 command.
-        # Use NXP_CUST_KEK_EXT_SK in SB json
-        self.info_print(" 5: Wrapping user PCK key.")
-        self.wrapped_user_pck = self.wrap_key(self.user_pck)
-
-        # 6: Generate template sb3 fw, sb3ImageType=6
-        self.info_print(" 6: Creating template un-encrypted SB3 header and data blobs.")
-        # 6.1: Generate SB3.1 header template
-        self.info_print(" 6.1: Creating template SB3 header.")
-        sb3_header = SecureBinary31Header(
-            firmware_version=self.sb3_fw_ver,
-            curve_name="secp256r1",
-            description=self.sb3_descr,
-            timestamp=self.timestamp,
-            flags=0x01,  # Bit0: PROV_MFW: when set, the SB3 file encrypts provisioning firmware
-        )
-        self.timestamp = sb3_header.timestamp
-        sb3_header_exported = sb3_header.export()
-        logger.debug(
-            f" 6.1: The template SB3 header: \n{sb3_header.info()} \n Length:{len(sb3_header_exported)}"
-        )
-
-        # 6.2: Create SB3 file un-encrypted data part
-        self.info_print(" 6.2: Creating un-encrypted SB3 data.")
-        sb3_data = SecureBinary31Commands(
-            family=self.family, curve_name="secp256r1", is_encrypted=False, timestamp=self.timestamp
-        )
-
-        if self.container_conf_dir is not None:
-            sb3_data.load_from_config(
-                self.get_cmd_from_config(), search_paths=[self.container_conf_dir]
-            )
-        key_blob_command_position = value_to_int(
-            self.database.get_device_value("key_blob_command_position", self.family)
-        )
-        sb3_data.insert_command(
-            index=key_blob_command_position,
-            command=CmdLoadKeyBlob(
-                offset=self.update_keyblob_offset(),
-                data=self.wrapped_user_pck,
-                key_wrap_id=CmdLoadKeyBlob.get_key_id(
-                    family=self.family, key_name=CmdLoadKeyBlob.KeyTypes.NXP_CUST_KEK_EXT_SK
-                ),
-            ),
-        )
-
-        logger.debug(f" 6.2: Created un-encrypted SB3 data: \n{sb3_data.info()}")
-        # 6.3: Get SB3 file data part individual chunks
-        data_cmd_blocks = sb3_data.get_cmd_blocks_to_export()
-
-        # 7: Call hsm_enc_blk to encrypt all the data chunks from step 6. Use FW encryption key from step 3.
-        self.info_print(" 7: Encrypting SB3 data on device")
-        sb3_enc_data = self.encrypt_data_blocks(
-            cust_fw_enc_prk, sb3_header_exported, data_cmd_blocks
-        )
-        # 7.1: Add to encrypted data parts SHA256 hashes
-        self.info_print(" 7.1: Enriching encrypted SB3 data by mandatory hashes.")
-        enc_final_data = sb3_data.process_cmd_blocks_to_export(sb3_enc_data)
-        self.store_temp_res("Final_data.bin", enc_final_data, "to_merge")
-
-        # 7.2: Create dummy certification part of SB3 manifest
-        self.info_print(" 7.2: Creating dummy certificate block.")
-        cb_header = CertificateBlockHeader()
-        cb_header.cert_block_size = (
-            cb_header.SIZE + 68 + self.DEVBUFF_GEN_MASTER_ENC_SHARE_OUTPUT_SIZE
-        )
-        logger.debug(f" 7.2: The dummy certificate block has been created:\n{cb_header.info()}.")
-
-        # 7.3: Update the SB3 pre-prepared header by current data
-        self.info_print(" 7.3: Updating SB3 header by valid values.")
-        sb3_header.block_count = sb3_data.block_count
-        sb3_header.image_total_length += (
-            len(sb3_data.final_hash) + cb_header.cert_block_size + self.DEVBUFF_SB3_SIGNATURE_SIZE
-        )
-        logger.debug(
-            f" 7.3: The SB3 header has been updated by valid values:\n{sb3_header.info()}."
-        )
-
-        # 7.4: Compose manifest that will be signed
-        self.info_print(" 7.4: Preparing SB3 manifest to sign.")
-        manifest_to_sign = bytes()
-        manifest_to_sign += sb3_header.export()
-        manifest_to_sign += sb3_data.final_hash
-        manifest_to_sign += cb_header.export()
-        manifest_to_sign += (
-            b"\x11\x00\x00\x80"  # 0x80000011  Cert Flags: CA Flag, 1 certificate and NIST P-256
-        )
-        manifest_to_sign += cust_fw_auth_puk
-        manifest_to_sign += oem_enc_share
-        self.store_temp_res("manifest_to_sign.bin", manifest_to_sign, "to_merge")
-        logger.debug(
-            f" 7.4: The SB3 manifest data to sign:\n{format_raw_data(manifest_to_sign, use_hexdump=True)}."
-        )
-
-        # 8: Get sign of SB3 file manifest
-        self.info_print(" 8: Creating SB3 manifest signature on device.")
-        manifest_signature = self.sign_data_blob(manifest_to_sign, cust_fw_auth_prk)
-        logger.debug(
-            f" 8: The SB3 manifest signature data:\n{format_raw_data(manifest_signature, use_hexdump=True)}."
-        )
-
-        # 9: Merge all parts together
-        self.info_print(" 9: Composing final SB3 file.")
-        self.final_sb = bytes()
-        self.final_sb += manifest_to_sign
-        self.final_sb += manifest_signature
-        self.final_sb += enc_final_data
-        self.store_temp_res("Final_SB3.sb3", self.final_sb)
-        logger.debug(
-            f" 9: The final SB3 file data:\n{format_raw_data(self.final_sb, use_hexdump=True)}."
-        )
-
-        # 10: Final reset to ensure followup operations (e.g. receive-sb-file) work correctly
-        if self.reset:
-            self.info_print("10: Resetting the target device")
-            self.mboot.reset(timeout=self.RESET_TIMEOUT)
-        else:
-            self.info_print("10: Final target reset disabled")
-
-    def export(self) -> bytes:
-        """Get the Final SB file.
-
-        :return: Final SB file in bytes.
-        """
-        return self.final_sb
-
-    def oem_generate_master_share(self, oem_share_input: bytes) -> Tuple[bytes, bytes, bytes]:
-        """Generate on device Encrypted OEM master share outputs.
-
-        :param oem_share_input: OEM input (randomize seed)
-        :raises SPSDKError: In case of any vulnerability.
-        :return: Tuple with OEM generate master share outputs.
-        """
-        if not self.mboot.write_memory(self.DEVBUFF_BASE0, oem_share_input):
-            raise SPSDKError("Cannot write OEM SHARE INPUT into device.")
-
-        oem_gen_master_share_res = self.mboot.tp_oem_gen_master_share(
-            self.DEVBUFF_BASE0,
-            self.DEVBUFF_GEN_MASTER_SHARE_INPUT_SIZE,
-            self.DEVBUFF_BASE1,
-            self.DEVBUFF_SIZE,
-            self.DEVBUFF_BASE2,
-            self.DEVBUFF_SIZE,
-            self.DEVBUFF_BASE3,
-            self.DEVBUFF_SIZE,
-        )
-
-        if not oem_gen_master_share_res:
-            raise SPSDKError(
-                "OEM generate master share command failed,"
-                " device probably needs reset due to doubled call of this command."
-            )
-
-        if (
-            oem_gen_master_share_res[0] != self.DEVBUFF_GEN_MASTER_ENC_SHARE_OUTPUT_SIZE
-            and oem_gen_master_share_res[1] != self.DEVBUFF_GEN_MASTER_ENC_MASTER_SHARE_OUTPUT_SIZE
-            and oem_gen_master_share_res[2] != self.DEVBUFF_GEN_MASTER_CUST_CERT_PUK_OUTPUT_SIZE
-        ):
-            raise SPSDKError("OEM generate master share command has invalid results.")
-
-        oem_enc_share = self.mboot.read_memory(
-            self.DEVBUFF_BASE1,
-            self.DEVBUFF_GEN_MASTER_ENC_SHARE_OUTPUT_SIZE,
-        )
-        if not oem_enc_share:
-            raise SPSDKError("Cannot read OEM ENCRYPTED SHARE OUTPUT from device.")
-        self.store_temp_res("ENC_OEM_SHARE.bin", oem_enc_share)
-
-        oem_enc_master_share = self.mboot.read_memory(
-            self.DEVBUFF_BASE2,
-            self.DEVBUFF_GEN_MASTER_ENC_MASTER_SHARE_OUTPUT_SIZE,
-        )
-        if not oem_enc_master_share:
-            raise SPSDKError("Cannot read OEM ENCRYPTED MASTER SHARE OUTPUT from device.")
-        self.store_temp_res("ENC_OEM_MASTER_SHARE.bin", oem_enc_master_share)
-
-        oem_cert = self.mboot.read_memory(
-            self.DEVBUFF_BASE3,
-            self.DEVBUFF_GEN_MASTER_CUST_CERT_PUK_OUTPUT_SIZE,
-        )
-        if not oem_cert:
-            raise SPSDKError("Cannot read OEM CERTIFICATE from device.")
-        self.store_temp_res("OEM_CERT.bin", oem_cert)
-
-        return oem_enc_share, oem_enc_master_share, oem_cert
-
-    def generate_key(
-        self, key_type: TrustProvOemKeyType, key_name: Optional[str] = None
-    ) -> Tuple[bytes, bytes]:
-        """Generate on device key pairs of provided type.
-
-        :param key_type: Type of generated key pairs.
-        :param key_name: optional name for storing temporary files.
-        :raises SPSDKError: In case of any vulnerability.
-        :return: Tuple with Private and Public key.
-        """
-        hsm_gen_key_res = self.mboot.tp_hsm_gen_key(
-            key_type,
-            0,
-            self.DEVBUFF_BASE0,
-            self.DEVBUFF_SIZE,
-            self.DEVBUFF_BASE1,
-            self.DEVBUFF_SIZE,
-        )
-
-        if not hsm_gen_key_res:
-            raise SPSDKError("HSM generate key command failed.")
-
-        if (
-            hsm_gen_key_res[0] != self.DEVBUFF_HSM_GENKEY_KEYBLOB_SIZE
-            and hsm_gen_key_res[1] != self.DEVBUFF_HSM_GENKEY_KEYBLOB_PUK_SIZE
-        ):
-            raise SPSDKError("OEM generate master share command has invalid results.")
-
-        prk = self.mboot.read_memory(
-            self.DEVBUFF_BASE0,
-            self.DEVBUFF_HSM_GENKEY_KEYBLOB_SIZE,
-        )
-        if not prk:
-            raise SPSDKError("Cannot read generated private key from device.")
-
-        puk = self.mboot.read_memory(
-            self.DEVBUFF_BASE1,
-            self.DEVBUFF_HSM_GENKEY_KEYBLOB_PUK_SIZE,
-        )
-        if not puk:
-            raise SPSDKError("Cannot read generated public key from device.")
-
-        self.store_temp_res((key_name or str(TrustProvOemKeyType[str(key_type)])) + "_PRK.bin", prk)
-        self.store_temp_res((key_name or str(TrustProvOemKeyType[str(key_type)])) + "_PUK.bin", puk)
-
-        return prk, puk
-
-    def wrap_key(self, user_pck: bytes) -> bytes:
-        """Wrap the user PCK key.
-
-        :param user_pck: User PCK key
-        :raises SPSDKError: In case of any vulnerability.
-        :return: Wrapped user PCK by RFC3396.
-        """
-        if not self.mboot.write_memory(self.DEVBUFF_BASE0, user_pck):
-            raise SPSDKError("Cannot write USER_PCK into device.")
-
-        hsm_store_key_res = self.mboot.tp_hsm_store_key(
-            TrustProvKeyType.CKDFK,
-            0x01,
-            self.DEVBUFF_BASE0,
-            self.DEVBUFF_USER_PCK_KEY_SIZE,
-            self.DEVBUFF_BASE1,
-            self.DEVBUFF_SIZE,
-        )
-
-        if not hsm_store_key_res:
-            raise SPSDKError("HSM Store Key command failed.")
-
-        if hsm_store_key_res[1] != self.DEVBUFF_WRAPPED_USER_PCK_KEY_SIZE:
-            raise SPSDKError("HSM Store Key command has invalid results.")
-
-        wrapped_user_pck = self.mboot.read_memory(
-            self.DEVBUFF_BASE1,
-            self.DEVBUFF_WRAPPED_USER_PCK_KEY_SIZE,
-        )
-        if not wrapped_user_pck:
-            raise SPSDKError("Cannot read WRAPPED USER PCK from device.")
-
-        self.store_temp_res("CUST_MK_SK.bin", wrapped_user_pck)
-
-        return wrapped_user_pck
-
-    def sign_data_blob(self, data_to_sign: bytes, key: bytes) -> bytes:
-        """Get HSM encryption sign for data blob.
-
-        :param data_to_sign: Input data to sign.
-        :param key: FW signing key (MFWISK).
-        :raises SPSDKError: In case of any vulnerability.
-        :return: Data blob signature (64 bytes).
-        """
-        if not self.mboot.write_memory(self.DEVBUFF_BASE0, key):
-            raise SPSDKError("Cannot write signing key into device.")
-        if not self.mboot.write_memory(self.DEVBUFF_BASE1, data_to_sign):
-            raise SPSDKError("Cannot write Data to sign into device.")
-        hsm_gen_key_res = self.mboot.tp_hsm_enc_sign(
-            self.DEVBUFF_BASE0,
-            len(key),
-            self.DEVBUFF_BASE1,
-            len(data_to_sign),
-            self.DEVBUFF_BASE2,
-            self.DEVBUFF_SB3_SIGNATURE_SIZE,
-        )
-
-        if hsm_gen_key_res != self.DEVBUFF_SB3_SIGNATURE_SIZE:
-            raise SPSDKError("HSM signing command failed.")
-
-        signature = self.mboot.read_memory(
-            self.DEVBUFF_BASE2,
-            self.DEVBUFF_SB3_SIGNATURE_SIZE,
-        )
-        if not signature:
-            raise SPSDKError("Cannot read generated signature from device.")
-
-        self.store_temp_res("SB3_sign.bin", signature, "to_merge")
-
-        return signature
-
-    def store_temp_res(self, file_name: str, data: bytes, group: Optional[str] = None) -> None:
-        """Storing temporary files into workspace.
-
-        :param file_name: Name of file to store the data.
-        :param data: Data to store.
-        :param group: Subfolder name, defaults to None
-        """
-        if not self.workspace:
-            return
-        group_dir = os.path.join(self.workspace, group or "")
-        if not os.path.isdir(group_dir):
-            os.mkdir(group_dir)
-
-        filename = os.path.join(self.workspace, group or "", file_name)
-
-        with open(filename, "wb") as data_file:
-            data_file.write(data)
-
-    def get_cmd_from_config(self) -> List[Dict[str, Any]]:
-        """Process command description into a command object.
-
-        :return: Modified list of commands
-        :raises SPSDKError: Unknown command
-        """
-        cfg_commands: List[Dict[str, Any]] = []
-        if self.config_data and self.config_data.get("commands"):
-            cfg_commands = self.config_data["commands"]
-            for cmd in cfg_commands:
-                cmd_cpy: Dict = cmd.copy()
-                name, args = cmd_cpy.popitem()
-                if name == "loadKeyBlob" and value_to_int(str(args["offset"])) == 0x04:
-                    raise SPSDKError(
-                        f"""The duplicated 'loadKeyBlob' on offset 0x04 from
-                    configuration file:\n {args}."""
-                    )
-
-        return cfg_commands
-
-    def encrypt_data_blocks(
-        self, cust_fw_enc_key: bytes, sb3_header: bytes, data_cmd_blocks: List[bytes]
-    ) -> List[bytes]:
-        """Encrypt all data blocks on device.
-
-        :param cust_fw_enc_key: Firmware encryption key.
-        :param sb3_header: Un Encrypted SB3 file header.
-        :param data_cmd_blocks: List of un-encrypted SB3 file command blocks.
-        :raises SPSDKError: In case of any vulnerability.
-        :return: List of encrypted command blocks on device.
-        """
-        if not self.mboot.write_memory(self.DEVBUFF_BASE0, cust_fw_enc_key):
-            raise SPSDKError("Cannot write customer fw encryption key into device.")
-        self.store_temp_res("SB3_header.bin", sb3_header, "to_encrypt")
-        if not self.mboot.write_memory(self.DEVBUFF_BASE1, sb3_header):
-            raise SPSDKError("Cannot write SB3 header into device.")
-
-        encrypted_blocks = []
-        for data_cmd_block_ix, data_cmd_block in enumerate(data_cmd_blocks, start=1):
-            self.store_temp_res(f"SB3_block_{data_cmd_block_ix}.bin", data_cmd_block, "to_encrypt")
-            if not self.mboot.write_memory(self.DEVBUFF_BASE2, data_cmd_block):
-                raise SPSDKError(f"Cannot write SB3 data block{data_cmd_block_ix} into device.")
-            key_id = CmdLoadKeyBlob.get_key_id(
-                self.family, CmdLoadKeyBlob.KeyTypes.NXP_CUST_KEK_INT_SK
-            )
-            if not self.mboot.tp_hsm_enc_blk(
-                self.DEVBUFF_BASE0,
-                len(cust_fw_enc_key),
-                key_id,
-                self.DEVBUFF_BASE1,
-                len(sb3_header),
-                data_cmd_block_ix,
-                self.DEVBUFF_BASE2,
-                self.DEVBUFF_DATA_BLOCK_SIZE,
-            ):
-                raise SPSDKError(
-                    f"Cannot run SB3 data block_{data_cmd_block_ix} HSM Encryption in device."
-                )
-
-            encrypted_block = self.mboot.read_memory(
-                self.DEVBUFF_BASE2,
-                self.DEVBUFF_DATA_BLOCK_SIZE,
-            )
-            if not encrypted_block:
-                raise SPSDKError(f"Cannot read SB3 data block_{data_cmd_block_ix} from device.")
-
-            self.store_temp_res(f"SB3_block_{data_cmd_block_ix}.bin", encrypted_block, "encrypted")
-
-            encrypted_blocks.append(encrypted_block)
-
-        return encrypted_blocks
-
-
-def get_user_pck(key: BinaryIO) -> bytes:
-    """Get binary from text or binary file.
-
-    :param key: Binary user PCK key file.
-    :return: Binary array loaded from file.
-    :raises SPSDKValueError: When invalid input value is recognized.
-    """
-    user_pck = key.read()
-
-    if len(user_pck) != 32:
-        raise SPSDKValueError(
-            f"Invalid length of USER PCK INPUT ({len(user_pck)} not equal to 32)."
-        )
-
-    return user_pck
-
-
-def get_oem_share_input(binary: BinaryIO) -> bytes:
-    """Get binary from text or binary file.
-
-    :param binary: Path to binary file.
-    :return: Binary array loaded from file.
-    :raises SPSDKValueError: When invalid input value is recognized.
-    """
-    if binary:
-        oem_share_input = binary.read()
-    else:
-        oem_share_input = crypto_backend().random_bytes(16)
-
-    if len(oem_share_input) != 16:
-        raise SPSDKValueError(
-            f"Invalid length of OEM SHARE INPUT ({len(oem_share_input)} not equal to 16)."
-        )
-
-    return oem_share_input
+from spsdk.mboot.properties import DeviceUidValue, PropertyTag
+from spsdk.mboot.protocol.base import MbootProtocolBase
+from spsdk.sbfile.devhsm.devhsm import DevHsm
+from spsdk.sbfile.devhsm.utils import DevHSMConfig, get_devhsm_class
+from spsdk.sbfile.sb31.devhsm import DevHsmSB31
+from spsdk.utils.misc import get_printable_path, load_binary, write_file
 
 
 @click.group(name="nxpdevhsm", no_args_is_help=True, cls=CommandsTreeGroup)
 @spsdk_apps_common_options
 def main(log_level: int) -> int:
     """Nxpdevhsm application is designed to create SB3 provisioning file for initial provisioning of device by OEM."""
-    logging.basicConfig(level=log_level or logging.WARNING)
+    spsdk_logger.install(level=log_level)
     return 0
 
 
-@main.command(no_args_is_help=True)
-@isp_interfaces(uart=True, usb=True, lpcusbsio=True, buspal=True, json_option=False)
+@main.command(name="generate", no_args_is_help=True)
+@spsdk_mboot_interface(identify_by_family=True)
+@spsdk_family_option(families=DevHsm.get_supported_families(), required=False)
 @click.option(
     "-k",
     "--key",
-    type=click.File(mode="rb"),
-    required=True,
-    help="User PCK secret file (32-bytes long binary file). PCK (provisioned by OEM, known by OEM) - Part Common Key."
-    " This is a 256-bit pre-shared AES key provisioned by OEM. PCK is used to derive FW image encryption keys.",
+    type=click.Path(exists=True, file_okay=True, dir_okay=False),
+    required=False,
+    help="""Customer Master Key Symmetric Key secret file (32-bytes long binary file).
+    CUST_MK_SK (provisioned by OEM, known by OEM).
+    This is a 256-bit pre-shared AES key provisioned by OEM. CUST_MK_SK is used to derive FW image encryption keys.""",
 )
 @click.option(
-    "-o",
+    "-i",
     "--oem-share-input",
-    type=click.File(mode="rb"),
+    type=click.Path(exists=True, file_okay=True, dir_okay=False),
     help="OEM share input file to use as a seed to randomize the provisioning process (16-bytes long binary file).",
+)
+@click.option(
+    "-e",
+    "--enc-oem-master-share",
+    type=click.Path(exists=True, dir_okay=False),
+    help="Path to Encrypted OEM MASTER SHARE binary.",
 )
 @click.option(
     "-w",
@@ -635,83 +78,320 @@ def main(log_level: int) -> int:
     help="Workspace folder to store temporary files, that could be used for future review.",
 )
 @click.option(
-    "-j",
-    "--container-conf",
-    type=click.Path(exists=True),
-    required=False,
-    help="""JSON/YAML container configuration file to produce secure binary v3.x.
-    This configuration file must contain family, list of commands and description""",
+    "-ir/-IR",
+    "--initial-reset/--no-init-reset",
+    default=None,
+    help=(
+        "Reset device BEFORE DevHSM operation. The DevHSM operation can run only once between resets. "
+        "Do not enable this option on Linux/Mac when using USB. By default this reset is DISABLED."
+    ),
 )
 @click.option(
-    "-f",
-    "--family",
-    required=False,
-    help="Select the chip family.",
-    type=click.Choice(["lpc55s3x"], case_sensitive=False),
+    "-fr/-FR",
+    "--final-reset/--no-final-reset",
+    default=None,
+    help=(
+        "Reset device AFTER DevHSM operation. This reset is required if you need to use the device "
+        "after DevHSM operation for other security related operations (e.g. receive-sb-file). "
+        "By default this reset is ENABLED."
+    ),
 )
 @click.option(
-    "-r/-R",
-    "--reset/--no-reset",
-    default=True,
-    help="Control resetting target before and after DevHSM operation. Reset is enabled by default.",
+    "-ba",
+    "--buffer-address",
+    type=INT(),
+    help="Override the communication buffer base address. The default address is family-specific.",
 )
-@click.argument("output-path", type=click.File(mode="wb"))
-def generate(
-    port: str,
-    usb: str,
-    buspal: str,
-    lpcusbsio: str,
-    oem_share_input: BinaryIO,
-    key: BinaryIO,
-    output_path: BinaryIO,
+@spsdk_output_option(required=False)
+@spsdk_config_option(required=False)
+def generate_command(
+    interface: MbootProtocolBase,
+    oem_share_input: str,
+    enc_oem_master_share: str,
+    key: str,
+    output: str,
     workspace: str,
-    container_conf: str,
-    timeout: int,
+    config: str,
     family: str,
-    reset: bool,
+    initial_reset: bool,
+    final_reset: bool,
+    buffer_address: int,
 ) -> None:
-    """Generate provisioning SB3.1 file.
-
-    \b
-    PATH    - output file path, where the final provisioned SB file will be stored.
-    """
-    interface = get_interface(
-        module="mboot", port=port, usb=usb, lpcusbsio=lpcusbsio, timeout=timeout, buspal=buspal
+    """Generate provisioning SB file."""
+    generate(
+        interface=interface,
+        oem_share_input=oem_share_input,
+        enc_oem_master_share=enc_oem_master_share,
+        key=key,
+        output=output,
+        workspace=workspace,
+        config=config,
+        family=family,
+        initial_reset=initial_reset,
+        final_reset=final_reset,
+        buffer_address=buffer_address,
     )
-    assert isinstance(interface, MBootInterface)
 
-    oem_share_in = get_oem_share_input(oem_share_input)
-    user_pck = get_user_pck(key)
-    if container_conf:
-        family_from_cfg = load_configuration(container_conf).get("family")
-        if not isinstance(family_from_cfg, str):
-            raise SPSDKError("Family parameter is not provided in the container configuration")
-    if (family and container_conf) and (family != family_from_cfg):
-        raise SPSDKError(
-            f"Family from json configuration file: {family_from_cfg} differs from the family parameter {family}"
-        )
 
-    if not family and not container_conf:
-        raise SPSDKError(
-            "Need to provide family. Either as -f parameter or in json configuration file."
-        )
-    family_final = family if not container_conf else family_from_cfg
-    assert isinstance(family_final, str)
+def generate(
+    interface: MbootProtocolBase,
+    oem_share_input: Optional[str] = None,
+    enc_oem_master_share: Optional[str] = None,
+    key: Optional[str] = None,
+    output: Optional[str] = None,
+    workspace: Optional[str] = None,
+    config: Optional[str] = None,
+    family: Optional[str] = None,
+    initial_reset: Optional[bool] = False,
+    final_reset: Optional[bool] = True,
+    buffer_address: Optional[int] = None,
+) -> None:
+    """Generate provisioning SB file."""
+    app_config = DevHSMConfig(
+        config=config,
+        oem_share_input=oem_share_input,
+        enc_oem_master_share=enc_oem_master_share,
+        key=key,
+        output=output,
+        workspace=workspace,
+        family=family,
+        initial_reset=initial_reset,
+        final_reset=final_reset,
+        buffer_address=buffer_address,
+    )
+    search_paths = [app_config.config_path] if app_config.config_path else None
+    oem_share_in = DevHsm.get_oem_share_input(app_config.oem_share_input, search_paths)
+    enc_oem_master_share_in = DevHsm.get_oem_master_share(
+        app_config.enc_oem_master_share, search_paths
+    )
+    cust_mk_sk = DevHsm.get_cust_mk_sk(app_config.key, search_paths) if app_config.key else None
+    out_file = resolve_path_relative_to_config(
+        "containerOutputFile", app_config.config, app_config.output
+    )
+    if not app_config.family:
+        raise SPSDKAppError("Family is not specified.")
+    devhsm_cls = get_devhsm_class(app_config.family)
     with McuBoot(interface) as mboot:
-        devhsm = DeviceHsm(
+        devhsm = devhsm_cls(
             mboot=mboot,
-            user_pck=user_pck,
+            cust_mk_sk=cust_mk_sk,
             oem_share_input=oem_share_in,
+            oem_enc_master_share_input=enc_oem_master_share_in,
             info_print=click.echo,
-            container_conf=container_conf,
-            workspace=workspace,
-            family=family_final,
-            reset=reset,
+            container_conf=config,
+            workspace=app_config.workspace,
+            family=app_config.family,
+            initial_reset=app_config.initial_reset,
+            final_reset=app_config.final_reset,
+            buffer_address=app_config.buffer_address,
         )
-        devhsm.create_sb3()
-        output_path.write(devhsm.export())
+        devhsm.create_sb()
+        write_file(devhsm.export(), out_file, "wb")
 
-    click.echo(f"Final SB3 file has been written: {os.path.abspath(output_path.name)}")
+    click.echo(f"Final SB file has been written: {get_printable_path(os.path.abspath(out_file))}")
+
+
+@main.command(name="get-template", no_args_is_help=True)
+@spsdk_family_option(families=DevHsm.get_supported_families())
+@spsdk_output_option(force=True)
+def get_template_command(family: str, output: str) -> None:
+    """Create template of configuration in YAML format.
+
+    The template file name is specified as argument of this command.
+    """
+    get_template(family, output)
+
+
+def get_template(family: str, output: str) -> None:
+    """Create template of configuration in YAML format."""
+    write_file(get_devhsm_class(family).generate_config_template(family), output)
+    click.echo(
+        f"The DevHsm template for {family} has been saved into {get_printable_path(output)} YAML file"
+    )
+
+
+@main.command(name="gen-master-share", no_args_is_help=True)
+@spsdk_mboot_interface(identify_by_family=True)
+@spsdk_family_option(families=DevHsmSB31.get_supported_families())
+@click.option(
+    "-i",
+    "--oem-share-input",
+    type=click.Path(exists=True, file_okay=True, dir_okay=False),
+    help="OEM share input file to use as a seed to randomize the provisioning process (16-bytes long binary file).",
+)
+@spsdk_output_option(
+    required=False,
+    directory=True,
+    help="Path to optional directory where to store generated OEM shares.",
+)
+@click.option(
+    "-ir/-IR",
+    "--initial-reset/--no-init-reset",
+    default=True,
+    help=(
+        "Reset device BEFORE DevHSM operation. The DevHSM operation can run only once between resets. "
+        "Do not enable this option on Linux/Mac when using USB. By default this reset is DISABLED."
+    ),
+)
+@click.option(
+    "-ba",
+    "--buffer-address",
+    type=INT(),
+    help="Override the communication buffer base address. The default address is family-specific.",
+)
+def gen_master_share(
+    interface: MbootProtocolBase,
+    family: str,
+    oem_share_input: str,
+    output: str,
+    initial_reset: bool,
+    buffer_address: int,
+) -> None:
+    """Generate OEM SHARE on target and optionally store results."""
+    seed_data = DevHsm.get_oem_share_input(oem_share_input)
+
+    with McuBoot(interface=interface) as mboot:
+        if initial_reset:
+            mboot.reset(timeout=500, reopen=True)
+        devhsm = DevHsmSB31(
+            mboot=mboot,
+            oem_share_input=seed_data,
+            initial_reset=True,
+            family=family,
+            buffer_address=buffer_address,
+        )
+        enc_oem_share, enc_oem_master_share, oem_cert = devhsm.oem_generate_master_share()
+
+    if output:
+        write_file(seed_data, os.path.join(output, "OEM_SEED.bin"), mode="wb")
+        write_file(enc_oem_share, os.path.join(output, "ENC_OEM_SHARE.bin"), mode="wb")
+        write_file(
+            enc_oem_master_share, os.path.join(output, "ENC_OEM_MASTER_SHARE.bin"), mode="wb"
+        )
+        write_file(oem_cert, os.path.join(output, "NXP_CUST_CA_PUK.bin"), mode="wb")
+    click.echo("OEM MASTER SHARE successfully generated.")
+
+
+@main.command(name="set-master-share", no_args_is_help=True)
+@spsdk_mboot_interface(identify_by_family=True)
+@spsdk_family_option(families=DevHsmSB31.get_supported_families())
+@click.option(
+    "-i",
+    "--oem-share-input",
+    type=click.Path(exists=True, dir_okay=False),
+    required=True,
+    help="Path to OEM_SEED binary.",
+)
+@click.option(
+    "-e",
+    "--enc-oem-master-share",
+    type=click.Path(exists=True, dir_okay=False),
+    required=True,
+    help="Path to OEM ENC MASTER SHARE.",
+)
+@click.option(
+    "-ba",
+    "--buffer-address",
+    type=INT(),
+    help="Override the communication buffer base address. The default address is family-specific.",
+)
+def set_master_share(
+    interface: MbootProtocolBase,
+    family: str,
+    oem_share_input: str,
+    enc_oem_master_share: str,
+    buffer_address: int,
+) -> None:
+    """Set OEM SHARE."""
+    with McuBoot(interface=interface) as mboot:
+        devhsm = DevHsmSB31(mboot=mboot, family=family, buffer_address=buffer_address)
+        devhsm.oem_set_master_share(
+            oem_seed=load_binary(oem_share_input),
+            enc_oem_share=load_binary(enc_oem_master_share),
+        )
+    click.echo("OEM MASTER SHARE successfully set.")
+
+
+@main.command(name="wrap-cust-mk-sk", no_args_is_help=True)
+@spsdk_mboot_interface(identify_by_family=True)
+@spsdk_family_option(families=DevHsmSB31.get_supported_families())
+@click.option("-i", "--cust-mk-sk", type=click.Path(exists=True, dir_okay=False), required=True)
+@spsdk_output_option(directory=True)
+@click.option(
+    "-ba",
+    "--buffer-address",
+    type=INT(),
+    help="Override the communication buffer base address. The default address is family-specific.",
+)
+def wrap_cust_mk_sk(
+    interface: MbootProtocolBase, family: str, cust_mk_sk: str, output: str, buffer_address: int
+) -> None:
+    """Wrap CUST_MK_SK key."""
+    with McuBoot(interface=interface) as mboot:
+        devhsm = DevHsmSB31(mboot=mboot, family=family, buffer_address=buffer_address)
+        wrapped_key = devhsm.wrap_key(load_binary(cust_mk_sk))
+    write_file(wrapped_key, os.path.join(output, "CUST_MK_SK_BLOB.bin"), mode="wb")
+    click.echo("Wrapped CUST_MK_SK successfully created.")
+
+
+@main.command(name="get-cust-fw-auth", no_args_is_help=True)
+@spsdk_mboot_interface(identify_by_family=True)
+@spsdk_family_option(families=DevHsmSB31.get_supported_families())
+@click.option(
+    "-i",
+    "--oem-share-input",
+    type=click.Path(exists=True, dir_okay=False),
+    required=False,
+    help="Path to OEM_SEED binary.",
+)
+@click.option(
+    "-e",
+    "--enc-oem-master-share",
+    type=click.Path(exists=True, dir_okay=False),
+    required=False,
+    help="Path to OEM ENC MASTER SHARE.",
+)
+@spsdk_output_option(directory=True)
+@click.option(
+    "-ba",
+    "--buffer-address",
+    type=INT(),
+    help="Override the communication buffer base address. The default address is family-specific.",
+)
+def get_cust_fw_auth(
+    interface: MbootProtocolBase,
+    family: str,
+    oem_share_input: str,
+    enc_oem_master_share: str,
+    output: str,
+    buffer_address: int,
+) -> None:
+    """Generate CUST FW AUTH key."""
+    with McuBoot(interface=interface) as mboot:
+        uuid_list = mboot.get_property(PropertyTag.UNIQUE_DEVICE_IDENT)
+        if not uuid_list:
+            raise SPSDKAppError(f"Unable to read UUID. Error: {mboot.status_string}")
+        uuid_obj = DeviceUidValue(PropertyTag.UNIQUE_DEVICE_IDENT.tag, uuid_list)
+        uuid = str(uuid_obj.to_int())
+
+        # allow for previously set OEM Shares
+        devhsm = DevHsmSB31(
+            mboot=mboot, family=family, oem_share_input=bytes(), buffer_address=buffer_address
+        )
+        if oem_share_input and enc_oem_master_share:
+            devhsm.oem_set_master_share(
+                oem_seed=load_binary(oem_share_input),
+                enc_oem_share=load_binary(enc_oem_master_share),
+            )
+        else:
+            click.echo(
+                "OEM SHARE INPUT or ENC OEM MASTER SHARE (or both) are missing. Reusing existing OEM SHARE settings."
+            )
+        prk, puk = devhsm.generate_key(key_type=TrustProvOemKeyType.MFWISK)
+    write_file(uuid, os.path.join(output, "UUID.txt"))
+    write_file(prk, os.path.join(output, "CUST_FW_AUTH_PRK.bin"), mode="wb")
+    write_file(puk, os.path.join(output, "CUST_FW_AUTH_PRK_PUK.bin"), mode="wb")
+    click.echo("CUST FW AUTH key pair successfully created.")
 
 
 @catch_spsdk_error

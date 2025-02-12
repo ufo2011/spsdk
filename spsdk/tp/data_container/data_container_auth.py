@@ -1,27 +1,27 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2021-2022 NXP
+# Copyright 2021-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
 """Module for all Authenticators used in DataContainer."""
 
 from abc import abstractmethod
-from typing import Mapping, Optional
+from typing import Mapping, Optional, Type
 
-from crcmod.predefined import mkPredefinedCrcFun
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import cmac, hashes, hmac
-from cryptography.hazmat.primitives.ciphers import algorithms
+from spsdk.crypto.cmac import cmac, cmac_validate
+from spsdk.crypto.crc import CrcAlg, from_crc_algorithm
+from spsdk.crypto.hash import EnumHashAlgorithm
+from spsdk.crypto.keys import PrivateKeyEcc, PublicKeyEcc
+from spsdk.crypto.spsdk_hmac import hmac, hmac_validate
+from spsdk.crypto.utils import extract_public_key_from_data
+from spsdk.tp.exceptions import SPSDKTpError
+from spsdk.utils.misc import Endianness
+from spsdk.utils.spsdk_enum import SpsdkEnum
 
-from spsdk.utils.crypto.backend_openssl import openssl_backend
-from spsdk.utils.easy_enum import Enum
 
-from ..exceptions import SPSDKTpError
-
-
-class AuthenticationType(Enum):
+class AuthenticationType(SpsdkEnum):
     """Available Authentication types."""
 
     NONE = (0, "none", "None")
@@ -60,47 +60,33 @@ class AES_CMAC(AuthenticationProvider):
     @classmethod
     def sign(cls, data: bytes, key: bytes) -> bytes:
         """Generate CMAC authentication code."""
-        cipher = cmac.CMAC(algorithm=algorithms.AES(key))
-        cipher.update(data=data)
-        return cipher.finalize()
+        return cmac(key=key, data=data)
 
     @classmethod
     def validate(cls, data: bytes, signature: bytes, key: bytes) -> bool:
         """Validate CMAC authentication code."""
-        cipher = cmac.CMAC(algorithm=algorithms.AES(key))
-        cipher.update(data=data)
-        try:
-            cipher.verify(signature=signature)
-            return True
-        except InvalidSignature:
-            return False
+        return cmac_validate(key=key, data=data, signature=signature)
 
 
 # pylint: disable=invalid-name
 class _HMAC(AuthenticationProvider):
     """Base for HMAC Authenticators."""
 
-    HASHER: Optional[hashes.HashAlgorithm] = None
+    HASHER: Optional[EnumHashAlgorithm] = None
 
     @classmethod
     def sign(cls, data: bytes, key: bytes) -> bytes:
         """Generate hash authentication code."""
-        assert cls.HASHER
-        hasher = hmac.HMAC(key=key, algorithm=cls.HASHER)
-        hasher.update(data)
-        return hasher.finalize()
+        if not cls.HASHER:
+            raise SPSDKTpError("HASHER attribute must be defined in subclass")
+        return hmac(key=key, data=data, algorithm=cls.HASHER)
 
     @classmethod
     def validate(cls, data: bytes, signature: bytes, key: bytes) -> bool:
         """Validate hash authentication code."""
-        assert cls.HASHER
-        hasher = hmac.HMAC(key=key, algorithm=cls.HASHER)
-        hasher.update(data)
-        try:
-            hasher.verify(signature=signature)
-            return True
-        except InvalidSignature:
-            return False
+        if not cls.HASHER:
+            raise SPSDKTpError("HASHER attribute must be defined in subclass")
+        return hmac_validate(key=key, data=data, signature=signature, algorithm=cls.HASHER)
 
 
 # pylint: disable=invalid-name
@@ -109,29 +95,33 @@ class HMAC_256(_HMAC):
 
     TYPE = AuthenticationType.HMAC_256
     DATA_LEN = 32
-    HASHER = hashes.SHA256()
+    HASHER = EnumHashAlgorithm.SHA256
 
 
 # pylint: disable=invalid-name
 class _CRC(AuthenticationProvider):
     """Base for CRC Authenticators."""
 
-    CRC_NAME = "invalid-crc-name"
+    CRC_NAME = None
 
     @classmethod
     def sign(cls, data: bytes, key: Optional[bytes] = None) -> bytes:
         """Generate CRC code."""
-        crc_func = mkPredefinedCrcFun(cls.CRC_NAME)
-        crc = crc_func(data)
-        crc_bytes = int.to_bytes(crc, length=cls.DATA_LEN, byteorder="little")
+        if cls.CRC_NAME is None:
+            raise SPSDKTpError("CRC_NAME attribute must be defined in subclass")
+        crc_obj = from_crc_algorithm(cls.CRC_NAME)
+        crc = crc_obj.calculate(data)
+        crc_bytes = int.to_bytes(crc, length=cls.DATA_LEN, byteorder=Endianness.LITTLE.value)
         return crc_bytes
 
     @classmethod
     def validate(cls, data: bytes, signature: bytes, key: Optional[bytes] = None) -> bool:
         """Validate CRC code."""
-        crc_func = mkPredefinedCrcFun(cls.CRC_NAME)
-        crc = crc_func(data)
-        crc_bytes = int.to_bytes(crc, length=cls.DATA_LEN, byteorder="little")
+        if cls.CRC_NAME is None:
+            raise SPSDKTpError("CRC_NAME attribute must be defined in subclass")
+        crc_obj = from_crc_algorithm(cls.CRC_NAME)
+        crc = crc_obj.calculate(data)
+        crc_bytes = int.to_bytes(crc, length=cls.DATA_LEN, byteorder=Endianness.LITTLE.value)
         return crc_bytes == signature
 
 
@@ -141,7 +131,7 @@ class CRC32(_CRC):
 
     TYPE = AuthenticationType.CRC32
     DATA_LEN = 4
-    CRC_NAME = "crc32"
+    CRC_NAME = CrcAlg.CRC32  # type: ignore
 
 
 # pylint: disable=invalid-name
@@ -154,30 +144,35 @@ class ECDSA_256(AuthenticationProvider):
     @classmethod
     def sign(cls, data: bytes, key: bytes) -> bytes:
         """Generate ECDSA signature."""
-        return openssl_backend.ecc_sign(key, data)
+        return PrivateKeyEcc.parse(key).sign(data=data)
 
     @classmethod
     def validate(cls, data: bytes, signature: bytes, key: bytes) -> bool:
         """Validate ECDSA signature."""
-        return openssl_backend.ecc_verify(key, signature, data)
+        pub_key = extract_public_key_from_data(key)
+        assert isinstance(pub_key, PublicKeyEcc)
+        return pub_key.verify_signature(
+            signature=signature,
+            data=data,
+        )
 
 
-_AUTHENTICATORS: Mapping[int, AuthenticationProvider] = {
-    AuthenticationType.AES_CMAC: AES_CMAC,  # type: ignore
-    AuthenticationType.HMAC_256: HMAC_256,  # type: ignore
-    AuthenticationType.ECDSA_256: ECDSA_256,  # type: ignore
-    AuthenticationType.CRC32: CRC32,  # type: ignore
+_AUTHENTICATORS: Mapping[AuthenticationType, Type[AuthenticationProvider]] = {
+    AuthenticationType.AES_CMAC: AES_CMAC,
+    AuthenticationType.HMAC_256: HMAC_256,
+    AuthenticationType.ECDSA_256: ECDSA_256,
+    AuthenticationType.CRC32: CRC32,
 }
 
 
-def _get_auth_provider(auth_type: AuthenticationType) -> AuthenticationProvider:
+def _get_auth_provider(auth_type: AuthenticationType) -> Type[AuthenticationProvider]:
     try:
         provider = _AUTHENTICATORS[auth_type]
         return provider
     except KeyError as exc:
-        if auth_type in AuthenticationType.tags():
+        if auth_type in AuthenticationType:
             raise SPSDKTpError(
-                f"Authenticator '{AuthenticationType.desc(auth_type)}' ({auth_type}) is not supported yet"
+                f"Authenticator '{auth_type.description}' ({auth_type}) is not supported yet"
             ) from exc
         raise SPSDKTpError(f"Unknown AUTH TYPE: {auth_type}") from exc
 

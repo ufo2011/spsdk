@@ -1,27 +1,22 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2020-2023 NXP
+# Copyright 2020-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
 """Module provides support for checking the brick-conditions in PFR settings."""
 
 import logging
-import os
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Optional
 
-from spsdk.pfr import PFR_DATA_FOLDER, Processor, Translator
 from spsdk.pfr.exceptions import SPSDKPfrcMissingConfigError, SPSDKPfrConfigError
-from spsdk.pfr.pfr import PfrConfiguration
-from spsdk.utils.database import Database
+from spsdk.pfr.pfr import CFPA, CMPA, SPSDKPfrError
+from spsdk.pfr.processor import Processor
+from spsdk.pfr.translator import Translator
+from spsdk.utils.database import DatabaseManager, get_db, get_families
 from spsdk.utils.misc import load_configuration
-
-from .pfr import CFPA, CMPA, SPSDKPfrError
-
-PFRC_DATA_FOLDER = os.path.join(PFR_DATA_FOLDER, "pfrc")
-PFRC_DATABASE_FILE = os.path.join(PFRC_DATA_FOLDER, "database.yaml")
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +31,7 @@ class Rule:
     cond: str
 
 
-class RulesList(List[Rule]):
+class RulesList(list[Rule]):
     """List of rules."""
 
     @staticmethod
@@ -59,8 +54,10 @@ class RulesList(List[Rule]):
         :param rules_file: A path to a configuration file containing rules to be loaded
         :returns RulesList object with loaded rules
         """
-        rules = load_configuration(rules_file)
-        return RulesList(Rule(**rule) for rule in rules)
+        rules_dict: dict[str, list[dict]] = load_configuration(rules_file)
+        if "rules" not in rules_dict:
+            raise SPSDKPfrConfigError("No rules found in the configuration file")
+        return RulesList(Rule(**rule) for rule in rules_dict["rules"])
 
 
 class Pfrc:
@@ -76,32 +73,43 @@ class Pfrc:
         :param cmpa: configuration data loaded from CMPA config file, defaults to None
         :param cfpa: configuration data loaded from CFPA config file, defaults to None
         :raises SPSDKPfrError: No configuration is provided
-        :raises SPSDKPfrConfigError: Problem with PFR configuration(s) occured
+        :raises SPSDKPfrConfigError: Problem with PFR configuration(s) occurred
         """
-        self.database = Database(PFRC_DATABASE_FILE)
         if not (cmpa or cfpa):
             raise SPSDKPfrError("No cmpa or cfpa configurations specified")
         self.cmpa = cmpa
         self.cfpa = cfpa
-        self.chip_family = cmpa.device if cmpa else cfpa.device  # type: ignore
-        if not self.chip_family or self.chip_family not in self.get_supported_families():
+
+        self.chip_family = cmpa.family if cmpa else cfpa.family  # type: ignore
+        pfrc_devices = self.get_supported_families()
+        pfrc_devices += list(
+            DatabaseManager().quick_info.devices.get_predecessors(pfrc_devices).keys()
+        )
+        if not self.chip_family or self.chip_family not in pfrc_devices:
             raise SPSDKPfrConfigError(
                 f"Chip family from configuration is not supported: {self.chip_family} "
                 f"Supported families:{self.get_supported_families()}"
             )
 
+        self.db = get_db(self.chip_family, "latest")
+
     @staticmethod
-    def get_supported_families() -> List[str]:
+    def get_supported_families() -> list[str]:
         """Return list of supported families.
 
         :return: List of supported families.
         """
-        database = Database(PFRC_DATABASE_FILE)
-        return database.devices.device_names
+        pfr_devices = get_families(DatabaseManager.PFR)
+        ret = []
+        for dev in pfr_devices:
+            pfrc_rules = get_db(dev, "latest").get_list(DatabaseManager.PFR, "rules", [])
+            if pfrc_rules:
+                ret.append(dev)
+        return ret
 
     def validate_brick_conditions(
         self, additional_rules_file: Optional[str] = None
-    ) -> Tuple[RulesList, RulesList, RulesList]:
+    ) -> tuple[RulesList, RulesList, RulesList]:
         """The method validates the brick conditions for specified configuration.
 
         :param additional_rules_file: Additional rules file, defaults to None
@@ -142,8 +150,8 @@ class Pfrc:
         :param additional_rules_file: Additional rules file, defaults to None
         :return: Loaded rules in list of dictionaries.
         """
-        rules_files = self.database.get_device_value("rules", self.chip_family)
-        rules_files = [os.path.join(PFRC_DATA_FOLDER, rules_file) for rules_file in rules_files]
+        rules_files = self.db.get_list(DatabaseManager.PFR, "rules")
+        rules_files = [self.db.device.create_file_path(rules_file) for rules_file in rules_files]
         if additional_rules_file:
             rules_files.append(additional_rules_file)
         return RulesList.load_from_files_list(rules_files)

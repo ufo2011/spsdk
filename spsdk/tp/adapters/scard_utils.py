@@ -1,18 +1,18 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2021-2023 NXP
+# Copyright 2021-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 """Utilities used in SmartCard."""
 
 import logging
-from typing import List, NamedTuple, Optional, Tuple
+from typing import NamedTuple, Optional
 
-from spsdk import SPSDKError
-from spsdk.apps.utils import format_raw_data
-from spsdk.utils.easy_enum import Enum
+from spsdk.apps.utils.utils import format_raw_data
+from spsdk.exceptions import SPSDKError
 from spsdk.utils.misc import get_hash
+from spsdk.utils.spsdk_enum import SpsdkEnum
 
 try:
     from smartcard.CardConnectionDecorator import CardConnection
@@ -28,12 +28,12 @@ except ImportError as import_error:
     ) from import_error
 
 
-from . import scard_commands
+from spsdk.tp.adapters import scard_commands
 
 logger = logging.getLogger(__name__)
 
 
-class ProvItem(Enum):
+class ProvItem(SpsdkEnum):
     """Provisioning item indexes."""
 
     OEM_CERT_COUNT = (0x1001, "oem_id_count")
@@ -49,6 +49,9 @@ class ProvItem(Enum):
     CFPA = (0x0007, "cfpa")
     CMPA = (0x0008, "cmpa")
     PROD_COUNTER = (0x0009, "prod_counter")
+    PROV_DATA = (0x000A, "prov_data")
+    PROV_FLAGS = (0x000B, "prov_flags")
+    FAMILY = (0x000C, "family")
     OEM_CERT_TEMPLATE = (0x0100, "oem_cert_template")
 
 
@@ -100,10 +103,11 @@ class AppletInfo(NamedTuple):
     reader_name: str
     version: str
     serial_number: int
+    sealed: bool
     card_connection: CardConnection
 
 
-def get_readers() -> List[Tuple[str, str]]:
+def get_readers() -> list[tuple[str, str]]:
     """Return list of all readers in the system.
 
     Each reader is represented by a tuple:
@@ -115,7 +119,7 @@ def get_readers() -> List[Tuple[str, str]]:
 
 def get_applet_infos(
     atr: str, applet: str, filter_id: Optional[int] = None, filter_reader: Optional[str] = None
-) -> List[AppletInfo]:
+) -> list[AppletInfo]:
     """Collets information about attached card readers.
 
     :param atr: Select the card's ATR (after reset value)
@@ -156,11 +160,14 @@ def get_applet_infos(
                 continue
             version_cmd = scard_commands.GetAppletVersion()
             version = version_cmd.format(version_cmd.transmit(scard.connection))
+            sealed_cmd = scard_commands.GetSealState()
+            sealed = sealed_cmd.format(sealed_cmd.transmit(scard.connection))
             ret.append(
                 AppletInfo(
                     reader_name=reader_tuple[0],
                     version=version,
                     serial_number=serial_number,
+                    sealed=sealed,
                     card_connection=scard.connection,
                 )
             )

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2020-2023 NXP
+# Copyright 2020-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -11,40 +11,20 @@ import os
 from datetime import datetime, timezone
 from struct import pack
 from time import sleep
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence
 
 import pytest
 from cryptography import x509
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives.serialization import (
-    NoEncryption,
-    PrivateFormat,
-    load_pem_private_key,
-)
 
-from spsdk.crypto import (
-    Encoding,
-    generate_certificate,
-    generate_rsa_private_key,
-    generate_rsa_public_key,
-    save_crypto_item,
-    save_rsa_private_key,
-)
-from spsdk.image import (
-    MAC,
-    BeeFacRegion,
-    BeeKIB,
-    BeeProtectRegionBlock,
-    BeeRegionHeader,
-    BootImgRT,
-    FlexSPIConfBlockFCB,
-    PaddingFCB,
-    SrkItem,
-    SrkTable,
-    hab_audit_log,
-)
-from spsdk.mboot import ExtMemId, McuBoot, PropertyTag
-from spsdk.mboot import scan_usb as mboot_scan_usb
+from spsdk.crypto.certificate import Certificate
+from spsdk.crypto.crypto_types import SPSDKEncoding
+from spsdk.crypto.keys import PrivateKeyRsa
+from spsdk.image.bee import BeeFacRegion, BeeKIB, BeeProtectRegionBlock, BeeRegionHeader
+from spsdk.image.images import BootImgRT, FlexSPIConfBlockFCB, PaddingFCB
+from spsdk.image.secret import MAC, SrkItem, SrkTable
+from spsdk.mboot.exceptions import McuBootConnectionError
+from spsdk.mboot.interfaces.usb import MbootUSBInterface
+from spsdk.mboot.mcuboot import ExtMemId, McuBoot, PropertyTag
 from spsdk.sbfile.sb1 import (
     BootSectionV1,
     CmdErase,
@@ -54,11 +34,10 @@ from spsdk.sbfile.sb1 import (
     SecureBootFlagsV1,
     SecureBootV1,
 )
-from spsdk.sdp import SDP, ResponseValue, SdpCommandError, StatusCode
-from spsdk.sdp import scan_usb as sdp_scan_usb
-from spsdk.utils.easy_enum import Enum
-from spsdk.utils.misc import DebugInfo, align, align_block, load_binary
-from tests.misc import compare_bin_files, write_dbg_log
+from spsdk.sdp.interfaces.usb import SdpUSBInterface
+from spsdk.sdp.sdp import SDP, ResponseValue, SdpCommandError, StatusCode
+from spsdk.utils.misc import Endianness, align, align_block, load_binary
+from tests.misc import compare_bin_files
 
 # ############################## EXECUTION PARAMETERS ##############################
 # Flag allowing to switch between testing expected image content and generating an output image
@@ -82,7 +61,7 @@ CERT_SUBDIR = "crts"
 # name of the data sub-directory with SRK hashes
 SRK_SUBDIR = "srk"
 # private key password (used to store or load key from disk)
-PRIV_KEY_PASSWORD = b"SWTestTeam"
+PRIV_KEY_PASSWORD = "SWTestTeam"
 # name of the sub-directory with debug logs for generation of the output
 DEBUG_LOG_SUBDIR = "debug_logs"
 # name of the sub-directory with processor specific files; it is also used as ID of the test processor
@@ -120,8 +99,10 @@ class CpuParams:
         data_subdir: str,
         com_processor_name: str,
         board: str,
-        cpu_data: hab_audit_log.CpuData,
         ext_flash_cfg_word0: int,
+        encryption_supported: bool = True,
+        xip_signature_supported: bool = True,
+        none_xip_signature_supported: bool = True,
     ):
         """Constructor.
 
@@ -129,8 +110,10 @@ class CpuParams:
         :param data_subdir: name of processor specific data sub-directory
         :param com_processor_name: SPSDK-specific name of the target processor for communication API (MBOOT and SDP)
         :param board: name of the board (used to select name of the source and output image)
-        :param cpu_data: contains important specific data for each cpu
         :param ext_flash_cfg_word0: configuration word 0 for external FLASH
+        :param encryption_supported: Flag that CPU supports encryption HAB
+        :param xip_signature_supported: Flag that CPU supports XIP signed HAB
+        :param none_xip_signature_supported: Flag that CPU supports None XIP signed HAB
         """
         # ID of the test configuration
         self.id = data_subdir
@@ -147,7 +130,9 @@ class CpuParams:
         self.board = board
         self.ext_flash_cfg_word0 = ext_flash_cfg_word0
         self.ext_flash_cfg_word1 = 0  # currently zero for all RT
-        self.cpu_data = cpu_data
+        self.encryption_supported = encryption_supported
+        self.xip_signature_supported = xip_signature_supported
+        self.none_xip_signature_supported = none_xip_signature_supported
 
     def __str__(self) -> str:
         return self.id + " " + self.__class__.__name__
@@ -160,8 +145,9 @@ class CpuParams:
             ID_RT1020,
             "MXRT20",
             "evkmimxrt1020",
-            hab_audit_log.CpuData.MIMXRT1020,
             IS25WP_FLASH_CFG_WORD0,
+            encryption_supported=False,
+            none_xip_signature_supported=False,
         )
 
     @classmethod
@@ -172,7 +158,6 @@ class CpuParams:
             ID_RT1050,
             "MXRT50",
             "evkbimxrt1050",
-            hab_audit_log.CpuData.MIMXRT1050,
             IS26KS_FLASH_CFG_WORD0,
         )
 
@@ -184,20 +169,8 @@ class CpuParams:
             ID_RT1060,
             "MXRT60",
             "evkmimxrt1060",
-            hab_audit_log.CpuData.MIMXRT1060,
             IS25WP_FLASH_CFG_WORD0,
         )
-
-
-"""Maps cpu ids from CpuParams into hab_audit_log.CpuData format."""
-CpuDataMapper = {
-    # maps rt102x into hab_audit_log.CpuData.MIMXRT1020
-    ID_RT1020: hab_audit_log.CpuData.MIMXRT1020,
-    # maps rt105x into hab_audit_log.CpuData.MIMXRT1050
-    ID_RT1050: hab_audit_log.CpuData.MIMXRT1050,
-    # maps rt106x into hab_audit_log.CpuData.MIMXRT1060
-    ID_RT1060: hab_audit_log.CpuData.MIMXRT1060,
-}
 
 
 # ############################## PROCESSOR/BOARD SPECIFIC INFO ########################################
@@ -237,19 +210,11 @@ def srk_table4(cpu_params: CpuParams) -> SrkTable:
     """
     result = SrkTable()
     for cert_prefix in ["SRK1", "SRK2", "SRK3", "SRK4"]:
-        cert_data = load_binary(
+        certificate = Certificate.load(
             os.path.join(cpu_params.cert_data_dir, cert_prefix + "_sha256_2048_65537_v3_ca_crt.pem")
         )
-        certificate = x509.load_pem_x509_certificate(cert_data, default_backend())
         result.append(SrkItem.from_certificate(certificate))
     return result
-
-
-class AuthType(Enum):
-    """Authentication type"""
-
-    STANDARD_SIGNED = (0, "Standard signed image")
-    ENCRYPTED = (1, "Encrypted image")
 
 
 def _to_authenticated_image(
@@ -287,31 +252,25 @@ def _to_authenticated_image(
         assert boot_img.decrypted_app_data == app_data
     csf_prefix = "CSF" + str(srk_key_index + 1) + "_1_sha256_2048_65537_v3_usr_"
     img_prefix = "IMG" + str(srk_key_index + 1) + "_1_sha256_2048_65537_v3_usr_"
-    csf_priv_key = load_pem_private_key(
-        load_binary(os.path.join(cpu_params.keys_data_dir, csf_prefix + "key.pem")),
+    csf_priv_key = PrivateKeyRsa.load(
+        os.path.join(cpu_params.keys_data_dir, csf_prefix + "key.pem"),
         password=PRIV_KEY_PASSWORD,
-        backend=default_backend(),
     )
-    img_priv_key = load_pem_private_key(
-        load_binary(os.path.join(cpu_params.keys_data_dir, img_prefix + "key.pem")),
+    img_priv_key = PrivateKeyRsa.load(
+        os.path.join(cpu_params.keys_data_dir, img_prefix + "key.pem"),
         password=PRIV_KEY_PASSWORD,
-        backend=default_backend(),
     )
-    csf_priv_key_data = csf_priv_key.private_bytes(
-        encoding=Encoding.PEM, format=PrivateFormat.PKCS8, encryption_algorithm=NoEncryption()
-    )
-    img_priv_key_data = img_priv_key.private_bytes(
-        encoding=Encoding.PEM, format=PrivateFormat.PKCS8, encryption_algorithm=NoEncryption()
-    )
+    assert isinstance(csf_priv_key, PrivateKeyRsa)
+    assert isinstance(img_priv_key, PrivateKeyRsa)
     if dek is None:
         boot_img.add_csf_standard_auth(
             CSF_VERSION,
             srk_table4(cpu_params),
             srk_key_index,
             load_binary(os.path.join(cpu_params.cert_data_dir, csf_prefix + "crt.pem")),
-            csf_priv_key_data,
+            csf_priv_key,
             load_binary(os.path.join(cpu_params.cert_data_dir, img_prefix + "crt.pem")),
-            img_priv_key_data,
+            img_priv_key,
         )
     else:
         boot_img.add_csf_encrypted(
@@ -319,9 +278,9 @@ def _to_authenticated_image(
             srk_table4(cpu_params),
             srk_key_index,
             load_binary(os.path.join(cpu_params.cert_data_dir, csf_prefix + "crt.pem")),
-            csf_priv_key_data,
+            csf_priv_key,
             load_binary(os.path.join(cpu_params.cert_data_dir, img_prefix + "crt.pem")),
-            img_priv_key_data,
+            img_priv_key,
         )
 
 
@@ -331,9 +290,9 @@ def init_flashloader(cpu_params: CpuParams) -> McuBoot:
 
     :param cpu_params: processor specific parameters of the test
     :return: McuBoot instance to communicate with flash-loader
-    :raises ConnectionError: if connection cannot be established
+    :raises McuBootConnectionError: if connection cannot be established
     """
-    devs = mboot_scan_usb(
+    devs = MbootUSBInterface.scan_usb(
         cpu_params.com_processor_name
     )  # check whether flashloader is already running
     if len(devs) == 0:
@@ -342,15 +301,17 @@ def init_flashloader(cpu_params: CpuParams) -> McuBoot:
             load_binary(os.path.join(cpu_params.data_dir, "ivt_flashloader.bin"))
         )
 
-        devs = sdp_scan_usb(cpu_params.com_processor_name)
+        devs = SdpUSBInterface.scan_usb(cpu_params.com_processor_name)
         if len(devs) != 1:
-            raise ConnectionError("Cannot connect to ROM bootloader")
+            raise McuBootConnectionError("Cannot connect to ROM bootloader")
 
         with SDP(devs[0], cmd_exception=True) as sd:
             assert sd.is_opened
             try:
                 sd.read(INT_RAM_ADDR_CODE, 4)  # dummy read to receive response
-            except SdpCommandError:  # there is an exception if HAB is locked, cause read not supported
+            except (
+                SdpCommandError
+            ):  # there is an exception if HAB is locked, cause read not supported
                 pass
 
             if (sd.status_code == StatusCode.HAB_IS_LOCKED) and (
@@ -375,7 +336,7 @@ def init_flashloader(cpu_params: CpuParams) -> McuBoot:
         for _ in range(10):  # wait 10 sec until flash-loader is inited
             sleep(1)
             # Scan for MCU-BOOT device
-            devs = mboot_scan_usb(cpu_params.com_processor_name)
+            devs = MbootUSBInterface.scan_usb(cpu_params.com_processor_name)
             if len(devs) == 1:
                 break
 
@@ -437,23 +398,25 @@ def _burn_image_to_sd(cpu_params: CpuParams, img: BootImgRT, img_data: bytes) ->
     if VERIFY_SRK_FUSES:
         assert verify_srk_fuses(mboot, srk_table4(cpu_params))
 
-    # ### Configure external FLASH on EVK: flex-spi-nor using options on address 0x2000 ###
+    # ### Configure external FLASH on EVK: flexspi-nor using options on address 0x2000 ###
     # call "%blhost%" -u 0x15A2,0x0073 -j -- fill-memory 0x2000 4 0xD0000000 word
     assert mboot.fill_memory(INT_RAM_ADDR_DATA, 4, 0xD0000000)
     # call "%blhost%" -u 0x15A2,0x0073 -j -- fill-memory 0x2004 4 0x00000000 word
     assert mboot.fill_memory(INT_RAM_ADDR_DATA + 4, 4, 0x00000000)
     # call "%blhost%" -u 0x15A2,0x0073 -j -- configure-memory 288 0x2000
-    assert mboot.configure_memory(INT_RAM_ADDR_DATA, ExtMemId.SD_CARD)
+    assert mboot.configure_memory(INT_RAM_ADDR_DATA, ExtMemId.SD_CARD.tag)
 
     img_data = align_block(img_data, 0x1000)
 
     # ### Erase memory before writing image ###
     # call "%blhost%" -u 0x15A2,0x0073 -j -- flash-erase-region 0x400 16384 288
-    assert mboot.flash_erase_region(SD_CARD_ADDR + img.ivt_offset, len(img_data), ExtMemId.SD_CARD)
+    assert mboot.flash_erase_region(
+        SD_CARD_ADDR + img.ivt_offset, len(img_data), ExtMemId.SD_CARD.tag
+    )
 
     # @echo ### Write image ###
     # call "%blhost%" -u 0x15A2,0x0073 -j -- write-memory 0x00000400 image.bin 288
-    assert mboot.write_memory(SD_CARD_ADDR + img.ivt_offset, img_data, ExtMemId.SD_CARD)
+    assert mboot.write_memory(SD_CARD_ADDR + img.ivt_offset, img_data, ExtMemId.SD_CARD.tag)
 
     # for HAB encrypted image write KEY BLOB
     if img.dek_key:
@@ -461,7 +424,7 @@ def _burn_image_to_sd(cpu_params: CpuParams, img: BootImgRT, img_data: bytes) ->
         blob = mboot.generate_key_blob(img.dek_key)
         tgt_address = EXT_FLASH_ADDR + img.dek_img_offset
         # call "blhost" -u 0x15A2,0x0073 -j -- write-memory 0x60008000 blob.bin 9
-        assert mboot.write_memory(tgt_address, blob, ExtMemId.FLEX_SPI_NOR)
+        assert mboot.write_memory(tgt_address, blob, ExtMemId.FLEX_SPI_NOR.tag)
 
     mboot.close()
 
@@ -487,14 +450,14 @@ def _init_otpmk_bee_regions(mboot: McuBoot, bee_regions: Sequence[BeeFacRegion])
         assert mboot.fill_memory(INT_RAM_ADDR_DATA + offset, 4, fac.length)
         offset += 4
     # apply the configuration
-    assert mboot.configure_memory(INT_RAM_ADDR_DATA, ExtMemId.FLEX_SPI_NOR)
+    assert mboot.configure_memory(INT_RAM_ADDR_DATA, ExtMemId.FLEX_SPI_NOR.tag)
 
 
 def _burn_image_to_flash(
     cpu_params: CpuParams,
     img: BootImgRT,
     img_data: bytes,
-    otpmk_bee_regions: Tuple[BeeFacRegion, ...] = tuple(),
+    otpmk_bee_regions: tuple[BeeFacRegion, ...] = tuple(),
 ) -> None:
     """Burn image into external FLASH. This function is called only in production mode.
 
@@ -512,13 +475,13 @@ def _burn_image_to_flash(
     if VERIFY_SRK_FUSES:
         assert verify_srk_fuses(mboot, srk_table4(cpu_params))
 
-    # ### Configure external FLASH on EVK: flex-spi-nor using options on address 0x2000 ###
+    # ### Configure external FLASH on EVK: flexspi-nor using options on address 0x2000 ###
     # call "%blhost%" -u 0x15A2,0x0073 -j -- fill-memory 0x2000 4 0xC0233007 word
     assert mboot.fill_memory(INT_RAM_ADDR_DATA, 4, cpu_params.ext_flash_cfg_word0)
     # call "%blhost%" -u 0x15A2,0x0073 -j -- fill-memory 0x2004 4 0x00000000 word
     assert mboot.fill_memory(INT_RAM_ADDR_DATA + 4, 4, cpu_params.ext_flash_cfg_word1)
     # call "%blhost%" -u 0x15A2,0x0073 -j -- configure-memory 9 0x2000
-    assert mboot.configure_memory(INT_RAM_ADDR_DATA, ExtMemId.FLEX_SPI_NOR)
+    assert mboot.configure_memory(INT_RAM_ADDR_DATA, ExtMemId.FLEX_SPI_NOR.tag)
 
     if not img.fcb.enabled:
         write_addr_ofs = img.ivt_offset
@@ -535,7 +498,7 @@ def _burn_image_to_flash(
     # ### Erase memory before writing image ###
     # call "%blhost%" -u 0x15A2,0x0073 -j -- flash-erase-region 0x60000000 21000 9
     size = align(len(img_data) + write_addr_ofs, 0x1000)
-    assert mboot.flash_erase_region(EXT_FLASH_ADDR, size, ExtMemId.FLEX_SPI_NOR)
+    assert mboot.flash_erase_region(EXT_FLASH_ADDR, size, ExtMemId.FLEX_SPI_NOR.tag)
 
     if not img.fcb.enabled or isinstance(img.fcb, PaddingFCB):  # FCB not part of the image
         # ### Use tag 0xF000000F to notify Flashloader to program FlexSPI NOR config block to the start of device###
@@ -543,9 +506,9 @@ def _burn_image_to_flash(
         assert mboot.fill_memory(INT_RAM_ADDR_DATA, 4, FCB_FLASH_NOR_CFG_WORD)
         # ### Program configuration block ###
         # call "%blhost%" -u 0x15A2,0x0073 -j -- configure-memory 9 0x3000
-        assert mboot.configure_memory(INT_RAM_ADDR_DATA, ExtMemId.FLEX_SPI_NOR)
+        assert mboot.configure_memory(INT_RAM_ADDR_DATA, ExtMemId.FLEX_SPI_NOR.tag)
         # read flex_spi.fcb
-        mem = mboot.read_memory(EXT_FLASH_ADDR, 512, ExtMemId.FLEX_SPI_NOR)
+        mem = mboot.read_memory(EXT_FLASH_ADDR, 512, ExtMemId.FLEX_SPI_NOR.tag)
         with open(os.path.join(cpu_params.data_dir, "flex_spi.fcb"), "wb") as f:
             f.write(mem)
 
@@ -566,7 +529,7 @@ def _burn_image_to_flash(
         blob = mboot.generate_key_blob(img.dek_key)
         tgt_address = EXT_FLASH_ADDR + img.dek_img_offset
         # call "blhost" -u 0x15A2,0x0073 -j -- write-memory 0x60008000 blob.bin 9
-        assert mboot.write_memory(tgt_address, blob, ExtMemId.FLEX_SPI_NOR)
+        assert mboot.write_memory(tgt_address, blob, ExtMemId.FLEX_SPI_NOR.tag)
 
     if AUTHENTICATE and (img.address == EXT_FLASH_ADDR) and not otpmk_bee_regions:
         mboot.close()
@@ -575,10 +538,10 @@ def _burn_image_to_flash(
     else:
         # detect XIP image
         app_data = img.decrypted_app_data
-        initial_pc = int.from_bytes(app_data[4:8], byteorder="little")
+        initial_pc = int.from_bytes(app_data[4:8], byteorder=Endianness.LITTLE.value)
         if img.address == EXT_FLASH_ADDR:  # if XIP
             # run XIP image immediately
-            stack_ptr = int.from_bytes(app_data[:4], byteorder="little")
+            stack_ptr = int.from_bytes(app_data[:4], byteorder=Endianness.LITTLE.value)
             assert mboot.execute(initial_pc, EXT_FLASH_ADDR + img.ivt_offset, stack_ptr)
 
         mboot.close()
@@ -588,7 +551,7 @@ def write_image(
     cpu_params: CpuParams,
     image_file_name: str,
     img: BootImgRT,
-    otpmk_bee_regions: Tuple[BeeFacRegion, ...] = tuple(),
+    otpmk_bee_regions: tuple[BeeFacRegion, ...] = tuple(),
 ) -> None:
     """Write image to the external flash
     The method behavior depends on TEST_IMG_CONTENT:
@@ -601,14 +564,12 @@ def write_image(
     :param otpmk_bee_regions: optional list of BEE regions for BEE OTPMK encryption
     """
     path = os.path.join(cpu_params.data_dir, OUTPUT_IMAGES_SUBDIR, image_file_name)
-    debug_info = DebugInfo()
     # use zulu datetime for test purposes only, to produce stable output; remove the parameter for production
     zulu = datetime(year=2020, month=4, day=8, hour=5, minute=54, second=33, tzinfo=timezone.utc)
-    img_data = img.export(dbg_info=debug_info, zulu=zulu)
+    img_data = img.export(zulu=zulu)
     assert len(img_data) == img.size
-    write_dbg_log(cpu_params.data_dir, image_file_name, debug_info.lines, TEST_IMG_CONTENT)
     if TEST_IMG_CONTENT:
-        assert img.info()  # quick check info prints non-empty output
+        assert str(img)  # quick check info prints non-empty output
         compare_bin_files(path, img_data)
         # compare no-padding
         if (
@@ -655,25 +616,19 @@ def write_sb(cpu_params: CpuParams, image_file_name: str, img: SecureBootV1) -> 
     :param img: image instance to be written
     """
     path = os.path.join(cpu_params.data_dir, OUTPUT_IMAGES_SUBDIR, image_file_name)
-    dbg_info = DebugInfo()
     img_data = img.export(
-        dbg_info=dbg_info,
         # use the following parameters only for unit test
         header_padding8=b"\xdb\x00\x76\x7a\xf4\x81\x0b\x86",
         auth_padding=b"\x36\x72\xf4\x99\x92\x05\x34\xd2\xd5\x17\xa0\xf7",
     )
-    write_dbg_log(cpu_params.data_dir, image_file_name, dbg_info.lines, TEST_IMG_CONTENT)
     if TEST_IMG_CONTENT:
-        assert img.info()  # quick check info prints non-empty output
+        assert str(img)  # quick check info prints non-empty output
         compare_bin_files(path, img_data)
-        img = SecureBootV1.parse(b"0" + img_data, 1)
-        dbg_info2 = DebugInfo()
+        img = SecureBootV1.parse((b"0" + img_data)[1:])
         img_data2 = img.export(
-            dbg_info=dbg_info2,
             header_padding8=b"\xdb\x00\x76\x7a\xf4\x81\x0b\x86",
             auth_padding=b"\x36\x72\xf4\x99\x92\x05\x34\xd2\xd5\x17\xa0\xf7",
         )
-        assert dbg_info.lines == dbg_info2.lines
         assert img_data == img_data2
     else:
         with open(path, "wb") as f:
@@ -726,22 +681,6 @@ def test_unsigned(
 
     # write image to disk and to processor
     write_image(cpu_params, image_name + "_unsigned.bin", boot_img)
-
-
-def test_hab_audit(cpu_params: CpuParams) -> None:
-    """Authenticate the application, load HAB log and parse.
-
-    :param cpu_params: processor specific parameters of the test"""
-    if TEST_IMG_CONTENT:
-        return  # this can be used only in production mode
-
-    mboot = init_flashloader(cpu_params)
-    # TODO: repair getting cpu_data
-    cpu_data = CpuDataMapper[cpu_params.id]
-    hab_audit_log.hab_audit_xip_app(cpu_data, mboot, read_log_only=True)
-    # authenticate the application and read all HAB logs
-    hab_audit_log.hab_audit_xip_app(cpu_data, mboot, read_log_only=False)
-    mboot.close()
 
 
 @pytest.mark.parametrize("fcb", [True, False])
@@ -799,6 +738,9 @@ def test_signed(cpu_params: CpuParams, srk_key_index: int) -> None:
     :param cpu_params: processor specific parameters of the test
     :param srk_key_index: index of the SRK key used
     """
+    if not cpu_params.xip_signature_supported:
+        pytest.skip("Unsupported configuration")
+
     image_name = f"{cpu_params.board}_iled_blinky_ext_FLASH"
     tgt_address = EXT_FLASH_ADDR
 
@@ -814,6 +756,9 @@ def test_signed_flashloader(cpu_params: CpuParams) -> None:
     :param cpu_params: processor specific parameters of the test
     """
     assert TEST_IMG_CONTENT  # this should be used in test mode only to verify the flashloader image creation process
+
+    if not cpu_params.none_xip_signature_supported:
+        pytest.skip("Unsupported configuration")
 
     image_name = "ivt_flashloader"
     tgt_address = INT_RAM_ADDR_CODE
@@ -875,37 +820,27 @@ def test_generate_csf_img(
     out_name = cert_name_prefix + str(srk_key_index) + "_" + str(cert_index) + base_key_name + "usr"
     out_key_path = os.path.join(cpu_params.keys_data_dir, out_name + "_key")
     # generate private key
-    gen_priv_key = generate_rsa_private_key(key_size=key_size)
-    save_rsa_private_key(
-        gen_priv_key, out_key_path + ".pem", password=PRIV_KEY_PASSWORD, encoding=Encoding.PEM
-    )
-    save_rsa_private_key(
-        gen_priv_key, out_key_path + ".der", password=PRIV_KEY_PASSWORD, encoding=Encoding.DER
-    )
+    gen_priv_key = PrivateKeyRsa.generate_key(key_size=key_size)
+    gen_priv_key.save(out_key_path + ".pem", password=PRIV_KEY_PASSWORD, encoding=SPSDKEncoding.PEM)
+    gen_priv_key.save(out_key_path + ".der", password=PRIV_KEY_PASSWORD, encoding=SPSDKEncoding.DER)
     # generate public key
-    gen_pub_key = generate_rsa_public_key(gen_priv_key)
+    gen_pub_key = gen_priv_key.get_public_key()
     # load private key of the issuer (SRK)
-    srk_priv_key = load_pem_private_key(
-        load_binary(os.path.join(cpu_params.keys_data_dir, srk_name + "_key.pem")),
+    srk_priv_key = PrivateKeyRsa.load(
+        os.path.join(cpu_params.keys_data_dir, srk_name + "_key.pem"),
         password=PRIV_KEY_PASSWORD,
-        backend=default_backend(),
     )
     # generate certificate
-    gen_cert = generate_certificate(
+    gen_cert = Certificate.generate_certificate(
         x509_common_name(out_name),
         x509_common_name(srk_name),
         gen_pub_key,
         srk_priv_key,
         serial_number=0x199999A7,
-        if_ca=False,
         duration=3560,
     )
-    save_crypto_item(
-        gen_cert, os.path.join(cpu_params.cert_data_dir, out_name + "_crt.pem"), Encoding.PEM
-    )
-    save_crypto_item(
-        gen_cert, os.path.join(cpu_params.cert_data_dir, out_name + "_crt.der"), Encoding.DER
-    )
+    gen_cert.save(os.path.join(cpu_params.cert_data_dir, out_name + "_crt.pem"), SPSDKEncoding.PEM)
+    gen_cert.save(os.path.join(cpu_params.cert_data_dir, out_name + "_crt.der"), SPSDKEncoding.DER)
 
 
 # ####################################################################################
@@ -915,6 +850,9 @@ def test_hab_encrypted(cpu_params: CpuParams) -> None:
     """Test HAB encrypted image.
     :param cpu_params: processor specific parameters of the test
     """
+    if not cpu_params.encryption_supported:
+        pytest.skip("Unsupported configuration")
+
     image_name = f"{cpu_params.board}_iled_blinky_int_RAM"
     tgt_address = INT_RAM_ADDR_CODE
     srk_key_index = 0
@@ -922,7 +860,7 @@ def test_hab_encrypted(cpu_params: CpuParams) -> None:
     app_data = load_binary(os.path.join(cpu_params.data_dir, image_name + ".bin"))
     # Encryption params (nonce + dek): use only for test purpose, for production use None
     nonce = bytes.fromhex("24eb311ce02a61d74cad460739")
-    dek = load_binary(os.path.join(cpu_params.rt10xx_data_dir, f"hab_dek.bin"))
+    dek = load_binary(os.path.join(cpu_params.rt10xx_data_dir, "hab_dek.bin"))
     #
     boot_img = BootImgRT(tgt_address)
     _to_authenticated_image(cpu_params, boot_img, app_data, srk_key_index, -1, dek, nonce)
@@ -1010,19 +948,23 @@ def test_sb(cpu_params: CpuParams) -> None:
     # load 0xc0233007 > 0x2000;
     sect.append(
         CmdFill(
-            INT_RAM_ADDR_DATA, int.from_bytes(pack("<I", cpu_params.ext_flash_cfg_word0), "little")
+            INT_RAM_ADDR_DATA,
+            int.from_bytes(pack("<I", cpu_params.ext_flash_cfg_word0), Endianness.LITTLE.value),
         )
     )
     # enable flexspinor 0x2000;
-    sect.append(CmdMemEnable(INT_RAM_ADDR_DATA, 4, ExtMemId.FLEX_SPI_NOR))
+    sect.append(CmdMemEnable(INT_RAM_ADDR_DATA, 4, ExtMemId.FLEX_SPI_NOR.tag))
     # erase 0x60000000..0x60100000;
     sect.append(CmdErase(EXT_FLASH_ADDR, align(boot_img.ivt_offset + boot_img.size, 0x1000)))
     # load 0xf000000f > 0x3000;
     sect.append(
-        CmdFill(INT_RAM_ADDR_DATA, int.from_bytes(pack("<I", FCB_FLASH_NOR_CFG_WORD), "little"))
+        CmdFill(
+            INT_RAM_ADDR_DATA,
+            int.from_bytes(pack("<I", FCB_FLASH_NOR_CFG_WORD), Endianness.LITTLE.value),
+        )
     )
     # enable flexspinor 0x3000;
-    sect.append(CmdMemEnable(INT_RAM_ADDR_DATA, 4, ExtMemId.FLEX_SPI_NOR))
+    sect.append(CmdMemEnable(INT_RAM_ADDR_DATA, 4, ExtMemId.FLEX_SPI_NOR.tag))
     # load myBinFile > kAbsAddr_Ivt;
     app_data = align_block(
         app_data, 0x10
@@ -1059,21 +1001,25 @@ def test_sb_multiple_sections(cpu_params: CpuParams) -> None:
     # load 0xc0233007 > 0x2000;
     sect.append(
         CmdFill(
-            INT_RAM_ADDR_DATA, int.from_bytes(pack("<I", cpu_params.ext_flash_cfg_word0), "little")
+            INT_RAM_ADDR_DATA,
+            int.from_bytes(pack("<I", cpu_params.ext_flash_cfg_word0), Endianness.LITTLE.value),
         )
     )
     # enable flexspinor 0x2000;
-    sect.append(CmdMemEnable(INT_RAM_ADDR_DATA, 4, ExtMemId.FLEX_SPI_NOR))
+    sect.append(CmdMemEnable(INT_RAM_ADDR_DATA, 4, ExtMemId.FLEX_SPI_NOR.tag))
     # erase 0x60000000..0x60010000;
     # Note: erasing of long flash region may fail on timeout
     # For example this fails on EVK-RT1060: sect.append(CmdErase(EXT_FLASH_ADDR, 0x100000))
     sect.append(CmdErase(EXT_FLASH_ADDR, 0x10000))
     # load 0xf000000f > 0x3000;
     sect.append(
-        CmdFill(INT_RAM_ADDR_DATA, int.from_bytes(pack("<I", FCB_FLASH_NOR_CFG_WORD), "little"))
+        CmdFill(
+            INT_RAM_ADDR_DATA,
+            int.from_bytes(pack("<I", FCB_FLASH_NOR_CFG_WORD), Endianness.LITTLE.value),
+        )
     )
     # enable flexspinor 0x3000;
-    sect.append(CmdMemEnable(INT_RAM_ADDR_DATA, 4, ExtMemId.FLEX_SPI_NOR))
+    sect.append(CmdMemEnable(INT_RAM_ADDR_DATA, 4, ExtMemId.FLEX_SPI_NOR.tag))
     # load myBinFile > kAbsAddr_Ivt;
     app_data += b"\xdc\xe8\x6d\x5d\xe9\x8c\xf5\x7c"  # this is random padding fixed for the test, not use for production
     sect.append(CmdLoad(EXT_FLASH_ADDR + boot_img.ivt_offset, app_data))

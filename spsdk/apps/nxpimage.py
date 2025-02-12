@@ -1,51 +1,109 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2022-2023 NXP
+# Copyright 2022-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
 """NXP MCU Image tool."""
+import datetime
 import logging
 import os
 import sys
 from binascii import unhexlify
-from typing import List, Optional
+from typing import Optional
 
 import click
 
-from spsdk.apps.utils.common_cli_options import CommandsTreeGroup, spsdk_apps_common_options
-from spsdk.apps.utils.utils import INT, SPSDKAppError, catch_spsdk_error, get_key, store_key
+from spsdk.apps.utils import spsdk_logger
+from spsdk.apps.utils.common_cli_options import (
+    CommandsTreeGroup,
+    SpsdkClickGroup,
+    spsdk_apps_common_options,
+    spsdk_config_option,
+    spsdk_family_option,
+    spsdk_output_option,
+    spsdk_plugin_option,
+    spsdk_revision_option,
+)
+from spsdk.apps.utils.utils import (
+    INT,
+    SPSDKAppError,
+    catch_spsdk_error,
+    filepath_from_config,
+    store_key,
+)
+from spsdk.crypto.crypto_types import SPSDKEncoding
+from spsdk.crypto.signature_provider import get_signature_provider
 from spsdk.exceptions import SPSDKError
-from spsdk.image import SB3_SCH_FILE, TrustZone, get_mbi_class
-from spsdk.image.ahab.ahab_container import AHABImage
-from spsdk.image.ahab.signed_msg import SignedMessage
+from spsdk.image.ahab.ahab_certificate import AhabCertificate
+from spsdk.image.ahab.ahab_data import AhabTargetMemory, FlagsSrkSet
+from spsdk.image.ahab.ahab_image import AHABImage
+from spsdk.image.ahab.signed_msg import MessageCommands, SignedMessage, SignedMessageContainer
+from spsdk.image.ahab.utils import (
+    ahab_re_sign,
+    ahab_sign_image,
+    ahab_update_keyblob,
+    write_ahab_fuses,
+)
+from spsdk.image.bca.bca import BCA
 from spsdk.image.bee import BeeNxp
-from spsdk.image.bootable_image.bimg import BootableImage, get_bimg_class
+from spsdk.image.bootable_image.bimg import BootableImage
 from spsdk.image.fcb.fcb import FCB
+from spsdk.image.fcf.fcf import FCF
+from spsdk.image.hab import segments as hab_segments
+from spsdk.image.hab.hab_container import HabContainer
 from spsdk.image.keystore import KeyStore
-from spsdk.image.mbimg import mbi_generate_config_templates, mbi_get_supported_families
-from spsdk.image.xmcd.xmcd import XMCD
+from spsdk.image.mbi.mbi import (
+    MasterBootImage,
+    get_mbi_class,
+    mbi_generate_config_templates,
+    mbi_get_supported_families,
+)
+from spsdk.image.mem_type import MemoryType
+from spsdk.image.trustzone import TrustZone
+from spsdk.image.wic import replace_uboot
+from spsdk.image.xmcd.xmcd import XMCD, ConfigurationBlockType
+from spsdk.lpcprog.protocol import LPCProgCRPLevels
+from spsdk.lpcprog.utils import lpcprog_make_image_bootable, lpcprog_update_crp_value
+from spsdk.sbfile.sb2 import sly_bd_parser as bd_parser
 from spsdk.sbfile.sb2.commands import CmdLoad
-from spsdk.sbfile.sb2.images import BootImageV21, generate_SB21
+from spsdk.sbfile.sb2.images import BootImageV21
 from spsdk.sbfile.sb31.images import SecureBinary31
-from spsdk.utils.crypto.cert_blocks import CertBlockV2
+from spsdk.utils.crypto.cert_blocks import CertBlock, CertBlockV1, CertBlockVx, IskCertificateLite
 from spsdk.utils.crypto.iee import IeeNxp
 from spsdk.utils.crypto.otfad import OtfadNxp
+from spsdk.utils.database import DatabaseManager
 from spsdk.utils.images import BinaryImage, BinaryPattern
 from spsdk.utils.misc import (
+    Endianness,
     align,
     align_block,
     get_abs_path,
+    get_printable_path,
     load_binary,
     load_configuration,
+    load_hex_string,
     load_text,
     value_to_int,
     write_file,
 )
-from spsdk.utils.schema_validator import ConfigTemplate, ValidationSchemas, check_config
+from spsdk.utils.plugins import load_plugin_from_source
+from spsdk.utils.schema_validator import CommentedConfig, check_config
+from spsdk.utils.verifier import Verifier, VerifierResult
 
 logger = logging.getLogger(__name__)
+
+
+def print_verifier_to_console(v: Verifier, problems: bool = False) -> None:
+    """Print verifier results to console."""
+    results = None
+    if problems:
+        results = [VerifierResult.WARNING, VerifierResult.ERROR]
+    click.echo(v.draw(results))
+
+    click.echo("Summary table of verifier results:\n" + v.get_summary_table() + "\n")
+    click.echo("Overall  result: " + VerifierResult.draw(v.result))
 
 
 @click.group(name="nxpimage", no_args_is_help=True, cls=CommandsTreeGroup)
@@ -56,81 +114,122 @@ def main(log_level: int) -> None:
     Manage various kinds of images for NXP parts.
     It's successor of obsolete ELFTOSB tool.
     """
-    logging.basicConfig(level=log_level or logging.WARNING)
+    spsdk_logger.install(level=log_level)
 
 
-@main.group(name="mbi", no_args_is_help=True)
+@main.group(name="mbi", no_args_is_help=True, cls=SpsdkClickGroup)
 def mbi_group() -> None:
     """Group of sub-commands related to Master Boot Images."""
 
 
 @mbi_group.command(name="export", no_args_is_help=True)
-@click.argument("config", type=click.Path(exists=True, readable=True))
-def mbi_export_command(config: str) -> None:
+@spsdk_config_option(required=True)
+@spsdk_plugin_option
+def mbi_export_command(config: str, plugin: str) -> None:
     """Generate Master Boot Image from YAML/JSON configuration.
-
-    CONFIG is path to the YAML/JSON configuration
 
     The configuration template files could be generated by subcommand 'get-templates'.
     """
-    mbi_export(config)
+    mbi_export(config, plugin)
 
 
-def mbi_export(config: str) -> None:
-    """Generate Master Boot Image from YAML/JSON configuration."""
+def mbi_export(config: str, plugin: Optional[str] = None) -> None:
+    """Generate Master Boot Image from YAML/JSON configuration.
+
+    :param config: Path to the YAML/JSON configuration
+    :param plugin: Path to external python file containing a custom SignatureProvider implementation.
+    """
     config_data = load_configuration(config)
+    if plugin:
+        load_plugin_from_source(plugin)
     config_dir = os.path.dirname(config)
     mbi_cls = get_mbi_class(config_data)
-    check_config(config_data, mbi_cls.get_validation_schemas(), search_paths=[config_dir])
+    check_config(config_data, mbi_cls.get_validation_schemas_family())
+    check_config(
+        config_data,
+        mbi_cls.get_validation_schemas(config_data["family"]),
+        search_paths=[config_dir, "."],
+    )
     mbi_obj = mbi_cls()
-    mbi_obj.load_from_config(config_data, search_paths=[config_dir])
-    mbi_data = mbi_obj.export()
-
+    mbi_obj.load_from_config(config_data, search_paths=[config_dir, "."])
+    mbi_data = mbi_obj.export_image()
+    if mbi_obj.rkth:
+        click.echo(f"RKTH: {mbi_obj.rkth.hex()}")
     mbi_output_file_path = get_abs_path(config_data["masterBootOutputFile"], config_dir)
-    write_file(mbi_data, mbi_output_file_path, mode="wb")
+    logger.info(mbi_data.draw())
 
-    click.echo(f"Success. (Master Boot Image: {mbi_output_file_path} created.)")
+    write_file(mbi_data.export(), mbi_output_file_path, mode="wb")
+
+    click.echo(f"Success. (Master Boot Image: {get_printable_path(mbi_output_file_path)} created.)")
+
+
+@mbi_group.command(name="parse", no_args_is_help=True)
+@spsdk_family_option(families=mbi_get_supported_families())
+@spsdk_revision_option
+@click.option(
+    "-b",
+    "--binary",
+    type=click.Path(exists=True, readable=True, resolve_path=True),
+    required=True,
+    help="Path to binary MBI image to parse.",
+)
+@click.option(
+    "-k",
+    "--dek",
+    type=str,
+    required=False,
+    help=(
+        "Data encryption key, if it's specified, the parse method tries decrypt all encrypted images. "
+        "It could be specified as binary/HEX text file path or directly HEX string"
+    ),
+)
+@spsdk_output_option(directory=True)
+def mbi_parse_command(family: str, revision: str, binary: str, dek: str, output: str) -> None:
+    """Parse MBI Image into YAML configuration and binary images."""
+    mbi_parse(family, revision, binary, dek, output)
+
+
+def mbi_parse(family: str, revision: str, binary: str, dek: str, output: str) -> None:
+    """Parse MBI Image into YAML configuration and binary images."""
+    mbi = MasterBootImage.parse(family=family, data=load_binary(binary), dek=dek, revision=revision)
+
+    if not mbi:
+        click.echo(f"Failed. (MBI: {binary} parsing failed.)")
+        return
+
+    cfg = mbi.create_config(output_folder=output)
+    yaml_data = CommentedConfig(
+        main_title=(
+            f"Master Boot Image ({mbi.__class__.__name__}) recreated configuration from :"
+            f"{datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')}."
+        ),
+        schemas=mbi.get_validation_schemas(family),
+    ).get_config(cfg)
+
+    write_file(yaml_data, os.path.join(output, "mbi_config.yaml"))
+
+    click.echo(f"Success. (MBI: {binary} has been parsed and stored into {output} )")
 
 
 @mbi_group.command(name="get-templates", no_args_is_help=True)
-@click.option(
-    "-f",
-    "--chip-family",
-    default="lpc55s3x",
-    type=click.Choice(mbi_get_supported_families(), case_sensitive=False),
-    required=True,
-    help="Select the chip family.",
-)
-@click.option(
-    "-o",
-    "--overwrite",
-    default=False,
-    type=bool,
-    is_flag=True,
-    help="Allow overwriting existing template file.",
-)
-@click.argument("output", type=click.Path())
-def mbi_get_templates_command(chip_family: str, overwrite: bool, output: str) -> None:
-    """Create template of MBI configurations in YAML format.
-
-    The path for template files is specified as argument of this command.
-    """
-    mbi_get_templates(chip_family, overwrite, output)
-
-
-def mbi_get_templates(chip_family: str, overwrite: bool, output: str) -> None:
+@spsdk_family_option(families=mbi_get_supported_families())
+@spsdk_revision_option
+@spsdk_output_option(directory=True, force=True)
+def mbi_get_templates_command(family: str, revision: str, output: str) -> None:
     """Create template of MBI configurations in YAML format."""
-    templates = mbi_generate_config_templates(chip_family)
+    mbi_get_templates(family, revision, output)
+
+
+def mbi_get_templates(family: str, revision: str, output: str) -> None:
+    """Create template of MBI configurations in YAML format."""
+    templates = mbi_generate_config_templates(family, revision)
     for file_name, template in templates.items():
-        full_file_name = os.path.join(output, file_name + ".yml")
-        if not os.path.isfile(full_file_name) or overwrite:
-            click.echo(f"Creating {full_file_name} template file.")
-            write_file(template, full_file_name)
-        else:
-            click.echo(f"Skip creating {full_file_name}, this file already exists.")
+        full_file_name = os.path.join(output, file_name + ".yaml")
+        click.echo(f"Creating {get_printable_path(full_file_name)} template file.")
+        write_file(template, full_file_name)
 
 
-@main.group(name="sb21", no_args_is_help=True)
+@main.group(name="sb21", no_args_is_help=True, cls=SpsdkClickGroup)
 def sb21_group() -> None:
     """Group of sub-commands related to Secure Binary 2.1."""
 
@@ -139,14 +238,234 @@ def sb21_group() -> None:
 @click.option(
     "-c",
     "--command",
-    type=click.Path(exists=True),
-    help="BD configuration file to produce secure binary v2.x",
+    type=click.Path(exists=True, resolve_path=True),
+    required=True,
+    help="BD or YAML configuration file to produce secure binary v2.x",
 )
-@click.option("-o", "--output", type=click.Path(), help="Output file path.")
+@spsdk_output_option(required=False)
 @click.option(
     "-k", "--key", type=click.Path(exists=True), help="Add a key file and enable encryption."
 )
-@click.option("-s", "--pkey", type=click.Path(exists=True), help="Path to private key for signing.")
+@click.option(
+    "-s",
+    "--pkey",
+    type=str,
+    help="Path to private key or signature provider configuration used for signing.",
+)
+@click.option(
+    "-S",
+    "--cert",
+    type=click.Path(exists=True),
+    multiple=True,
+    help="Path to certificate files for signing. The first certificate will be \
+the self signed root key certificate.",
+)
+@click.option(
+    "-R",
+    "--root-key-cert",
+    type=click.Path(exists=True),
+    multiple=True,
+    help="Path to root key certificate file(s) for verifying other certificates. \
+Only 4 root key certificates are allowed, others are ignored. \
+One of the certificates must match the first certificate passed \
+with -S/--cert arg.",
+)
+@click.option(
+    "-h",
+    "--hash-of-hashes",
+    type=click.Path(),
+    help="Path to output hash of hashes of root keys. If argument is not \
+provided, then by default the tool creates hash.bin in the working directory.",
+)
+@spsdk_plugin_option
+@click.argument("external", type=click.Path(), nargs=-1)
+def sb21_export_command(
+    command: str,
+    output: Optional[str] = None,
+    key: Optional[str] = None,
+    pkey: Optional[str] = None,
+    cert: Optional[list[str]] = None,
+    root_key_cert: Optional[list[str]] = None,
+    hash_of_hashes: Optional[str] = None,
+    plugin: Optional[str] = None,
+    external: Optional[list[str]] = None,
+) -> None:
+    """Generate Secure Binary v2.1 Image from configuration.
+
+    EXTERNAL is a space separated list of external binary files defined in BD file
+    """
+    sb21_export(command, output, key, pkey, cert, root_key_cert, hash_of_hashes, plugin, external)
+
+
+def sb21_export(
+    command: str,
+    output: Optional[str] = None,
+    key: Optional[str] = None,
+    pkey: Optional[str] = None,
+    cert: Optional[list[str]] = None,
+    root_key_cert: Optional[list[str]] = None,
+    hash_of_hashes: Optional[str] = None,
+    plugin: Optional[str] = None,
+    external: Optional[list[str]] = None,
+) -> None:
+    """Generate Secure Binary v2.1 Image from configuration (BD or YAML)."""
+    if plugin:
+        load_plugin_from_source(plugin)
+    signature_provider = None
+    if pkey:
+        signature_provider = (
+            get_signature_provider(local_file_key=pkey)
+            if os.path.isfile(pkey)
+            else get_signature_provider(sp_cfg=pkey)
+        )
+    config_dir = os.path.dirname(command)
+    try:
+        parsed_config = BootImageV21.parse_sb21_config(command, external_files=external)
+        if not output:
+            output = get_abs_path(parsed_config["containerOutputFile"], config_dir)
+        sb2 = BootImageV21.load_from_config(
+            config=parsed_config,
+            key_file_path=key,
+            signature_provider=signature_provider,
+            signing_certificate_file_paths=cert,
+            root_key_certificate_paths=root_key_cert,
+            rkth_out_path=hash_of_hashes,
+            search_paths=[config_dir],
+        )
+        write_file(sb2.export(), output, mode="wb")
+    except (SPSDKError, KeyError) as exc:
+        raise SPSDKAppError(f"The SB2.1 file generation failed: ({str(exc)}).") from exc
+    if sb2.cert_block:
+        click.echo(f"RKTH: {sb2.cert_block.rkth.hex()}")
+    click.echo(f"Success. (Secure binary 2.1: {get_printable_path(output)} created.)")
+
+
+@sb21_group.command(name="parse", no_args_is_help=True)
+@click.option(
+    "-b",
+    "--binary",
+    type=click.Path(exists=True, readable=True, resolve_path=True),
+    required=True,
+    help="Path to the SB2 container that would be parsed.",
+)
+@click.option(
+    "-k",
+    "--key",
+    type=click.Path(exists=True, readable=True),
+    required=True,
+    help="Key file for SB2 decryption in plaintext",
+)
+@spsdk_output_option(directory=True)
+def sb21_parse_command(binary: str, key: str, output: str) -> None:
+    """Parse Secure Binary v2.1 Image."""
+    sb21_parse(binary, key, output)
+
+
+def sb21_parse(binary: str, key: str, output: str) -> None:
+    """Parse Secure Binary v2.1 Image."""
+    # transform text-based KEK into bytes
+    sb_kek = unhexlify(load_text(key))
+
+    try:
+        parsed_sb = BootImageV21.parse(data=load_binary(binary), kek=sb_kek)
+    except SPSDKError as exc:
+        raise SPSDKAppError(f"SB21 parse: Attempt to parse image failed: {str(exc)}") from exc
+
+    if isinstance(parsed_sb.cert_block, CertBlockV1):
+        for cert_idx, certificate in enumerate(parsed_sb.cert_block.certificates):
+            file_name = os.path.join(output, f"certificate_{cert_idx}_der.cer")
+            logger.debug(f"Dumping certificate {file_name}")
+            write_file(certificate.export(SPSDKEncoding.DER), file_name, mode="wb")
+
+    for section_idx, boot_sections in enumerate(parsed_sb.boot_sections):
+        for command_idx, command in enumerate(boot_sections._commands):
+            if isinstance(command, CmdLoad):
+                file_name = os.path.join(
+                    output, f"section_{section_idx}_load_command_{command_idx}_data.bin"
+                )
+                logger.debug(f"Dumping load command data {file_name}")
+                write_file(command.data, file_name, mode="wb")
+
+    logger.debug(str(parsed_sb))
+    write_file(
+        str(parsed_sb),
+        os.path.join(output, "parsed_info.txt"),
+    )
+    click.echo(f"Success. (SB21: {binary} has been parsed and stored into {output}.)")
+    click.echo(
+        "Please note that the exported binary images from load command might contain padding"
+    )
+
+
+@sb21_group.command(name="get-sbkek", no_args_is_help=False)
+@click.option(
+    "-k",
+    "--master-key",
+    type=str,
+    help="AES-256 master key as hexadecimal string or path to file containing key in plain text or in binary",
+)
+@spsdk_output_option(
+    required=False,
+    directory=True,
+    help="Output folder where the sbkek.txt and sbkek.bin will be stored",
+)
+def get_sbkek_command(master_key: str, output: str) -> None:
+    """Compute SBKEK (AES-256) value and optionally store it as plain text and as binary.
+
+    SBKEK is AES-256 symmetric key used for encryption and decryption of SB.
+    Plain text version is used for SB generation.
+    Binary format is to be written to the keystore.
+    The same format is also used for USER KEK.
+
+    For OTP, the SBKEK is derived from OTP master key:
+    SB2_KEK = AES256(OTP_MASTER_KEY,
+    03000000_00000000_00000000_00000000_04000000_00000000_00000000_00000000)
+
+    Master key is not needed when using PUF as key storage
+
+    The computed SBKEK is shown as hexadecimal text on STDOUT,
+    SBKEK is stored in plain text and in binary if the 'output-folder' is specified,
+    """
+    get_sbkek(master_key, output)
+
+
+def get_sbkek(master_key: str, output_folder: str) -> None:
+    """Compute SBKEK (AES-256) value and optionally store it as plain text and as binary."""
+    otp_master_key = load_hex_string(master_key, KeyStore.OTP_MASTER_KEY_SIZE)
+    sbkek = KeyStore.derive_sb_kek_key(otp_master_key)
+
+    click.echo(f"SBKEK: {sbkek.hex()}")
+    click.echo(f"(OTP) MASTER KEY: {otp_master_key.hex()}")
+
+    if output_folder:
+        store_key(os.path.join(output_folder, "sbkek"), sbkek, reverse=True)
+        store_key(os.path.join(output_folder, "otp_master_key"), otp_master_key)
+        click.echo(f"Keys have been stored to: {get_printable_path(output_folder)}")
+
+
+@sb21_group.command(name="convert", no_args_is_help=False)
+@spsdk_family_option(families=BootImageV21.get_supported_families(), required=True)
+@spsdk_output_option(help="Path to converted YAML configuration")
+@click.option(
+    "-c",
+    "--command",
+    type=click.Path(resolve_path=True, exists=True),
+    help="Path to BD file that will be converted to YAML",
+    required=True,
+)
+@click.option(
+    "-k",
+    "--key",
+    type=click.Path(exists=True),
+    help="Add a key file and enable encryption.",
+    required=True,
+)
+@click.option(
+    "-s",
+    "--pkey",
+    type=str,
+    help="Path to private key or signature provider configuration used for signing.",
+)
 @click.option(
     "-S",
     "--cert",
@@ -173,237 +492,403 @@ with -S/--cert arg.",
 provided, then by default the tool creates hash.bin in the working directory.",
 )
 @click.argument("external", type=click.Path(), nargs=-1)
-def sb21_export_command(
+def convert_bd(
     command: str,
     output: str,
     key: str,
     pkey: str,
-    cert: List[str],
-    root_key_cert: List[str],
+    cert: list[str],
+    root_key_cert: list[str],
     hash_of_hashes: str,
-    external: List[str],
+    external: list[str],
+    family: str,
 ) -> None:
-    """Generate Secure Binary v2.1 Image from configuration.
+    """Convert SB 2.1 BD file to YAML."""
+    convert_bd_conf(
+        command, output, key, pkey, cert, root_key_cert, hash_of_hashes, external, family
+    )
 
-    EXTERNAL is a space separated list of external binary files defined in BD file
-    """
-    sb21_export(command, output, key, pkey, cert, root_key_cert, hash_of_hashes, external)
 
-
-def sb21_export(
+def convert_bd_conf(
     command: str,
-    output: str,
+    output_conf: str,
     key: str,
     pkey: str,
-    cert: List[str],
-    root_key_cert: List[str],
+    cert: list[str],
+    root_key_cert: list[str],
     hash_of_hashes: str,
-    external: List[str],
+    external: list[str],
+    family: str,
 ) -> None:
-    """Generate Secure Binary v2.1 Image from configuration."""
-    if output is None:
-        raise SPSDKAppError("Error: no output file was specified")
-    try:
-        sb2_data = generate_SB21(
-            bd_file_path=command,
-            key_file_path=key,
-            private_key_file_path=pkey,
-            signing_certificate_file_paths=cert,
-            root_key_certificate_paths=root_key_cert,
-            hoh_out_path=hash_of_hashes,
-            external_files=external,
-        )
-        write_file(sb2_data, output, mode="wb")
-    except SPSDKError as exc:
-        raise SPSDKAppError(f"The SB2.1 file generation failed: ({str(exc)}).") from exc
-    else:
-        click.echo(f"Success. (Secure binary 2.1: {output} created.)")
+    """Convert SB 2.1 BD file to YAML."""
+    config = BootImageV21.parse_sb21_config(command, external_files=external)
+    cert_config = {}
+    for idx, root_cert in enumerate(root_key_cert):
+        cert_config[f"rootCertificate{idx}File"] = root_cert
+        for crt in cert:
+            if root_cert == crt:
+                cert_config["mainRootCertId"] = idx  # type: ignore[assignment]
+    cert_config["imageBuildNumber"] = config["options"].pop("buildNumber")
+    config["signPrivateKey"] = pkey
+    if key:
+        config["containerKeyBlobEncryptionKey"] = key
+    if hash_of_hashes:
+        config["RKHTOutputPath"] = hash_of_hashes
 
+    config["containerOutputFile"] = "output.sb"
+    cert_block_file = "cert_block.yaml"
+    config["certBlock"] = cert_block_file
+    config["family"] = family
 
-@sb21_group.command(name="parse")
-@click.option(
-    "-b",
-    "--binary",
-    type=click.Path(exists=True, readable=True),
-    required=True,
-    help="Path to the SB2 container that would be parsed.",
-)
-@click.option(
-    "-k",
-    "--key",
-    type=click.Path(exists=True, readable=True),
-    required=True,
-    help="Key file for SB2 decryption in plaintext",
-)
-@click.argument("parsed-data", type=click.Path())
-def sb21_parse_command(binary: str, key: str, parsed_data: str) -> None:
-    """Parse Secure Binary v2.1 Image."""
-    sb21_parse(binary, key, parsed_data)
-
-
-def sb21_parse(binary: str, key: str, parsed_data: str) -> None:
-    """Parse Secure Binary v2.1 Image."""
-    # transform text-based KEK into bytes
-    sb_kek = unhexlify(load_text(key))
-
-    try:
-        parsed_sb = BootImageV21.parse(data=load_binary(binary), kek=sb_kek)
-    except SPSDKError as exc:
-        logger.debug(f"SB21 parse: Attempt to parse image failed: {str(exc)}")
-
-    if isinstance(parsed_sb.cert_block, CertBlockV2):
-        for cert_idx, certificate in enumerate(parsed_sb.cert_block.certificates):
-            file_name = f"certificate_{cert_idx}_der.cer"
-            logger.debug(f"Dumping certificate {file_name}")
-            write_file(certificate.dump(), os.path.join(parsed_data, file_name), mode="wb")
-
-    for section_idx, boot_sections in enumerate(parsed_sb._boot_sections):
-        for command_idx, command in enumerate(boot_sections._commands):
-            if isinstance(command, CmdLoad):
-                file_name = f"section_{section_idx}_load_command_{command_idx}_data.bin"
-                logger.debug(f"Dumping load command data {file_name}")
-                write_file(command.data, os.path.join(parsed_data, file_name), mode="wb")
-
-    logger.debug(parsed_sb.info())
-    write_file(
-        parsed_sb.info(),
-        os.path.join(parsed_data, "parsed_info.txt"),
+    schemas = BootImageV21.get_validation_schemas()
+    ret = CommentedConfig(main_title="SB 2.1 converted configuration", schemas=schemas).get_config(
+        config
     )
-    click.echo(f"Success. (SB21: {binary} has been parsed and stored into {parsed_data}.)")
-    click.echo(
-        "Please note that the exported binary images from load command might contain padding"
+    write_file(ret, output_conf)
+
+    schemas = CertBlockV1.get_validation_schemas()
+    ret = CommentedConfig(main_title="Certificate Block V1", schemas=schemas).get_config(
+        cert_config
     )
+    write_file(ret, os.path.join(os.path.dirname(output_conf), cert_block_file))
+    click.echo(f"Converted YAML configuration written to {output_conf}")
 
 
-@sb21_group.command(name="get-sbkek", no_args_is_help=False)
-@click.option(
-    "-k",
-    "--master-key",
-    type=str,
-    help="AES-256 master key as hexadecimal string or path to file containing key in plain text or in binary",
-)
-@click.option(
-    "-o",
-    "--output-folder",
-    type=click.Path(),
-    help="Output folder where the sbkek.txt and sbkek.bin will be stored",
-)
-def get_sbkek_command(master_key: str, output_folder: str) -> None:
-    """Compute SBKEK (AES-256) value and optionally store it as plain text and as binary.
-
-    SBKEK is AES-256 symmetric key used for encryption and decryption of SB.
-    Plain text version is used for SB generation.
-    Binary format is to be written to the keystore.
-    The same format is also used for USERKEK.
-
-    For OTP, the SBKEK is derived from OTP master key:
-    SB2_KEK = AES256(OTP_MASTER_KEY,
-    03000000_00000000_00000000_00000000_04000000_00000000_00000000_00000000)
-
-    Master key is not needed when using PUF as key storage
-
-    The computed SBKEK is shown as hexadecimal text on STDOUT,
-    SBKEK is stored in plain text and in binary if the 'output-folder' is specified,
-    """
-    get_sbkek(master_key, output_folder)
+@sb21_group.command(name="get-template", no_args_is_help=True)
+@spsdk_output_option(force=True)
+@spsdk_family_option(families=BootImageV21.get_supported_families(), required=False)
+def sb21_get_template_command(output: str, family: str) -> None:
+    """Create template of configuration in YAML format."""
+    sb21_get_template(output, family)
 
 
-def get_sbkek(master_key: str, output_folder: str) -> None:
-    """Compute SBKEK (AES-256) value and optionally store it as plain text and as binary."""
-    otp_master_key = get_key(master_key, KeyStore.OTP_MASTER_KEY_SIZE)
-    sbkek = KeyStore.derive_sb_kek_key(otp_master_key)
-
-    click.echo(f"SBKEK: {sbkek.hex()}")
-    click.echo(f"(OTP) MASTER KEY: {otp_master_key.hex()}")
-
-    if output_folder:
-        store_key(os.path.join(output_folder, "sbkek"), sbkek, reverse=True)
-        store_key(os.path.join(output_folder, "otp_master_key"), otp_master_key)
-        click.echo(f"Keys have been stored to: {output_folder}")
+def sb21_get_template(output: str, family: Optional[str] = None) -> None:
+    """Create template of configuration in YAML format."""
+    click.echo(f"Creating {get_printable_path(output)} template file.")
+    write_file(BootImageV21.generate_config_template(family), output)
 
 
-@main.group(name="sb31")
+@main.group(name="sb31", cls=SpsdkClickGroup)
 def sb31_group() -> None:
     """Group of sub-commands related to Secure Binary 3.1."""
 
 
 @sb31_group.command(name="export", no_args_is_help=True)
-@click.argument("config", type=click.Path(exists=True, readable=True))
-def sb31_export_command(config: str) -> None:
+@spsdk_config_option(required=True)
+@spsdk_plugin_option
+def sb31_export_command(config: str, plugin: str) -> None:
     """Generate Secure Binary v3.1 Image from YAML/JSON configuration.
 
-    CONFIG is path to the YAML/JSON configuration.
-    RoTKTH/SB3KDK is printed out in verbose mode.
+    SB3KDK is printed out in verbose mode.
 
     The configuration template files could be generated by subcommand 'get-template'.
     """
-    sb31_export(config)
+    sb31_export(config, plugin)
 
 
-def sb31_export(config: str) -> None:
+def sb31_export(config: str, plugin: Optional[str] = None) -> None:
     """Generate Secure Binary v3.1 Image from YAML/JSON configuration."""
+    if plugin:
+        load_plugin_from_source(plugin)
     config_data = load_configuration(config)
     config_dir = os.path.dirname(config)
-    schemas = SecureBinary31.get_validation_schemas(include_test_configuration=True)
-    schemas.append(ValidationSchemas.get_schema_file(SB3_SCH_FILE)["sb3_output"])
+    check_config(config_data, SecureBinary31.get_validation_schemas_family())
+    schemas = SecureBinary31.get_validation_schemas(config_data["family"])
     check_config(config_data, schemas, search_paths=[config_dir])
-    sb3 = SecureBinary31.load_from_config(config_data, search_paths=[config_dir])
-    sb3_data = sb3.export()
+    sb3 = SecureBinary31.load_from_config(config_data, search_paths=[config_dir, "."])
 
+    sb3_data = sb3.export()
     sb3_output_file_path = get_abs_path(config_data["containerOutputFile"], config_dir)
     write_file(sb3_data, sb3_output_file_path, mode="wb")
 
-    click.echo(f"Success. (Secure binary 3.1: {sb3_output_file_path} created.)")
+    click.echo(f"RKTH: {sb3.cert_block.rkth.hex()}")
+    click.echo(f"Success. (Secure binary 3.1: {get_printable_path(sb3_output_file_path)} created.)")
 
 
 @sb31_group.command(name="get-template", no_args_is_help=True)
-@click.option(
-    "-f",
-    "--chip-family",
-    default="lpc55s3x",
-    type=click.Choice(SecureBinary31.get_supported_families(), case_sensitive=False),
-    required=True,
-    help="Select the chip family.",
-)
-@click.option(
-    "-o",
-    "--overwrite",
-    default=False,
-    type=bool,
-    is_flag=True,
-    help="Allow overwriting existing template file.",
-)
-@click.argument("output", type=click.Path())
-def sb31_get_template_command(chip_family: str, overwrite: bool, output: str) -> None:
+@spsdk_family_option(families=SecureBinary31.get_supported_families())
+@spsdk_output_option(force=True)
+def sb31_get_template_command(family: str, output: str) -> None:
     """Create template of configuration in YAML format.
 
     The template file name is specified as argument of this command.
     """
-    sb31_get_template(chip_family, overwrite, output)
+    sb31_get_template(family, output)
 
 
-def sb31_get_template(chip_family: str, overwrite: bool, output: str) -> None:
+def sb31_get_template(family: str, output: str) -> None:
     """Create template of configuration in YAML format."""
-    if not os.path.isfile(output) or overwrite:
-        click.echo(f"Creating {output} template file.")
-        write_file(
-            SecureBinary31.generate_config_template(chip_family)[f"{chip_family}_sb31"], output
+    click.echo(f"Creating {get_printable_path(output)} template file.")
+    write_file(SecureBinary31.generate_config_template(family)[f"{family}_sb31"], output)
+
+
+@main.group(name="cert-block", no_args_is_help=True, cls=SpsdkClickGroup)
+def cert_block_group() -> None:  # pylint: disable=unused-argument
+    """Group of sub-commands related to certification block."""
+
+
+@cert_block_group.command(name="get-template", no_args_is_help=True)
+@spsdk_family_option(families=CertBlock.get_all_supported_families())
+@spsdk_output_option(force=True)
+def cert_block_get_template_command(output: str, family: str) -> None:
+    """Create template of configuration in YAML format."""
+    cert_block_get_template(output, family)
+
+
+def cert_block_get_template(output: str, family: str) -> None:
+    """Create template of configuration in YAML format."""
+    click.echo(f"Creating {get_printable_path(output)} template file.")
+    cert_block_class = CertBlock.get_cert_block_class(family)
+    write_file(cert_block_class.generate_config_template(family), output)
+
+
+@cert_block_group.command(name="export", no_args_is_help=True)
+@spsdk_config_option(required=True)
+@spsdk_family_option(families=CertBlock.get_all_supported_families())
+@spsdk_plugin_option
+def cert_block_export_command(config: str, family: str, plugin: str) -> None:
+    """Generate Certificate Block from YAML/JSON configuration.
+
+    The configuration template files could be generated by subcommand 'get-template'.
+    """
+    cert_block_export(config, family, plugin)
+
+
+def cert_block_export(config: str, family: str, plugin: Optional[str] = None) -> None:
+    """Generate Certificate Block from YAML/JSON configuration."""
+    if plugin:
+        load_plugin_from_source(plugin)
+    config_data = load_configuration(config)
+    config_data["family"] = family
+    config_dir = os.path.dirname(config)
+    cert_block_class = CertBlock.get_cert_block_class(family)
+    schemas = cert_block_class.get_validation_schemas()
+    check_config(config_data, schemas, search_paths=[config_dir])
+    cert_block = cert_block_class.from_config(config_data, search_paths=[config_dir])
+    cert_data = cert_block.export()
+
+    try:
+        cert_block_output_file_path = get_abs_path(config_data["containerOutputFile"], config_dir)
+    except KeyError as e:
+        raise SPSDKAppError(
+            "containerOutputFile property must be provided in order to export cert-block"
+        ) from e
+    write_file(cert_data, cert_block_output_file_path, mode="wb")
+
+    if cert_block.rkth:
+        click.echo(f"RKTH: {cert_block.rkth.hex()}")
+    if hasattr(cert_block, "cert_hash"):
+        assert isinstance(cert_block, CertBlockVx), "Wrong instance of cert block"
+        click.echo(f"ISK Certificate hash [0:127]: {cert_block.cert_hash.hex()}\n")
+        otp_script_path = os.path.join(
+            os.path.dirname(cert_block_output_file_path), "otp_script.bcf"
         )
-    else:
-        click.echo(f"Skip creating {output}, this file already exists.")
+        write_file(cert_block.get_otp_script(), otp_script_path)
+        click.echo(f"OTP script written to: {get_printable_path(otp_script_path)}")
+    click.echo(
+        f"Success. (Certificate Block: {get_printable_path(cert_block_output_file_path)} created.)"
+    )
 
 
-@main.group(name="tz", no_args_is_help=True)
+@cert_block_group.command(name="get-isk-tbs", no_args_is_help=True)
+@spsdk_family_option(families=CertBlockVx.get_supported_families())
+@click.option(
+    "-p",
+    "--public-key",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, resolve_path=True),
+    help="Path to file with the ISK public key",
+)
+@spsdk_output_option()
+# pylint: disable=unused-argument  # we just filter applicable chip families, the value itself is not used
+def cert_block_get_isk_tbs_data(family: str, output: str, public_key: str) -> None:
+    """Generate To-Be-Signed data for ISK Certificate created by NXP's EdgeLock2GO service."""
+    puk = load_binary(path=public_key)
+    isk = IskCertificateLite(pub_key=puk, constraints=0)
+    tbs_data = isk.get_tbs_data()
+    write_file(data=tbs_data, path=output, mode="wb")
+    click.echo(f"Success. (ISK TBS data: {output} created.)")
+
+
+@cert_block_group.command(name="parse", no_args_is_help=True)
+@click.option(
+    "-b",
+    "--binary",
+    type=click.Path(exists=True, readable=True, resolve_path=True),
+    required=True,
+    help="Path to binary Certificate Block image to parse.",
+)
+@spsdk_family_option(families=CertBlock.get_all_supported_families())
+@spsdk_output_option(directory=True)
+def cert_block_parse_command(binary: str, family: str, output: str) -> None:
+    """Parse Certificate Block.
+
+    RoTKTH is printed out in verbose mode.
+    """
+    cert_block_parse(binary, family, output)
+
+
+# pylint: disable=unused-argument  # preparation for future updates
+def cert_block_parse(binary: str, family: str, output: str) -> None:
+    """Parse Certificate Block."""
+    cert_block = CertBlock.get_cert_block_class(family).parse(load_binary(binary))
+    logger.info(str(cert_block))
+    write_file(cert_block.create_config(output), os.path.join(output, "cert_block_config.yaml"))
+    click.echo(f"RKTH: {cert_block.rkth.hex()}")
+    click.echo(f"Success. (Certificate Block: {binary} has been parsed into {output}.)")
+
+
+@main.group(name="bca", no_args_is_help=True, cls=SpsdkClickGroup)
+def bca_group() -> None:  # pylint: disable=unused-argument
+    """Group of sub-commands related to BCA block."""
+
+
+@bca_group.command(name="get-template", no_args_is_help=True)
+@spsdk_family_option(families=BCA.get_supported_families())
+@spsdk_output_option(force=True)
+def bca_get_template_command(output: str, family: str) -> None:
+    """Create template of configuration in YAML format."""
+    bca_get_template(output, family)
+
+
+def bca_get_template(output: str, family: str) -> None:
+    """Create template of configuration in YAML format."""
+    click.echo(f"Creating {get_printable_path(output)} template file.")
+    write_file(BCA.generate_config_template(family), output)
+
+
+@bca_group.command(name="export", no_args_is_help=True)
+@spsdk_config_option(required=True)
+@spsdk_output_option()
+def bca_export_command(config: str, output: str) -> None:
+    """Generate BCA from YAML/JSON configuration.
+
+    The configuration template files could be generated by subcommand 'get-template'.
+    """
+    bca_export(config, output)
+
+
+def bca_export(config: str, output: str) -> None:
+    """Export BCA from YAML/JSON configuration."""
+    config_data = load_configuration(config)
+    check_config(config_data, BCA.get_validation_schemas_family())
+    family = config_data["family"]
+    revision = config_data.get("revision", "latest")
+    schemas = BCA.get_validation_schemas(family, revision)
+    check_config(config_data, schemas, search_paths=[os.path.dirname(config)])
+    bca_image = BCA.load_from_config(config_data)
+    bca_data = bca_image.export()
+    write_file(bca_data, output, mode="wb")
+
+    logger.info(f"Created BCA Image:\n{str(bca_image.registers.image_info())}")
+    click.echo(f"Success. (BCA: {output} created.)")
+
+
+@bca_group.command(name="parse", no_args_is_help=True)
+@click.option(
+    "-b",
+    "--binary",
+    type=click.Path(exists=True, readable=True, resolve_path=True),
+    required=True,
+    help="Path to binary BCA to parse.",
+)
+@spsdk_family_option(families=BCA.get_supported_families())
+@spsdk_output_option()
+def bca_parse_command(binary: str, family: str, output: str) -> None:
+    """Parse BCA."""
+    bca_parse(binary, family, output)
+
+
+# pylint: disable=unused-argument  # preparation for future updates
+def bca_parse(binary: str, family: str, output: str) -> None:
+    """Parse BCA Image into YAML configuration."""
+    bca_image = BCA.parse(load_binary(binary), family=family)
+    logger.info(f"Parsed BCA image memory map: {bca_image.registers.image_info().draw()}")
+    config = bca_image.create_config()
+    write_file(config, output)
+    click.echo(f"Success. (BCA: {binary} has been parsed and stored into {output}.)")
+
+
+@main.group(name="fcf", no_args_is_help=True, cls=SpsdkClickGroup)
+def fcf_group() -> None:  # pylint: disable=unused-argument
+    """Group of sub-commands related to FCF block."""
+
+
+@fcf_group.command(name="get-template", no_args_is_help=True)
+@spsdk_family_option(families=FCF.get_supported_families())
+@spsdk_output_option(force=True)
+def fcf_get_template_command(output: str, family: str) -> None:
+    """Create template of configuration in YAML format."""
+    fcf_get_template(output, family)
+
+
+def fcf_get_template(output: str, family: str) -> None:
+    """Create template of configuration in YAML format."""
+    click.echo(f"Creating {get_printable_path(output)} template file.")
+    write_file(FCF.generate_config_template(family), output)
+
+
+@fcf_group.command(name="export", no_args_is_help=True)
+@spsdk_config_option(required=True)
+@spsdk_output_option()
+def fcf_export_command(config: str, output: str) -> None:
+    """Generate FCF from YAML/JSON configuration.
+
+    The configuration template files could be generated by subcommand 'get-template'.
+    """
+    fcf_export(config, output)
+
+
+def fcf_export(config: str, output: str) -> None:
+    """Export FCF from YAML/JSON configuration."""
+    config_data = load_configuration(config)
+    check_config(config_data, FCF.get_validation_schemas_family())
+    family = config_data["family"]
+    revision = config_data.get("revision", "latest")
+    schemas = FCF.get_validation_schemas(family, revision)
+    check_config(config_data, schemas, search_paths=[os.path.dirname(config)])
+    fcf_image = FCF.load_from_config(config_data)
+    fcf_data = fcf_image.export()
+    write_file(fcf_data, output, mode="wb")
+
+    logger.info(f"Created FCF Image:\n{str(fcf_image.registers.image_info())}")
+    click.echo(f"Success. (FCF: {output} created.)")
+
+
+@fcf_group.command(name="parse", no_args_is_help=True)
+@click.option(
+    "-b",
+    "--binary",
+    type=click.Path(exists=True, readable=True, resolve_path=True),
+    required=True,
+    help="Path to binary FCF to parse.",
+)
+@spsdk_family_option(families=FCF.get_supported_families())
+@spsdk_output_option()
+def fcf_parse_command(binary: str, family: str, output: str) -> None:
+    """Parse FCF."""
+    fcf_parse(binary, family, output)
+
+
+# pylint: disable=unused-argument  # preparation for future updates
+def fcf_parse(binary: str, family: str, output: str) -> None:
+    """Parse FCF Image into YAML configuration."""
+    fcf_image = FCF.parse(load_binary(binary), family=family)
+    logger.info(f"Parsed FCF image memory map: {fcf_image.registers.image_info().draw()}")
+    config = fcf_image.create_config()
+    write_file(config, output)
+    click.echo(f"Success. (FCF: {binary} has been parsed and stored into {output}.)")
+
+
+@main.group(name="tz", no_args_is_help=True, cls=SpsdkClickGroup)
 def tz_group() -> None:
     """Group of sub-commands related to Trust Zone."""
 
 
 @tz_group.command(name="export", no_args_is_help=True)
-@click.argument("config", type=click.Path(exists=True, readable=True))
+@spsdk_config_option(required=True)
 def tz_export_command(config: str) -> None:
     """Generate TrustZone Image from YAML/JSON configuration.
-
-    CONFIG is path to the YAML/JSON configuration
 
     The configuration template files could be generated by subcommand 'get-template'.
     """
@@ -428,120 +913,74 @@ def tz_export(config: str) -> None:
 
 
 @tz_group.command(name="get-template", no_args_is_help=True)
-@click.option(
-    "-f",
-    "--chip-family",
-    default="lpc55s3x",
-    type=click.Choice(TrustZone.get_supported_families(), case_sensitive=False),
-    required=True,
-    help="Select the chip family.",
-)
-@click.option(
-    "-r",
-    "--revision",
-    type=str,
-    default="latest",
-    help="Chip revision; if not specified, most recent one will be used",
-)
-@click.option(
-    "-o",
-    "--overwrite",
-    default=False,
-    type=bool,
-    is_flag=True,
-    help="Allow overwriting existing template file.",
-)
-@click.argument("output", type=click.Path())
-def tz_get_template_command(chip_family: str, revision: str, overwrite: bool, output: str) -> None:
+@spsdk_family_option(families=TrustZone.get_supported_families())
+@spsdk_revision_option
+@spsdk_output_option(force=True)
+def tz_get_template_command(family: str, revision: str, output: str) -> None:
     """Create template of configuration in YAML format.
 
     The template file name is specified as argument of this command.
     """
-    tz_get_template(chip_family, revision, overwrite, output)
+    tz_get_template(family, revision, output)
 
 
-def tz_get_template(chip_family: str, revision: str, overwrite: bool, output: str) -> None:
+def tz_get_template(family: str, revision: str, output: str) -> None:
     """Create template of configuration in YAML format."""
-    if not os.path.isfile(output) or overwrite:
-        click.echo(f"Creating {output} template file.")
-        write_file(
-            TrustZone.generate_config_template(chip_family, revision)[f"{chip_family}_tz"], output
-        )
-    else:
-        click.echo(f"Skip creating {output}, this file already exists.")
+    write_file(TrustZone.generate_config_template(family, revision)[f"{family}_tz"], output)
+    click.echo(f"Trust zone template file has been created: {output}.")
 
 
-@main.group(name="ahab", no_args_is_help=True)
+@main.group(name="ahab", no_args_is_help=True, cls=SpsdkClickGroup)
 def ahab_group() -> None:
     """Group of sub-commands related to AHAB."""
 
 
 @ahab_group.command(name="export", no_args_is_help=True)
-@click.argument("config", type=click.Path(exists=True, readable=True))
-def ahab_export_command(config: str) -> None:
+@spsdk_config_option(required=True)
+@spsdk_plugin_option
+def ahab_export_command(config: str, plugin: str) -> None:
     """Generate AHAB Image from YAML/JSON configuration.
-
-    CONFIG is path to the YAML/JSON configuration
 
     The configuration template files could be generated by subcommand 'get-template'.
     """
-    ahab_export(config)
+    ahab_export(config, plugin)
 
 
-def ahab_export(config: str) -> None:
+def ahab_export(config: str, plugin: Optional[str] = None) -> None:
     """Generate AHAB Image from YAML/JSON configuration."""
+    if plugin:
+        load_plugin_from_source(plugin)
     config_data = load_configuration(config)
     config_dir = os.path.dirname(config)
-    schemas = AHABImage.get_validation_schemas()
+    check_config(config_data, AHABImage.get_validation_schemas_family())
+    family = config_data["family"]
+    revision = config_data.get("revision", "latest")
+    schemas = AHABImage.get_validation_schemas(family, revision)
     check_config(config_data, schemas, search_paths=[config_dir])
-    ahab_cnt = AHABImage.load_from_config(config_data, search_paths=[config_dir])
-    ahab_data = ahab_cnt.export()
+    ahab = AHABImage.load_from_config(config_data, search_paths=[config_dir])
+    ahab.update_fields()
+    ahab_data = ahab.export()
 
     ahab_output_file_path = get_abs_path(config_data["output"], config_dir)
     write_file(ahab_data, ahab_output_file_path, mode="wb")
 
-    logger.info(f"Created AHAB Image:\n{ahab_cnt.image_info().info()}")
-    logger.info(f"Created AHAB Image memory map:\n{ahab_cnt.image_info().draw()}")
-    click.echo(f"Success. (AHAB: {ahab_output_file_path} created.)")
+    logger.info(f"Created AHAB Image:\n{str(ahab.image_info())}")
+    logger.info(f"Created AHAB Image memory map:\n{ahab.image_info().draw()}")
+    click.echo(f"Success. (AHAB: {get_printable_path(ahab_output_file_path)} created.)")
 
     ahab_output_dir, ahab_output_file = os.path.split(ahab_output_file_path)
     ahab_output_file_no_ext, _ = os.path.splitext(ahab_output_file)
-    for cnt_ix, container in enumerate(ahab_cnt.ahab_containers):
-        if container.flag_srk_set == "nxp":
-            logger.debug("Skipping generating hashes for NXP container")
-            continue
-        srk_table = container.signature_block.srk_table
-        file_name = f"{ahab_output_file_no_ext}_{container.flag_srk_set}{cnt_ix}_srk_hash"
-        if srk_table:
-            srkh = srk_table.compute_srk_hash()
-            write_file(srkh.hex().upper(), get_abs_path(f"{file_name}.txt", ahab_output_dir))
-            try:
-                blhost_script = ahab_cnt.create_srk_hash_blhost_script(cnt_ix)
-                write_file(blhost_script, get_abs_path(f"{file_name}_blhost.bcf", ahab_output_dir))
-            except SPSDKError:
-                pass
-            click.echo(f"Generated SRK hash files ({file_name}*.*).")
+
+    write_ahab_fuses(ahab, ahab_output_dir, ahab_output_file_no_ext, click.echo)
 
 
 @ahab_group.command(name="parse", no_args_is_help=True)
-@click.option(
-    "-f",
-    "--chip-family",
-    default="rt1180",
-    type=click.Choice(AHABImage.get_supported_families(), case_sensitive=False),
-    required=True,
-    help="Select the chip family.",
-)
-@click.option(
-    "-t",
-    "--image-type",
-    type=click.Choice(AHABImage.IMAGE_TYPES),
-    help="AHAB image type., default is XIP.",
-)
+@spsdk_family_option(families=AHABImage.get_supported_families())
+@spsdk_output_option(directory=True)
 @click.option(
     "-b",
     "--binary",
-    type=click.Path(exists=True, readable=True),
+    type=click.Path(exists=True, readable=True, resolve_path=True),
     required=True,
     help="Path to binary AHAB image to parse.",
 )
@@ -555,218 +994,666 @@ def ahab_export(config: str) -> None:
         "It could be specified as binary/HEX text file path or directly HEX string"
     ),
 )
-@click.argument("parsed-data", type=click.Path())
-def ahab_parse_command(
-    chip_family: str, image_type: str, binary: str, dek: str, parsed_data: str
-) -> None:
+def ahab_parse_command(family: str, binary: str, dek: str, output: str) -> None:
     """Parse AHAB Image into YAML configuration and binary images."""
-    ahab_parse(chip_family, image_type, binary, dek, parsed_data)
+    ahab_parse(family, binary, dek, output)
 
 
-def ahab_parse(chip_family: str, image_type: str, binary: str, dek: str, parsed_data: str) -> None:
-    """Parse AHAB Image into YAML configuration and binary images."""
-    if not os.path.exists(parsed_data):
-        os.makedirs(parsed_data, exist_ok=True)
-    image_types = [image_type] if image_type else AHABImage.IMAGE_TYPES
-    for img_type in image_types:
+def ahab_parse_image(family: str, binary: bytes) -> AHABImage:
+    """Parse one AHAB Image.
+
+    :param family: Chip family.
+    :param binary: Binary to parse
+    :return: AHAB image if founded
+    :raise SPSDKError: In case of AHAB is not found
+    """
+    for target_memory in AhabTargetMemory.labels():
         try:
-            ahab_image = AHABImage(family=chip_family, image_type=img_type)
-            ahab_image.parse(load_binary(binary))
-            ahab_image.update_fields()
-            ahab_image.validate()
+            ahab_image = AHABImage(family=family, target_memory=target_memory)
+            ahab_image.parse(binary)
+            ahab_image.verify().validate()
         except SPSDKError as exc:
-            logger.debug(f"AHAB parse: Attempt to parse image as {img_type} failed: {str(exc)}")
+            logger.debug(
+                f"AHAB parse: Attempt to parse image for {target_memory} target failed: {str(exc)}"
+            )
             ahab_image = None
         else:
-            assert ahab_image
-            if (
-                ahab_image.get_first_data_image_address() < ahab_image.data_images_start
-                and img_type != "serial_downloader"
-            ):
-                ahab_image = None
-            else:
-                break
-
+            break
     if not ahab_image:
-        click.echo(f"Failed. (AHAB: {binary} parsing failed.)")
-        return
+        raise SPSDKError("Cannot find valid AHAB image")
 
-    logger.info(f"Identified AHAB image type: {img_type}")
+    return ahab_image
+
+
+def ahab_parse(family: str, binary: str, dek: str, output: str) -> None:
+    """Parse AHAB Image into YAML configuration and binary images."""
+    data = load_binary(binary)
+    parsed_folder = output
+    try:
+        ahab_image = ahab_parse_image(family=family, binary=data)
+    except SPSDKError as exc:
+        click.echo(f"Failed. (AHAB: {binary} parsing failed.: {str(exc)})")
+        return
+    if not os.path.exists(parsed_folder):
+        os.makedirs(parsed_folder, exist_ok=True)
+
+    logger.info(f"Identified AHAB image for {ahab_image.chip_config.target_memory.label} target")
     logger.info(f"Parsed AHAB image memory map: {ahab_image.image_info().draw()}")
     if dek:
         for container in ahab_image.ahab_containers:
-            if container.flag_srk_set != "nxp" and container.signature_block.blob:
-                container.signature_block.blob.dek = get_key(
-                    dek, container.signature_block.blob._size // 8
-                )
-                container.decrypt_data()
-
-    config = ahab_image.create_config(parsed_data)
+            if container.flag_srk_set != FlagsSrkSet.NXP:
+                if container.signature_block and container.signature_block.blob:
+                    container.signature_block.blob.dek = load_hex_string(
+                        dek, container.signature_block.blob._size // 8
+                    )
+                    container.decrypt_data()
+                else:
+                    logger.info("Nothing to decrypt, the container doesn't contains BLOB")
+    config = ahab_image.create_config(parsed_folder)
     write_file(
-        ConfigTemplate.convert_cm_to_yaml(config),
-        os.path.join(parsed_data, "parsed_config.yaml"),
+        CommentedConfig(
+            main_title=(
+                f"AHAB recreated configuration from :"
+                f"{datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')}."
+            ),
+            schemas=AHABImage.get_validation_schemas(family=family),
+        ).get_config(config),
+        os.path.join(parsed_folder, "parsed_config.yaml"),
     )
-    click.echo(f"Success. (AHAB: {binary} has been parsed and stored into {parsed_data}.)")
+    click.echo(f"Success. (AHAB: {binary} has been parsed and stored into {parsed_folder}.)")
+    write_ahab_fuses(ahab_image, parsed_folder, "", click.echo)
 
-    for cnt_ix, container in enumerate(ahab_image.ahab_containers):
-        srk_table = container.signature_block.srk_table
-        file_name = os.path.join(parsed_data, f"{container.flag_srk_set}{cnt_ix}_srk_hash")
-        if srk_table:
-            srkh = srk_table.compute_srk_hash()
-            write_file(srkh.hex().upper(), f"{file_name}.txt")
-            try:
-                blhost_script = ahab_image.create_srk_hash_blhost_script(cnt_ix)
-                write_file(blhost_script, f"{file_name}_blhost.bcf")
-            except SPSDKError:
-                pass
-            click.echo(f"Generated SRK hash files ({file_name}*.*).")
+
+@ahab_group.command(name="verify", no_args_is_help=True)
+@spsdk_family_option(families=AHABImage.get_supported_families())
+@click.option(
+    "-b",
+    "--binary",
+    type=click.Path(exists=True, readable=True, resolve_path=True),
+    required=True,
+    help="Path to binary AHAB image to parse.",
+)
+@click.option(
+    "-p",
+    "--problems",
+    is_flag=True,
+    default=False,
+    help="Show just problems in image.",
+)
+@click.option(
+    "-k",
+    "--dek",
+    type=str,
+    required=False,
+    help=(
+        "Data encryption key, if it's specified, the parse method tries decrypt all encrypted images. "
+        "It could be specified as binary/HEX text file path or directly HEX string"
+    ),
+)
+def ahab_verify_command(family: str, binary: str, dek: str, problems: bool) -> None:
+    """Verify AHAB Image."""
+    ahab_verify(family=family, binary=binary, dek=dek, problems=problems)
+
+
+def ahab_verify(family: str, binary: str, dek: str, problems: bool) -> None:
+    """Verify AHAB Image."""
+    data = load_binary(binary)
+    verifiers: list[Verifier] = []
+    valid_image = None
+    preparsed = AHABImage.pre_parse_verify(data)
+    if preparsed.has_errors:
+        click.echo("The image bases has error, it doesn't passed pre-parse check:")
+        print_verifier_to_console(preparsed, problems)
+        raise SPSDKAppError("Pre-parsed check failed")
+
+    for target_memory in AhabTargetMemory.labels():
+        ahab_image = AHABImage(family=family, target_memory=target_memory)
+        ahab_image.parse(data)
+        ver = ahab_image.verify()
+        verifiers.append(ver)
+        if not ver.has_errors:
+            valid_image = ahab_image
+
+    if not valid_image:
+        click.echo(
+            "The binary has errors for all memory targets! All memory targets attempts will be printed.",
+            err=True,
+        )
+        for x, verifier in enumerate(verifiers):
+            click.echo("\n" + "=" * 120)
+            click.echo(
+                f"The verification attempt for target memory: {AhabTargetMemory.labels()[x].upper()}".center(
+                    120
+                )
+            )
+            click.echo("=" * 120 + "\n")
+            print_verifier_to_console(verifier, problems)
+        raise SPSDKAppError("Verify failed")
+
+    for cnt in valid_image.ahab_containers:
+        if cnt.flag_srk_set != FlagsSrkSet.NXP and cnt.signature_block and cnt.signature_block.blob:
+            cnt.signature_block.blob.dek = (
+                load_hex_string(dek, cnt.signature_block.blob._size // 8) if dek else None
+            )
+
+    if not problems:
+        click.echo(valid_image.image_info().draw())
+
+    print_verifier_to_console(valid_image.verify(), problems)
+
+
+@ahab_group.command(name="update-keyblob", no_args_is_help=True)
+@spsdk_family_option(AHABImage.get_supported_families())
+@click.option(
+    "-b",
+    "--binary",
+    type=click.Path(exists=True, readable=True, resolve_path=True),
+    required=True,
+    help="Path to binary AHAB image to update.",
+)
+@click.option(
+    "-k",
+    "--keyblob",
+    type=str,
+    required=True,
+    help=("Path to keyblob that will be inserted into AHAB Image"),
+)
+@click.option(
+    "-i",
+    "--container-id",
+    type=INT(),
+    required=True,
+    help="""
+    ID of the container where the keyblob will be replaced.
+    """,
+)
+@click.option(
+    "-m",
+    "--mem-type",
+    type=click.Choice(
+        [mem_type.label for mem_type in BootableImage.get_supported_memory_types()],
+        case_sensitive=False,
+    ),
+    required=False,
+    help="Select memory type. Only applicable for bootable images "
+    "(image containing FCB or XMCD segments). Do not use for raw AHAB image",
+)
+def ahab_update_keyblob_command(
+    family: str, binary: str, keyblob: str, container_id: int, mem_type: str
+) -> None:
+    """Update keyblob in AHAB image container."""
+    ahab_update_keyblob(family, binary, keyblob, container_id, mem_type)
+    click.echo(f"Success. (AHAB: {binary} keyblob has been updated)")
+
+
+@ahab_group.command(name="re-sign", no_args_is_help=True)
+@spsdk_family_option(AHABImage.get_supported_families())
+@click.option(
+    "-b",
+    "--binary",
+    type=click.Path(exists=True, readable=True, resolve_path=True),
+    required=True,
+    help="Path to binary AHAB image to update.",
+)
+@click.option(
+    "-k",
+    "--pkey",
+    type=str,
+    required=True,
+    help="Path to private key or signature provider configuration used for signing.",
+)
+@click.option(
+    "-k1",
+    "--pkey-1",
+    type=str,
+    help="Path to private key or signature provider configuration used for signing second signature if it's used.",
+)
+@click.option(
+    "-i",
+    "--container-id",
+    type=INT(),
+    required=True,
+    help="""
+    ID of the container where the keyblob will be replaced.
+    """,
+)
+@click.option(
+    "-m",
+    "--mem-type",
+    type=click.Choice(
+        [mem_type.label for mem_type in BootableImage.get_supported_memory_types()],
+        case_sensitive=False,
+    ),
+    required=False,
+    help="Select memory type. Only applicable for bootable images "
+    "(image containing FCB or XMCD segments). Do not use for raw AHAB image",
+)
+def ahab_re_sign_command(
+    family: str, binary: str, pkey: str, pkey_1: Optional[str], container_id: int, mem_type: str
+) -> None:
+    """Re-sign the container in AHAB image."""
+    sign_provider_0 = (
+        get_signature_provider(local_file_key=pkey, pss_padding=True)
+        if os.path.isfile(pkey)
+        else get_signature_provider(sp_cfg=pkey, pss_padding=True)
+    )
+    sign_provider_1 = None
+    if pkey_1:
+        sign_provider_1 = (
+            get_signature_provider(local_file_key=pkey_1, pss_padding=True)
+            if os.path.isfile(pkey_1)
+            else get_signature_provider(sp_cfg=pkey_1, pss_padding=True)
+        )
+    ahab_re_sign(
+        family=family,
+        binary=binary,
+        container_id=container_id,
+        sign_provider_0=sign_provider_0,
+        sign_provider_1=sign_provider_1,
+        mem_type=mem_type,
+    )
+    click.echo(f"Success. (AHAB: {binary} signature has been updated)")
+
+
+@ahab_group.command(name="sign", no_args_is_help=True)
+@spsdk_config_option(required=True)
+@spsdk_output_option(force=True)
+@click.option(
+    "-b",
+    "--binary",
+    type=click.Path(exists=True, readable=True, resolve_path=True),
+    required=True,
+    help="Path to binary AHAB image to sign and optionally encrypt.",
+)
+@click.option(
+    "-m",
+    "--mem-type",
+    type=click.Choice(
+        [mem_type.label for mem_type in BootableImage.get_supported_memory_types()],
+        case_sensitive=False,
+    ),
+    required=False,
+    help="Select memory type.",
+)
+def ahab_sign_command(binary: str, output: str, mem_type: str, config: str) -> None:
+    """Sign all non-NXP AHAB containers and optionally encrypt them."""
+    signed_image = ahab_sign_image(
+        image_path=binary,
+        config_path=config,
+        mem_type=mem_type,
+    )
+    write_file(signed_image, output, "wb")
+    click.echo(f"Signed image saved to {output}")
 
 
 @ahab_group.command(name="get-template", no_args_is_help=True)
+@spsdk_family_option(families=AHABImage.get_supported_families())
+@spsdk_revision_option
+@spsdk_output_option(force=True)
 @click.option(
-    "-f",
-    "--chip-family",
-    default="rt1180",
-    type=click.Choice(AHABImage.get_supported_families(), case_sensitive=False),
-    required=True,
-    help="Select the chip family.",
-)
-@click.option(
-    "-o",
-    "--overwrite",
-    default=False,
-    type=bool,
+    "-s",
+    "--sign",
     is_flag=True,
-    help="Allow overwriting existing template file.",
+    default=False,
+    help="Get template just for signing (encryption). To be used with ahab sign command.",
 )
-@click.argument("output", type=click.Path())
-def ahab_get_template_command(chip_family: str, overwrite: bool, output: str) -> None:
+def ahab_get_template_command(
+    family: str, output: str, sign: bool = False, revision: str = "latest"
+) -> None:
     """Create template of configuration in YAML format.
 
     The template file name is specified as argument of this command.
     """
-    ahab_get_template(chip_family, overwrite, output)
-
-
-def ahab_get_template(chip_family: str, overwrite: bool, output: str) -> None:
-    """Create template of configuration in YAML format."""
-    if not os.path.isfile(output) or overwrite:
-        click.echo(f"Creating {output} template file.")
-        write_file(AHABImage.generate_config_template(chip_family)[f"{chip_family}_ahab"], output)
+    if sign:
+        ahab_get_sign_template(family, output, revision)
     else:
-        click.echo(f"Skip creating {output}, this file already exists.")
+        ahab_get_template(family, output, revision)
 
 
-@main.group(no_args_is_help=True)
+def ahab_get_template(family: str, output: str, revision: str = "latest") -> None:
+    """Create template of configuration in YAML format."""
+    click.echo(f"Creating {get_printable_path(output)} template file.")
+    write_file(AHABImage.generate_config_template(family, revision)[f"{family}_ahab"], output)
+
+
+def ahab_get_sign_template(family: str, output: str, revision: str = "latest") -> None:
+    """Create template of configuration in YAML format."""
+    click.echo(f"Creating {get_printable_path(output)} template file.")
+    write_file(AHABImage.generate_signing_template(family, revision)[f"{family}_ahab"], output)
+
+
+@ahab_group.group(name="certificate", no_args_is_help=True, cls=SpsdkClickGroup)
+def ahab_certificate_group() -> None:  # pylint: disable=unused-argument
+    """Group of sub-commands related to AHAB certificate blob."""
+
+
+@ahab_certificate_group.command(name="get-template", no_args_is_help=True)
+@spsdk_family_option(families=AhabCertificate.get_supported_families())
+@spsdk_revision_option
+@spsdk_output_option(force=True)
+def ahab_cert_block_get_template_command(family: str, revision: str, output: str) -> None:
+    """Create template of configuration in YAML format."""
+    ahab_cert_block_get_template(family, revision, output)
+
+
+def ahab_cert_block_get_template(family: str, revision: str, output: str) -> None:
+    """Create template of configuration in YAML format."""
+    click.echo(f"Creating {get_printable_path(output)} template file.")
+    write_file(AhabCertificate.generate_config_template(family, revision), output)
+
+
+@ahab_certificate_group.command(name="export", no_args_is_help=True)
+@spsdk_config_option(required=True)
+@spsdk_output_option(required=True)
+@spsdk_plugin_option
+def ahab_cert_block_export_command(config: str, output: str, plugin: str) -> None:
+    """Generate AHAB Certificate Blob from YAML/JSON configuration.
+
+    The configuration template files could be generated by subcommand 'get-template'.
+    """
+    ahab_cert_block_export(config, output, plugin)
+
+
+def ahab_cert_block_export(config: str, output: str, plugin: Optional[str] = None) -> None:
+    """Generate AHAB Certificate Blob from YAML/JSON configuration."""
+    if plugin:
+        load_plugin_from_source(plugin)
+    config_data = load_configuration(config)
+    config_dir = os.path.dirname(config)
+    schemas_family = AhabCertificate.get_validation_schemas_family()
+    check_config(config_data, schemas_family, search_paths=[config_dir])
+    family = config_data["family"]
+    revision = config_data.get("revision", "latest")
+    schemas = AhabCertificate.get_validation_schemas(family=family, revision=revision)
+    check_config(config_data, schemas, search_paths=[config_dir])
+    cert_block = AhabCertificate.load_from_config(config_data, search_paths=[config_dir])
+    # Sign the certificate blob
+    cert_block.update_fields()
+    cert_data = cert_block.export()
+
+    write_file(cert_data, output, mode="wb")
+
+    click.echo(f"Success. (AHAB Certificate Blob: {get_printable_path(output)} created.)")
+
+
+@ahab_certificate_group.command(name="parse", no_args_is_help=True)
+@spsdk_family_option(families=AhabCertificate.get_supported_families())
+@spsdk_revision_option
+@click.option(
+    "-b",
+    "--binary",
+    type=click.Path(exists=True, readable=True, resolve_path=True),
+    required=True,
+    help="Path to binary AHAB Certificate blob image to parse.",
+)
+@click.option(
+    "-s",
+    "--srk_set",
+    type=click.Choice(["oem", "nxp"], case_sensitive=False),
+    default="oem",
+    help="SRK set that has been used for certificate.",
+)
+@spsdk_output_option(directory=True)
+def ahab_cert_block_parse_command(
+    family: str, revision: str, binary: str, srk_set: str, output: str
+) -> None:
+    """Parse AHAB Certificate Blob."""
+    ahab_cert_block_parse(family, revision, binary, srk_set, output)
+
+
+def ahab_cert_block_parse(
+    family: str, revision: str, binary: str, srk_set: str, output: str
+) -> None:
+    """Parse AHAB Certificate Blob."""
+    cert_block = AhabCertificate.parse(load_binary(binary))
+    logger.info(str(cert_block))
+    parsed_cfg = CommentedConfig(
+        "Parsed AHAB Certificate",
+        AhabCertificate.get_validation_schemas(family=family, revision=revision),
+    ).get_config(cert_block.create_config(0, output, FlagsSrkSet.from_attr(srk_set)))
+    write_file(
+        parsed_cfg,
+        os.path.join(output, "certificate_config.yaml"),
+    )
+    click.echo(f"Success. (AHAB Certificate Blob: {binary} has been parsed into {output}.)")
+
+
+@ahab_certificate_group.command(name="verify", no_args_is_help=True)
+@spsdk_family_option(families=AhabCertificate.get_supported_families())
+@spsdk_revision_option
+@click.option(
+    "-b",
+    "--binary",
+    type=click.Path(exists=True, readable=True, resolve_path=True),
+    required=True,
+    help="Path to binary AHAB certificate to verify.",
+)
+@click.option(
+    "-p",
+    "--problems",
+    is_flag=True,
+    default=False,
+    help="Show just problems in image.",
+)
+def ahab_cert_block_verify_command(family: str, revision: str, binary: str, problems: bool) -> None:
+    """Verify AHAB Certificate."""
+    ahab_cert_block_verify(family, revision, binary, problems)
+
+
+def ahab_cert_block_verify(family: str, revision: str, binary: str, problems: bool) -> None:
+    """Verify AHAB Image."""
+    data = load_binary(binary)
+    # preparsed = AHABCertificate.pre_parse_verify(data)
+    # if preparsed.has_errors:
+    #     click.echo("The image bases has error, it doesn't passed pre-parse check:")
+    #     print_verifier_to_console(preparsed)
+    #     raise SPSDKAppError("Pre-parsed check failed")
+
+    ahab_certificate = AhabCertificate.parse(data)
+    ver = ahab_certificate.verify()
+
+    results = None
+    if problems:
+        results = [VerifierResult.WARNING, VerifierResult.ERROR]
+    click.echo(ver.draw(results))
+
+    click.echo("Summary table of verifier results:\n" + ver.get_summary_table())
+
+
+@main.group(no_args_is_help=True, cls=SpsdkClickGroup)
 def signed_msg() -> None:  # pylint: disable=unused-argument
     """Group of sub-commands related to Signed messages."""
 
 
 @signed_msg.command(name="export", no_args_is_help=True)
-@click.argument("config", type=click.Path(exists=True, readable=True))
-def signed_msg_export(config: str) -> None:
+@spsdk_config_option(required=True)
+@spsdk_plugin_option
+def signed_msg_export(config: str, plugin: str) -> None:
     """Generate Signed message Image from YAML/JSON configuration.
-
-    CONFIG is path to the YAML/JSON configuration
 
     The configuration template files could be generated by subcommand 'get-template'.
     """
+    if plugin:
+        load_plugin_from_source(plugin)
     config_data = load_configuration(config)
     config_dir = os.path.dirname(config)
-    schemas = SignedMessage.get_validation_schemas()
-    check_config(config_data, schemas, search_paths=[config_dir])
-    smsg = SignedMessage.load_from_config(config_data, search_paths=[config_dir])
-
-    signed_msg_data = smsg.export()
+    signed_message = SignedMessage.load_from_config(config=config_data, search_paths=[config_dir])
+    signed_message.update_fields()
+    signed_msg_data = signed_message.export()
 
     signed_msg_output_file_path = get_abs_path(config_data["output"], config_dir)
     write_file(signed_msg_data, signed_msg_output_file_path, mode="wb")
 
-    logger.info(f"Created Signed message Image:\n{smsg.image_info().info()}")
-    logger.info(f"Created Signed message Image memory map:\n{smsg.image_info().draw()}")
+    logger.info(f"Created Signed message Image:\n{str(signed_message.image_info())}")
+    logger.info(f"Created Signed message Image memory map:\n{signed_message.image_info().draw()}")
+    if not (
+        signed_message.signed_msg_container
+        and signed_message.signed_msg_container.signature_block
+        and signed_message.signed_msg_container.signature_block.srk_assets
+    ):
+        raise SPSDKAppError("SRK assets not found in the signed message")
+    logger.info(
+        f"SRK hash:{signed_message.signed_msg_container.signature_block.srk_assets.compute_srk_hash().hex()}"
+    )
     click.echo(f"Success. (Signed message: {signed_msg_output_file_path} created.)")
 
 
 @signed_msg.command(name="parse", no_args_is_help=True)
-@click.option(
-    "-f",
-    "--chip-family",
-    default="rt1180",
-    type=click.Choice(AHABImage.get_supported_families(), case_sensitive=False),
-    required=True,
-    help="Select the chip family.",
-)
+@spsdk_family_option(families=SignedMessage.get_supported_families())
+@spsdk_revision_option
 @click.option(
     "-b",
     "--binary",
-    type=click.Path(exists=True, readable=True),
+    type=click.Path(exists=True, readable=True, resolve_path=True),
     required=True,
     help="Path to binary Signed message image to parse.",
 )
-@click.argument("parsed-data", type=click.Path())
-def signed_msg_parse(chip_family: str, binary: str, parsed_data: str) -> None:
+@spsdk_output_option(directory=True)
+def signed_msg_parse(family: str, revision: str, binary: str, output: str) -> None:
     """Parse Signed message Image into YAML configuration and binary images."""
-    if not os.path.exists(parsed_data):
-        os.makedirs(parsed_data, exist_ok=True)
+    data = load_binary(binary)
+    preparsed = SignedMessage.pre_parse_verify(data)
+    if preparsed.has_errors:
+        click.echo("The signed message image bases has error, it doesn't passed pre-parse check:")
+        click.echo(preparsed.draw())
+        raise SPSDKAppError("Pre-parsed check failed")
+    if not os.path.exists(output):
+        os.makedirs(output, exist_ok=True)
     try:
-        signed_message = SignedMessage.parse(load_binary(binary))
-        signed_message.update_fields()
-        signed_message.validate({})
+        signed_message = SignedMessage(family=family, revision=revision)
+        signed_message.parse(data)
     except SPSDKError as exc:
         click.echo(f"Signed message parsing failed: {binary} ,({str(exc)})")
         return
 
     logger.info(f"Parsed Signed message image memory map: {signed_message.image_info().draw()}")
-    config = signed_message.create_config(parsed_data)
-    write_file(
-        ConfigTemplate.convert_cm_to_yaml(config),
-        os.path.join(parsed_data, "parsed_config.yaml"),
-    )
-    click.echo(
-        f"Success. (Signed message: {binary} has been parsed and stored into {parsed_data}.)"
-    )
 
-    srk_table = signed_message.signature_block.srk_table
-    file_name = os.path.join(parsed_data, f"{signed_message.flag_srk_set}_srk_hash")
-    if srk_table:
-        srkh = srk_table.compute_srk_hash()
-        write_file(srkh.hex().upper(), f"{file_name}.txt")
-        click.echo(f"Generated SRK hash files ({file_name}*.*).")
+    config = signed_message.create_config(output)
+    yaml_config = CommentedConfig(
+        main_title=(
+            f"Signed Message recreated configuration from :"
+            f"{datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')}."
+        ),
+        schemas=signed_message.get_validation_schemas(
+            signed_message.chip_config.family, signed_message.chip_config.revision
+        ),
+    ).get_config(config)
+
+    write_file(
+        yaml_config,
+        os.path.join(output, "parsed_config.yaml"),
+    )
+    click.echo(f"Success. (Signed message: {binary} has been parsed and stored into {output}.)")
+    for ix in range(signed_message.srk_count):
+        srk_hash = signed_message.get_srk_hash(ix)
+        assert isinstance(signed_message.signed_msg_container, SignedMessageContainer)
+        file_name = os.path.join(
+            output, f"{signed_message.signed_msg_container.flag_srk_set.label}_srk{ix}_hash"
+        )
+        write_file(srk_hash.hex().upper(), f"{file_name}.txt")
+        click.echo(f"Generated SRK hash file ({file_name}.txt)")
 
 
 @signed_msg.command(name="get-template", no_args_is_help=True)
+@spsdk_family_option(families=SignedMessage.get_supported_families())
+@spsdk_revision_option
 @click.option(
-    "-f",
-    "--chip-family",
-    default="rt1180",
-    type=click.Choice(AHABImage.get_supported_families(), case_sensitive=False),
-    required=True,
-    help="Select the chip family.",
+    "-m",
+    "--message",
+    required=False,
+    type=click.Choice(MessageCommands.labels(), case_sensitive=False),
+    help="Select only one signed message to generate specific template if needed",
 )
-@click.option(
-    "-o",
-    "--overwrite",
-    default=False,
-    type=bool,
-    is_flag=True,
-    help="Allow overwriting existing template file.",
-)
-@click.argument("output", type=click.Path())
-def signed_msg_get_template(chip_family: str, overwrite: bool, output: str) -> None:
+@spsdk_output_option(force=True)
+def signed_msg_get_template(
+    family: str, revision: str, message: Optional[str], output: str
+) -> None:
     """Create template of configuration in YAML format.
 
     The template file name is specified as argument of this command.
     """
-    if not os.path.isfile(output) or overwrite:
-        click.echo(f"Creating {output} template file.")
-        write_file(
-            SignedMessage.generate_config_template(chip_family)[f"{chip_family}_signed_msg"], output
+    click.echo(f"Creating {output} template file.")
+    write_file(
+        SignedMessage.generate_config_template(
+            family, revision, MessageCommands.from_attr(message) if message else None
+        )[f"{family}_signed_msg"],
+        output,
+    )
+
+
+@signed_msg.command(name="verify", no_args_is_help=True)
+@spsdk_family_option(families=SignedMessage.get_supported_families())
+@spsdk_revision_option
+@click.option(
+    "-b",
+    "--binary",
+    type=click.Path(exists=True, readable=True, resolve_path=True),
+    required=True,
+    help="Path to binary AHAB image to parse.",
+)
+@click.option(
+    "-p",
+    "--problems",
+    is_flag=True,
+    default=False,
+    help="Show just problems in image.",
+)
+@click.option(
+    "-k",
+    "--dek",
+    type=str,
+    required=False,
+    help=(
+        "Data encryption key, if it's specified, the parse method tries decrypt all encrypted images. "
+        "It could be specified as binary/HEX text file path or directly HEX string"
+    ),
+)
+def signed_msg_verify_command(
+    family: str, revision: str, binary: str, dek: str, problems: bool
+) -> None:
+    """Verify AHAB Image."""
+    signed_msg_verify(family=family, revision=revision, binary=binary, dek=dek, problems=problems)
+
+
+def signed_msg_verify(family: str, revision: str, binary: str, dek: str, problems: bool) -> None:
+    """Verify AHAB Image."""
+    data = load_binary(binary)
+    preparsed = SignedMessage.pre_parse_verify(data)
+    if preparsed.has_errors:
+        click.echo("The signed message image bases has error, it doesn't passed pre-parse check:")
+        print_verifier_to_console(preparsed)
+        raise SPSDKAppError("Pre-parsed check failed")
+
+    signed_msg_image = SignedMessage(family=family, revision=revision)
+    signed_msg_image.parse(data)
+    ver = signed_msg_image.verify()
+
+    if ver.has_errors:
+        click.echo("The binary has errors!", err=True)
+        print_verifier_to_console(ver)
+        raise SPSDKAppError("Verify failed")
+
+    assert isinstance(signed_msg_image.signed_msg_container, SignedMessageContainer)
+    if (
+        signed_msg_image.signed_msg_container.flag_srk_set != FlagsSrkSet.NXP
+        and signed_msg_image.signed_msg_container.signature_block
+        and signed_msg_image.signed_msg_container.signature_block.blob
+    ):
+        signed_msg_image.signed_msg_container.signature_block.blob.dek = (
+            load_hex_string(
+                dek, signed_msg_image.signed_msg_container.signature_block.blob._size // 8
+            )
+            if dek
+            else None
         )
-    else:
-        click.echo(f"Skip creating {output}, this file already exists.")
+
+    if not problems:
+        click.echo(signed_msg_image.image_info().draw())
+
+    print_verifier_to_console(signed_msg_image.verify())
 
 
-@main.group(name="otfad", no_args_is_help=True)
+@main.group(name="otfad", no_args_is_help=True, cls=SpsdkClickGroup)
 def otfad_group() -> None:
     """Group of sub-commands related to OTFAD."""
 
@@ -777,7 +1664,8 @@ def otfad_group() -> None:
     "--alignment",
     default="512",
     type=INT(),
-    help="Alignment of key blob data blocks to simplify align data to external memory blocks.",
+    help="Alignment of key blob data blocks. Default value is 512 B if not specified.",
+    required=False,
 )
 @click.option(
     "-i",
@@ -785,14 +1673,13 @@ def otfad_group() -> None:
     type=INT(),
     help=(
         "OTFAD peripheral index - This is needed to generate proper "
-        "indexes of fuses in optional BLHOST script. For example for RT1180."
+        "indexes of fuses in optional BLHOST script. If not specified, BLHOST fuse script won't be generated"
     ),
+    required=False,
 )
-@click.argument("config", type=click.Path(exists=True, readable=True))
+@spsdk_config_option(required=True)
 def otfad_export_command(alignment: int, config: str, index: Optional[int] = None) -> None:
     """Generate OTFAD Images from YAML/JSON configuration.
-
-    CONFIG is path to the YAML/JSON configuration
 
     The configuration template files could be generated by subcommand 'get-template'.
     """
@@ -807,16 +1694,23 @@ def otfad_export(alignment: int, config: str, index: Optional[int] = None) -> No
     family = config_data["family"]
     schemas = OtfadNxp.get_validation_schemas(family)
     check_config(config_data, schemas, search_paths=[config_dir])
-    otfad = OtfadNxp.load_from_config(config_data, search_paths=[config_dir])
-    binary_image = otfad.binary_image(data_alignment=alignment)
-    logger.info(f" The OTFAD image structure:\n{binary_image.draw()}")
+    otfad = OtfadNxp.load_from_config(config_data, config_dir, search_paths=[config_dir])
 
     output_folder = get_abs_path(config_data["output_folder"], config_dir)
-
-    otfad_all = os.path.join(output_folder, "otfad_whole_image.bin")
-    write_file(binary_image.export(), otfad_all, mode="wb")
-    logger.info(f"Created OTFAD Image:\n{otfad_all}")
-    sb21_supported = otfad.database.get_device_value("sb_21_supported", otfad.family, default=False)
+    otfad_table_name = filepath_from_config(
+        config_data, "keyblob_name", "OTFAD_Table", config_dir, output_folder
+    )
+    binary_image = otfad.binary_image(data_alignment=alignment, otfad_table_name=otfad_table_name)
+    logger.info(f" The OTFAD image structure:\n{binary_image.draw()}")
+    otfad_all = filepath_from_config(
+        config_data, "output_name", "otfad_whole_image", config_dir, output_folder
+    )
+    if otfad_all != "":
+        write_file(binary_image.export(), otfad_all, mode="wb")
+        logger.info(f"Created OTFAD Image:\n{otfad_all}")
+    else:
+        logger.info("Skipping export of OTFAD image")
+    sb21_supported = otfad.db.get_bool(DatabaseManager.OTFAD, "sb_21_supported", default=False)
     memory_map = (
         "In folder is stored two kind of files:\n"
         "  -  Binary file that contains whole image data including "
@@ -833,20 +1727,27 @@ def otfad_export(alignment: int, config: str, index: Optional[int] = None) -> No
     )
 
     for i, image in enumerate(binary_image.sub_images):
-        image_file = os.path.join(output_folder, f"{image.name}.bin")
-        write_file(image.export(), image_file, mode="wb")
-        logger.info(f"Created OTFAD Image:\n{image_file}")
-        memory_map += f"\n{image_file}:\n{image.info()}"
+        if image.name != "":
+            write_file(image.export(), image.name, mode="wb")
+            logger.info(f"Created OTFAD Image:\n{image.name}")
+            memory_map += f"\n{image.name}:\n{str(image)}"
+        else:
+            logger.info(
+                f"Skipping export of {str(image)}, value is blank in the configuration file"
+            )
         if sb21_supported:
-            bd_file_sources += f'\n    image{i} = "{image_file}";'
+            bd_file_sources += f'\n    image{i} = "{image.name}";'
             bd_file_section0 += f"\n    // Load Image: {image.name}"
             bd_file_section0 += f"\n    erase {hex(image.absolute_address)}..{hex(image.absolute_address+len(image))};"
             bd_file_section0 += f"\n    load image{i} > {hex(image.absolute_address)}"
 
     readme_file = os.path.join(output_folder, "readme.txt")
 
-    write_file(memory_map, readme_file)
-    logger.info(f"Created OTFAD readme file:\n{readme_file}")
+    if config_data.get("generate_readme", True):
+        write_file(memory_map, readme_file)
+        logger.info(f"Created OTFAD readme file:\n{readme_file}")
+    else:
+        logger.info("Skipping generation of OTFAD readme file")
 
     if sb21_supported:
         bd_file_name = os.path.join(output_folder, "sb21_otfad_example.bd")
@@ -867,17 +1768,17 @@ def otfad_export(alignment: int, config: str, index: Optional[int] = None) -> No
         write_file(bd_file, bd_file_name)
         logger.info(f"Created OTFAD BD file example:\n{bd_file_name}")
 
-    if otfad.database.get_device_value("has_kek_fuses", otfad.family, default=False) and index:
+    if otfad.db.get_bool(DatabaseManager.OTFAD, "has_kek_fuses", default=False) and index:
         blhost_script = None
         blhost_script = otfad.get_blhost_script_otp_kek(index)
         if blhost_script:
-            blhost_script_filename = os.path.join(
-                output_folder, f"otfad{index}_{otfad.family}_blhost.bcf"
-            )
+            blhost_script_filename = os.path.join(output_folder, f"otfad{index}_{otfad.family}.bcf")
             write_file(blhost_script, blhost_script_filename)
-            click.echo(f"Created OTFAD BLHOST load fuses script:\n{blhost_script_filename}")
+            click.echo(
+                f"Created OTFAD BLHOST load fuses script:\n{get_printable_path(blhost_script_filename)}"
+            )
 
-    click.echo(f"Success. OTFAD files has been created and stored into: {output_folder}")
+    click.echo("Success. OTFAD files have been created")
 
 
 @otfad_group.command(name="get-kek", no_args_is_help=False)
@@ -893,38 +1794,31 @@ def otfad_export(alignment: int, config: str, index: Optional[int] = None) -> No
     type=str,
     help="OTFAD KEY (OTFAD KEK seed) in hexadecimal format or file name to binary or text file with key.",
 )
-@click.option(
-    "-f",
-    "--chip-family",
-    type=click.Choice(OtfadNxp.get_supported_families()),
+@spsdk_family_option(
+    families=OtfadNxp.get_supported_families(),
     help=(
         "Optional family, if specified, the tool generates the BLHOST scripts to load key fuses."
         " To use this feature, the '-o' options has to be also defined!"
     ),
 )
-@click.option(
-    "-o",
-    "--output-folder",
-    type=click.Path(),
+@spsdk_output_option(
+    required=False,
+    directory=True,
     help="Optional result output folder (otfad_kek.bin/txt, optionally BLHOST scripts to load keys into Fuses)",
 )
-def otfad_get_kek_command(
-    otp_master_key: str, otfad_key: str, chip_family: str, output_folder: str
-) -> None:
+def otfad_get_kek_command(otp_master_key: str, otfad_key: str, family: str, output: str) -> None:
     """Compute OTFAD KEK value and optionally store it into folder in various formats.
 
     The computed OTFAD KEK is shown in hexadecimal text, if the 'output-folder' is specified,
     it is stored in folder also in binary format.
     """
-    otfad_get_kek(otp_master_key, otfad_key, chip_family, output_folder)
+    otfad_get_kek(otp_master_key, otfad_key, family, output)
 
 
-def otfad_get_kek(
-    otp_master_key: str, otfad_key: str, chip_family: str, output_folder: str
-) -> None:
+def otfad_get_kek(otp_master_key: str, otfad_key: str, family: str, output_folder: str) -> None:
     """Compute OTFAD KEK value and optionally store it into folder in various formats."""
-    omk = get_key(otp_master_key, KeyStore.OTP_MASTER_KEY_SIZE)
-    ok = get_key(otfad_key, KeyStore.OTFAD_KEY_SIZE)  # pylint:disable=invalid-name
+    omk = load_hex_string(otp_master_key, KeyStore.OTP_MASTER_KEY_SIZE)
+    ok = load_hex_string(otfad_key, KeyStore.OTFAD_KEY_SIZE)  # pylint:disable=invalid-name
 
     otfad_kek = KeyStore.derive_otfad_kek_key(omk, ok)
 
@@ -933,9 +1827,9 @@ def otfad_get_kek(
     click.echo(f"OTFAD KEK:      {otfad_kek.hex()}")
 
     blhost_script = None
-    if chip_family and chip_family in OtfadNxp.get_supported_families():
+    if family and family in OtfadNxp.get_supported_families():
         blhost_script = OtfadNxp.get_blhost_script_otp_keys(
-            chip_family, otp_master_key=omk, otfad_key_seed=ok
+            family, otp_master_key=omk, otfad_kek_seed=ok
         )
         if not output_folder:
             click.echo(f"OTFAD BLHOST load fuses script:\n{blhost_script}")
@@ -950,149 +1844,121 @@ def otfad_get_kek(
 
 
 @otfad_group.command(name="get-template", no_args_is_help=True)
-@click.option(
-    "-f",
-    "--chip-family",
-    type=click.Choice(OtfadNxp.get_supported_families(), case_sensitive=False),
-    required=True,
-    help="Select the chip family.",
-)
-@click.option(
-    "-o",
-    "--overwrite",
-    default=False,
-    type=bool,
-    is_flag=True,
-    help="Allow overwriting existing template file.",
-)
-@click.argument("output", type=click.Path())
-def otfad_get_template_command(chip_family: str, overwrite: bool, output: str) -> None:
+@spsdk_family_option(families=OtfadNxp.get_supported_families())
+@spsdk_output_option(force=True)
+def otfad_get_template_command(family: str, output: str) -> None:
     """Create template of configuration in YAML format.
 
     The template file name is specified as argument of this command.
     """
-    otfad_get_template(chip_family, overwrite, output)
+    otfad_get_template(family, output)
 
 
-def otfad_get_template(chip_family: str, overwrite: bool, output: str) -> None:
+def otfad_get_template(family: str, output: str) -> None:
     """Create template of configuration in YAML format."""
-    if not os.path.isfile(output) or overwrite:
-        click.echo(f"Creating {output} template file.")
-        write_file(OtfadNxp.generate_config_template(chip_family)[f"{chip_family}_otfad"], output)
-    else:
-        click.echo(f"Skip creating {output}, this file already exists.")
+    click.echo(f"Creating {get_printable_path(output)} template file.")
+    write_file(OtfadNxp.generate_config_template(family)[f"{family}_otfad"], output)
 
 
-@main.group(name="iee", no_args_is_help=True)
+@main.group(name="iee", no_args_is_help=True, cls=SpsdkClickGroup)
 def iee_group() -> None:  # pylint: disable=unused-argument
     """Group of sub-commands related to IEE."""
 
 
 @iee_group.command(name="export", no_args_is_help=True)
-@click.argument("config", type=click.Path(exists=True, readable=True))
-def iee_export(config: str) -> None:
+@spsdk_config_option(required=True)
+def iee_export_command(config: str) -> None:
     """Generate IEE Images from YAML/JSON configuration.
-
-    CONFIG is path to the YAML/JSON configuration
 
     The configuration template files could be generated by subcommand 'get-template'.
     """
+    iee_export(config)
+
+
+def iee_export(config: str) -> None:
+    """Generate IEE Images from YAML/JSON configuration."""
     config_data = load_configuration(config)
     config_dir = os.path.dirname(config)
     check_config(config_data, IeeNxp.get_validation_schemas_family(), search_paths=[config_dir])
     family = config_data["family"]
     schemas = IeeNxp.get_validation_schemas(family)
     check_config(config_data, schemas, search_paths=[config_dir])
-    iee = IeeNxp.load_from_config(config_data, search_paths=[config_dir])
+    iee = IeeNxp.load_from_config(config_data, config_dir, search_paths=[config_dir])
 
     output_folder = get_abs_path(config_data["output_folder"], config_dir)
+    iee_all = filepath_from_config(config_data, "output_name", "iee_whole_image", output_folder)
+    keyblob_name = filepath_from_config(
+        config_data, "keyblob_name", "iee_keyblob", config_dir, output_folder
+    )
 
-    output_name = config_data.get("output_name")
-    if not output_name:
-        output_name = "encrypted.bin"
-
-    keyblob_name = config_data.get("keyblob_name")
-    if not keyblob_name:
-        keyblob_name = "iee_keyblob.bin"
-
-    iee_all = os.path.join(output_folder, output_name)
-
-    binary_image = iee.binary_image(keyblob_name=keyblob_name, image_name=output_name)
+    binary_image = iee.binary_image(keyblob_name=keyblob_name, image_name=iee_all)
     logger.info(binary_image.draw())
 
-    write_file(binary_image.export(), iee_all, mode="wb")
-
-    click.echo(f"Created IEE Image containing keyblobs and encrypted data:\n{iee_all}")
+    if iee_all == "":
+        logger.info("Skipping export of IEE whole image")
+    else:
+        write_file(binary_image.export(), iee_all, mode="wb")
+        click.echo(f"Created IEE Image containing keyblobs and encrypted data:\n{iee_all}")
 
     memory_map = (
         "Output folder contains:\n"
         "  -  Binary file that contains whole image data including "
         f"IEE key blobs data {iee_all}.\n"
-        f"\IEE memory map:\n{binary_image.draw(no_color=True)}"
+        f"IEE memory map:\n{binary_image.draw(no_color=True)}"
     )
 
     for image in binary_image.sub_images:
-        image_file = os.path.join(output_folder, image.name)
-        write_file(image.export(), image_file, mode="wb")
-        logger.info(f"Created Encrypted IEE data blob:\n{image_file}")
-        memory_map += f"\n{image_file}:\n{image.info()}"
+        if image.name != "":
+            write_file(image.export(), image.name, mode="wb")
+            logger.info(f"Created Encrypted IEE data blob {image.description}:\n{image.name}")
+            memory_map += f"\n{image.name}:\n{str(image)}"
+        else:
+            logger.info(
+                f"Skipping export of {str(image)}, value is blank in the configuration file"
+            )
 
     readme_file = os.path.join(output_folder, "readme.txt")
 
-    write_file(memory_map, readme_file)
-    logger.info(f"Created IEE readme file:\n{readme_file}")
+    if config_data.get("generate_readme", True):
+        write_file(memory_map, readme_file)
+        logger.info(f"Created IEE readme file:\n{readme_file}")
+    else:
+        logger.info("Skipping generation of IEE readme file")
 
-    if iee.database.get_device_value("has_kek_fuses", iee.family):
+    if iee.db.get_bool(DatabaseManager.IEE, "has_kek_fuses") and config_data.get(
+        "generate_fuses_script", True
+    ):
         blhost_script = iee.get_blhost_script_otp_kek()
-        if blhost_script:
-            blhost_script_filename = os.path.join(output_folder, f"iee_{iee.family}_blhost.bcf")
-            write_file(blhost_script, blhost_script_filename)
-            click.echo(f"Created IEE BLHOST load fuses script:\n{blhost_script_filename}")
+        blhost_script_filename = os.path.join(output_folder, f"iee_{iee.family}_blhost.bcf")
+        write_file(blhost_script, blhost_script_filename)
+        click.echo(f"Created IEE BLHOST load fuses script:\n{blhost_script_filename}")
+    else:
+        logger.info("Skipping generation of IEE BLHOST load fuses script")
 
-    click.echo(f"Success. IEE files have been created and stored into: {output_folder}")
+    click.echo("Success. IEE files have been created")
 
 
 @iee_group.command(name="get-template", no_args_is_help=True)
-@click.option(
-    "-f",
-    "--chip-family",
-    default="rt1170",
-    type=click.Choice(IeeNxp.get_supported_families(), case_sensitive=False),
-    required=True,
-    help="Select the chip family.",
-)
-@click.option(
-    "-o",
-    "--overwrite",
-    default=False,
-    type=bool,
-    is_flag=True,
-    help="Allow overwriting existing template file.",
-)
-@click.argument("output", type=click.Path())
-def iee_get_template(chip_family: str, overwrite: bool, output: str) -> None:
+@spsdk_family_option(families=IeeNxp.get_supported_families())
+@spsdk_output_option(force=True)
+def iee_get_template(family: str, output: str) -> None:
     """Create template of configuration in YAML format.
 
     The template file name is specified as argument of this command.
     """
-    if not os.path.isfile(output) or overwrite:
-        click.echo(f"Creating {output} template file.")
-        write_file(IeeNxp.generate_config_template(chip_family)[f"{chip_family}_iee"], output)
-    else:
-        click.echo(f"Skip creating {output}, this file already exists.")
+    click.echo(f"Creating {output} template file.")
+    write_file(IeeNxp.generate_config_template(family)[f"{family}_iee"], output)
 
 
-@main.group(name="bee", no_args_is_help=True)
+@main.group(name="bee", no_args_is_help=True, cls=SpsdkClickGroup)
 def bee_group() -> None:
     """Group of sub-commands related to BEE."""
 
 
 @bee_group.command(name="export", no_args_is_help=True)
-@click.argument("config", type=click.Path(exists=True, readable=True))
+@spsdk_config_option(required=True)
 def bee_export_command(config: str) -> None:
     """Generate BEE Images from YAML/JSON configuration.
-
-    CONFIG is path to the YAML/JSON configuration
 
     The configuration template files could be generated by subcommand 'get-template'.
     """
@@ -1108,114 +1974,85 @@ def bee_export(config: str) -> None:
     bee = BeeNxp.load_from_config(config_data, search_paths=[config_dir])
 
     output_folder = get_abs_path(config_data["output_folder"], config_dir)
+    output_name = filepath_from_config(config_data, "output_name", "encrypted", output_folder)
 
-    output_name = config_data.get("output_name")
-    if not output_name:
-        output_name = "encrypted.bin"
-
-    bee_image = os.path.join(output_folder, output_name)
-    write_file(bee.export_image(), bee_image, mode="wb")
-    logger.info(f"Created BEE Image:\n{bee_image}")
-
-    header_name = config_data.get("header_name")
-    if not header_name:
-        header_name = "bee_ehdr.bin"
+    write_file(bee.export_image(), output_name, mode="wb")
+    logger.info(f"Created BEE Image:\n{output_name}")
 
     for idx, header in enumerate(bee.export_headers()):
-        header_output = os.path.join(output_folder, f"{idx}_" + header_name)
-        write_file(header, header_output, mode="wb")
-        logger.info(f"Created BEE Header:\n{header_output}")
+        if header:
+            header_output = filepath_from_config(
+                config_data, "header_name", "bee_ehdr", output_folder, file_extension=f"{idx}.bin"
+            )
+            write_file(header, header_output, mode="wb")
+            logger.info(f"Created BEE Header:\n{header_output}")
 
-    click.echo(f"Success. BEE files have been created and stored into: {output_folder}")
+    click.echo("Success. BEE files have been created")
 
 
 @bee_group.command(name="get-template", no_args_is_help=True)
-@click.option(
-    "-f",
-    "--chip-family",
-    default="rt1010",
-    type=click.Choice(BeeNxp.get_supported_families(), case_sensitive=False),
-    required=True,
-    help="Select the chip family.",
-)
-@click.option(
-    "-o",
-    "--overwrite",
-    default=False,
-    type=bool,
-    is_flag=True,
-    help="Allow overwriting existing template file.",
-)
-@click.argument("output", type=click.Path())
-def bee_get_template_command(chip_family: str, overwrite: bool, output: str) -> None:
+@spsdk_family_option(families=BeeNxp.get_supported_families())
+@spsdk_output_option(force=True)
+def bee_get_template_command(family: str, output: str) -> None:
     """Create template of configuration in YAML format.
 
     The template file name is specified as argument of this command.
     """
-    bee_get_template(chip_family, overwrite, output)
+    bee_get_template(family, output)
 
 
 # pylint: disable=unused-argument    # preparation for the future
-def bee_get_template(chip_family: str, overwrite: bool, output: str) -> None:
+def bee_get_template(family: str, output: str) -> None:
     """Create template of configuration in YAML format."""
-    if not os.path.isfile(output) or overwrite:
-        click.echo(f"Creating {output} template file.")
-        write_file(BeeNxp.generate_config_template(), output)
-    else:
-        click.echo(f"Skip creating {output}, this file already exists.")
+    click.echo(f"Creating {output} template file.")
+    write_file(BeeNxp.generate_config_template(), output)
 
 
-@main.group(name="bootable-image", no_args_is_help=True)
+@main.group(name="bootable-image", no_args_is_help=True, cls=SpsdkClickGroup)
 def bootable_image_group() -> None:
     """Group of bootable image utilities."""
 
 
 @bootable_image_group.command(name="merge", no_args_is_help=True)
-@click.option(
-    "-c",
-    "--config",
-    type=click.Path(exists=True, readable=True),
-    required=True,
-    help="Bootable Image YAML/JSON Configuration.",
-)
-@click.argument("output", type=click.Path())
-def binary_image_merge_command(config: str, output: str) -> None:
+@spsdk_config_option(required=True)
+@spsdk_output_option()
+@spsdk_plugin_option
+def bootable_image_merge_command(config: str, output: str, plugin: Optional[str] = None) -> None:
     """Merge boot image blocks into one bootable image.
 
     The configuration template files could be generated by subcommand 'get-templates'.
     """
-    binary_image_merge(config, output)
+    bootable_image_merge(config, output, plugin)
 
 
-def binary_image_merge(config: str, output: str) -> None:
+def bootable_image_merge(config: str, output: str, plugin: Optional[str] = None) -> None:
     """Merge boot image blocks into one bootable image."""
+    if plugin:
+        load_plugin_from_source(plugin)
     config_data = load_configuration(config)
     config_dir = os.path.dirname(config)
-    bimg_image = BootableImage.load_from_config(config_data, search_paths=[config_dir])
+    bimg_image = BootableImage.load_from_config(config_data, [config_dir])
     bimg_image_info = bimg_image.image_info()
 
     write_file(bimg_image_info.export(), output, mode="wb")
 
-    logger.info(f"Created Bootable Image:\n{bimg_image_info.info()}")
+    logger.info(f"Created Bootable Image:\n{str(bimg_image_info)}")
     logger.info(f"Created Bootable Image memory map:\n{bimg_image_info.draw()}")
-    click.echo(f"Success. (Bootable Image: {output} created.)")
+    if bimg_image.bootable_header_only:
+        click.echo("It has been created just only bootable header due missing application info.")
+    click.echo(f"Success. (Bootable Image: {get_printable_path(output)} created) ")
 
 
 @bootable_image_group.command(name="parse", no_args_is_help=True)
-@click.option(
-    "-f",
-    "--chip-family",
-    default="rt5xx",
-    type=click.Choice(BootableImage.get_supported_families(), case_sensitive=False),
-    required=True,
-    help="Select the chip family.",
-)
+@spsdk_family_option(families=BootableImage.get_supported_families())
 @click.option(
     "-m",
     "--mem-type",
-    default="flexspi_nor",
-    type=click.Choice(["flexspi_nor"], case_sensitive=False),
-    required=True,
+    type=click.Choice(
+        [mem_type.label for mem_type in BootableImage.get_supported_memory_types()],
+        case_sensitive=False,
+    ),
+    required=False,
     help="Select the chip used memory type.",
 )
 @click.option(
@@ -1225,82 +2062,263 @@ def binary_image_merge(config: str, output: str) -> None:
     required=True,
     help="Path to binary Bootable image to parse.",
 )
-@click.argument("parsed-data-path", type=click.Path())
+@spsdk_output_option(directory=True)
 def bootable_image_parse_command(
-    chip_family: str, mem_type: str, binary: str, parsed_data_path: str
+    family: str, mem_type: Optional[str], binary: str, output: str
 ) -> None:
     """Parse Bootable Image into YAML configuration and binary images."""
-    bootable_image_parse(chip_family, mem_type, binary, parsed_data_path)
+    memory = None
+    if mem_type:
+        memory = MemoryType.from_label(mem_type)
+    bootable_image_parse(family, memory, binary, output)
 
 
 def bootable_image_parse(
-    chip_family: str, mem_type: str, binary: str, parsed_data_path: str
+    family: str, mem_type: Optional[MemoryType], binary: str, output: str
 ) -> None:
     """Parse Bootable Image into YAML configuration and binary images."""
-    bimg_image = get_bimg_class(chip_family)(family=chip_family, mem_type=mem_type)
-    bimg_image.parse(load_binary(binary))
+    bimg_image = BootableImage.parse(load_binary(binary), family=family, mem_type=mem_type)
     bimg_image_info = bimg_image.image_info()
     logger.info(f"Parsed Bootable image memory map: {bimg_image_info.draw()}")
-    bimg_image.store_config(parsed_data_path)
+    bimg_image.store_config(output)
     click.echo(
-        f"Success. (Bootable Image: {binary} has been parsed and stored into {parsed_data_path} .)"
+        f"Success. (Bootable Image: {binary} has been parsed and stored into {get_printable_path(output)} .)"
     )
 
 
 @bootable_image_group.command(name="get-templates", no_args_is_help=True)
-@click.option(
-    "-f",
-    "--chip-family",
-    default="rt595",
-    type=click.Choice(BootableImage.get_supported_families(), case_sensitive=False),
-    required=True,
-    help="Select the chip family.",
-)
-@click.option(
-    "-o",
-    "--overwrite",
-    default=False,
-    type=bool,
-    is_flag=True,
-    help="Allow overwriting existing template file.",
-)
-@click.argument("output_folder", type=click.Path())
-def bootable_image_get_templates_command(
-    chip_family: str, overwrite: bool, output_folder: str
-) -> None:
+@spsdk_family_option(families=BootableImage.get_supported_families())
+@spsdk_output_option(directory=True, force=True)
+def bootable_image_get_templates_command(family: str, output: str) -> None:
     """Create template of configurations in YAML format from all memory types.
 
     The template files folder name is specified as argument of this command.
     """
-    bootable_image_get_templates(chip_family, overwrite, output_folder)
+    bootable_image_get_templates(family, output)
 
 
-def bootable_image_get_templates(chip_family: str, overwrite: bool, output_folder: str) -> None:
+def bootable_image_get_templates(family: str, output: str) -> None:
     """Create template of configurations in YAML format from all memory types."""
-    mem_types = BootableImage.get_supported_memory_types(chip_family)
+    mem_types = BootableImage.get_supported_memory_types(family)
     for mem_type in mem_types:
-        output = os.path.join(output_folder, f"bootimg_{chip_family}_{mem_type}.yml")
-        if not os.path.isfile(output) or overwrite:
-            click.echo(f"Creating {output} template file.")
-            write_file(BootableImage.generate_config_template(chip_family, mem_type), output)
-        else:
-            click.echo(f"Skip creating {output}, this file already exists.")
+        output_file = os.path.join(output, f"bootimg_{family}_{mem_type.label}.yaml")
+        click.echo(f"Creating {get_printable_path(output_file)} template file.")
+        write_file(BootableImage.generate_config_template(family, mem_type), output_file)
 
 
-@bootable_image_group.group(name="fcb", no_args_is_help=True)
+@bootable_image_group.command(name="verify", no_args_is_help=True)
+@spsdk_family_option(families=BootableImage.get_supported_families())
+@click.option(
+    "-b",
+    "--binary",
+    type=click.Path(exists=True, readable=True, resolve_path=True),
+    required=True,
+    help="Path to binary bootable image to verify.",
+)
+@click.option(
+    "-m",
+    "--mem-type",
+    type=click.Choice(
+        [mem_type.label for mem_type in BootableImage.get_supported_memory_types()],
+        case_sensitive=False,
+    ),
+    required=True,
+    help="Select the chip used memory type.",
+)
+@click.option(
+    "-p",
+    "--problems",
+    is_flag=True,
+    default=False,
+    help="Show just problems in image.",
+)
+def bootable_image_verify_command(family: str, binary: str, problems: bool, mem_type: str) -> None:
+    """Verify Bootable Image."""
+    bootable_image_verify(
+        family=family, binary=binary, problems=problems, mem_type=MemoryType.from_label(mem_type)
+    )
+
+
+def bootable_image_verify(family: str, binary: str, problems: bool, mem_type: MemoryType) -> None:
+    """Verify Bootable Image."""
+    data = load_binary(binary)
+
+    preparsed = BootableImage.pre_parse_verify(data, family, mem_type)
+    if preparsed.has_errors:
+        click.echo("The image bases has error, it doesn't passed pre-parse check:")
+        print_verifier_to_console(preparsed)
+        raise SPSDKAppError("Pre-parsed check failed")
+
+    bimg_images = []
+    bimg_images = BootableImage._parse_all(data, family=family, mem_type=mem_type, no_errors=False)
+    verifiers: list[Verifier] = []
+    found_good_image = False
+    for img in bimg_images:
+        ver = img.verify()
+        verifiers.append(ver)
+        if not ver.has_errors:
+            found_good_image = True
+
+    if not found_good_image and len(bimg_images):
+        click.echo(
+            "The binary has errors for all memory targets! All memory targets attempts will be printed.",
+            err=True,
+        )
+    for img, ver in zip(bimg_images, verifiers):
+        # Print also the images with errors detected in case that neither one is good
+        print_image = not ver.has_errors or (ver.has_errors and not found_good_image)
+        if print_image:
+            click.echo("\n" + "=" * 120)
+            click.echo(f"The result for: {img.mem_type.label}".center(120))
+            click.echo("=" * 120 + "\n")
+            print_verifier_to_console(ver)
+
+    if not found_good_image:
+        raise SPSDKAppError("Verify failed")
+
+
+@main.group(name="hab", no_args_is_help=True, cls=SpsdkClickGroup)
+def hab_group() -> None:  # pylint: disable=unused-argument
+    """Group of sub-commands related to HAB container."""
+
+
+@hab_group.command(name="get-template", no_args_is_help=True)
+@spsdk_output_option(force=True)
+@spsdk_family_option(families=HabContainer.get_supported_families(), required=False)
+def hab_get_template_command(output: str, family: Optional[str]) -> None:
+    """Create template of configuration in YAML format."""
+    hab_get_template(output, family)
+
+
+def hab_get_template(output: str, family: Optional[str]) -> None:
+    """Create template of configuration in YAML format."""
+    write_file(HabContainer.generate_config_template(family), output)
+    click.echo(f"The template file {get_printable_path(output)} has been created.")
+
+
+@hab_group.command(name="export", no_args_is_help=True)
+@click.option(
+    "-c",
+    "--command",
+    type=click.Path(exists=True),
+    required=True,
+    help="BD or YAML configuration file to produce HAB container",
+)
+@spsdk_output_option()
+@click.argument("external", type=click.Path(), nargs=-1)
+@spsdk_plugin_option
+def hab_export_command(
+    command: str,
+    output: str,
+    external: Optional[list[str]] = None,
+    plugin: Optional[str] = None,
+) -> None:
+    """Generate HAB container from configuration.
+
+    EXTERNAL is a space separated list of external binary files defined in BD file
+    """
+    image = hab_export(command, external, plugin)
+    write_file(image, output, mode="wb")
+    click.echo(f"Success. (HAB container: {get_printable_path(output)} created.)")
+
+
+def hab_export(command: str, external: Optional[list[str]], plugin: Optional[str] = None) -> bytes:
+    """Generate HAB container from configuration."""
+    if plugin:
+        load_plugin_from_source(plugin)
+    search_paths = [os.path.dirname(command)]
+    config = HabContainer.load_configuration(command, external, search_paths=search_paths)
+    hab = HabContainer.load_from_config(config, search_paths=search_paths)
+    return hab.export()
+
+
+@hab_group.command(name="convert", no_args_is_help=True)
+@click.option(
+    "-c",
+    "--command",
+    type=click.Path(exists=True),
+    required=True,
+    help="BD configuration file for conversion to YAML",
+)
+@spsdk_output_option()
+@click.argument("external", type=click.Path(), nargs=-1)
+def hab_convert_command(
+    command: str,
+    output: str,
+    external: list[str],
+) -> None:
+    """Convert BD Configuration to YAML.
+
+    EXTERNAL is a space separated list of external binary files defined in BD file
+    """
+    configuration = hab_convert(command, external)
+    write_file(configuration, output, mode="w")
+    click.echo(f"Success. (HAB Configuration converted to YAML: {output})")
+
+
+def hab_convert(command: str, external: list[str]) -> str:
+    """Convert HAB BD configuration to YAML configuration."""
+    try:
+        parser = bd_parser.BDParser()
+
+        bd_file_content = load_text(command)
+        bd_data = parser.parse(text=bd_file_content, extern=external)
+
+        if not bd_data:
+            raise SPSDKError("Invalid bd file, generation terminated")
+
+        config = HabContainer.transform_configuration(bd_data)
+        schemas = HabContainer.get_validation_schemas(family=config["options"].get("family"))
+        check_config(bd_data, schemas)
+        ret = CommentedConfig(main_title="HAB converted configuration", schemas=schemas).get_config(
+            config
+        )
+        return ret
+
+    except SPSDKError as exc:
+        raise SPSDKAppError(f"The conversion failed: ({str(exc)}).") from exc
+
+
+@hab_group.command(name="parse", no_args_is_help=True)
+@click.option(
+    "-b",
+    "--binary",
+    type=click.Path(exists=True, readable=True, resolve_path=True),
+    required=True,
+    help="Path to binary HAB image to parse.",
+)
+@spsdk_output_option(directory=True)
+def hab_parse_command(binary: str, output: str) -> None:
+    """Parse HAB container into individual segments."""
+    file_bin = load_binary(binary)
+    created_files = hab_parse(file_bin, output)
+    for file_path in created_files:
+        click.echo(f"File has been created: {file_path}")
+    click.echo(f"Success. (HAB container parsed into: {output}.)")
+
+
+def hab_parse(binary: bytes, output: str) -> list[str]:
+    """Generate HAB container from configuration."""
+    hab_container = HabContainer.parse(binary)
+    generated_bins = []
+    for seg_name in hab_segments.SEGMENTS_MAPPING:
+        segment = hab_container.get_segment(seg_name)
+        if segment:
+            seg_data = segment.export()
+            seg_out = os.path.join(output, f"{seg_name.label}.bin")
+            write_file(seg_data, seg_out, mode="wb")
+            generated_bins.append(seg_out)
+    return generated_bins
+
+
+@bootable_image_group.group(name="fcb", no_args_is_help=True, cls=SpsdkClickGroup)
 def fcb() -> None:  # pylint: disable=unused-argument
     """FCB (Flash Configuration Block) utilities."""
 
 
 @fcb.command(name="export", no_args_is_help=True)
-@click.option(
-    "-c",
-    "--config",
-    type=click.Path(exists=True, readable=True),
-    required=True,
-    help="FCB YAML/JSON Configuration.",
-)
-@click.argument("output", type=click.Path())
+@spsdk_config_option(required=True)
+@spsdk_output_option()
 def fcb_export_command(config: str, output: str) -> None:
     """Export FCB Image from YAML/JSON configuration.
 
@@ -1313,113 +2331,83 @@ def fcb_export(config: str, output: str) -> None:
     """Export FCB Image from YAML/JSON configuration."""
     config_data = load_configuration(config)
     check_config(config_data, FCB.get_validation_schemas_family())
-    chip_family = config_data["family"]
-    mem_type = config_data["type"]
+    family = config_data["family"]
+    mem_type = MemoryType.from_label(config_data["type"])
     revision = config_data.get("revision", "latest")
-    schemas = FCB.get_validation_schemas(chip_family, mem_type, revision)
+    schemas = FCB.get_validation_schemas(family, mem_type, revision)
     check_config(config_data, schemas, search_paths=[os.path.dirname(config)])
     fcb_image = FCB.load_from_config(config_data)
     fcb_data = fcb_image.export()
     write_file(fcb_data, output, mode="wb")
 
-    logger.info(f"Created FCB Image:\n{fcb_image.registers.image_info().info()}")
+    logger.info(f"Created FCB Image:\n{str(fcb_image.registers.image_info())}")
     logger.info(f"Created FCB Image memory map:\n{fcb_image.registers.image_info().draw()}")
     click.echo(f"Success. (FCB: {output} created.)")
 
 
 @fcb.command(name="parse", no_args_is_help=True)
-@click.option(
-    "-f",
-    "--chip-family",
-    default="rt5xx",
-    type=click.Choice(FCB.get_supported_families(), case_sensitive=False),
-    required=True,
-    help="Select the chip family.",
-)
+@spsdk_family_option(families=FCB.get_supported_families())
 @click.option(
     "-m",
     "--mem-type",
     default="flexspi_nor",
-    type=click.Choice(["flexspi_nor"], case_sensitive=False),
+    type=click.Choice(
+        [mem_type.label for mem_type in FCB.get_supported_memory_types()], case_sensitive=False
+    ),
     required=True,
     help="Select the chip used memory type.",
 )
 @click.option(
     "-b",
     "--binary",
-    type=click.Path(exists=True, readable=True),
+    type=click.Path(exists=True, readable=True, resolve_path=True),
     required=True,
     help="Path to binary FCB image to parse.",
 )
-@click.argument("config-file", type=click.Path())
-def fcb_parse_command(chip_family: str, mem_type: str, binary: str, config_file: str) -> None:
+@spsdk_output_option()
+def fcb_parse_command(family: str, mem_type: str, binary: str, output: str) -> None:
     """Parse FCB Image into YAML configuration."""
-    fcb_parse(chip_family, mem_type, binary, config_file)
+    fcb_parse(family, MemoryType.from_label(mem_type), binary, output)
 
 
-def fcb_parse(chip_family: str, mem_type: str, binary: str, config_file: str) -> None:
+def fcb_parse(family: str, mem_type: MemoryType, binary: str, output: str) -> None:
     """Parse FCB Image into YAML configuration."""
-    fcb_image = FCB(family=chip_family, mem_type=mem_type)
-    fcb_image.parse(load_binary(binary))
+    fcb_image = FCB.parse(load_binary(binary), family=family, mem_type=mem_type)
 
     logger.info(f"Parsed FCB image memory map: {fcb_image.registers.image_info().draw()}")
     config = fcb_image.create_config()
-    write_file(config, config_file)
-    click.echo(f"Success. (FCB: {binary} has been parsed and stored into {config_file} .)")
+    write_file(config, output)
+    click.echo(f"Success. (FCB: {binary} has been parsed and stored into {output} .)")
 
 
 @fcb.command(name="get-templates", no_args_is_help=True)
-@click.option(
-    "-f",
-    "--chip-family",
-    default="rt595",
-    type=click.Choice(FCB.get_supported_families(), case_sensitive=False),
-    required=True,
-    help="Select the chip family.",
-)
-@click.option(
-    "-o",
-    "--overwrite",
-    default=False,
-    type=bool,
-    is_flag=True,
-    help="Allow overwriting existing template file.",
-)
-@click.argument("output_folder", type=click.Path())
-def fcb_get_templates_command(chip_family: str, overwrite: bool, output_folder: str) -> None:
+@spsdk_family_option(families=FCB.get_supported_families())
+@spsdk_output_option(directory=True, force=True)
+def fcb_get_templates_command(family: str, output: str) -> None:
     """Create template of configurations in YAML format for all memory types.
 
     The template files folder name is specified as argument of this command.
     """
-    fcb_get_templates(chip_family, overwrite, output_folder)
+    fcb_get_templates(family, output)
 
 
-def fcb_get_templates(chip_family: str, overwrite: bool, output_folder: str) -> None:
+def fcb_get_templates(family: str, output_folder: str) -> None:
     """Create template of configurations in YAML format for all memory types."""
-    mem_types = FCB.get_supported_memory_types(chip_family)
+    mem_types = FCB.get_supported_memory_types(family)
     for mem_type in mem_types:
-        output = os.path.join(output_folder, f"fcb_{chip_family}_{mem_type}.yml")
-        if not os.path.isfile(output) or overwrite:
-            click.echo(f"Creating {output} template file.")
-            write_file(FCB.generate_config_template(chip_family, mem_type), output)
-        else:
-            click.echo(f"Skip creating {output}, this file already exists.")
+        output = os.path.join(output_folder, f"fcb_{family}_{mem_type.label}.yaml")
+        click.echo(f"Creating {output} template file.")
+        write_file(FCB.generate_config_template(family, mem_type), output)
 
 
-@bootable_image_group.group(name="xmcd", no_args_is_help=True)
+@bootable_image_group.group(name="xmcd", no_args_is_help=True, cls=SpsdkClickGroup)
 def xmcd() -> None:  # pylint: disable=unused-argument
     """XMCD (External Memory Configuration Data) utilities."""
 
 
 @xmcd.command(name="export", no_args_is_help=True)
-@click.option(
-    "-c",
-    "--config",
-    type=click.Path(exists=True, readable=True),
-    required=True,
-    help="XMCD YAML/JSON Configuration.",
-)
-@click.argument("output", type=click.Path())
+@spsdk_config_option(required=True)
+@spsdk_output_option()
 def xmcd_export_command(config: str, output: str) -> None:
     """Export XMCD Image from YAML/JSON configuration.
 
@@ -1431,98 +2419,173 @@ def xmcd_export_command(config: str, output: str) -> None:
 def xmcd_export(config: str, output: str) -> None:
     """Export XMCD Image from YAML/JSON configuration."""
     config_data = load_configuration(config)
-    xmcd_image = XMCD.load_from_config(config_data)
+    config_dir = os.path.dirname(config)
     check_config(config_data, XMCD.get_validation_schemas_family())
-    # Add validation of config
+    schemas = XMCD.get_validation_schemas(
+        config_data["family"],
+        MemoryType.from_label(config_data["mem_type"]),
+        ConfigurationBlockType.from_label(config_data["config_type"]),
+        config_data.get("revision", "latest"),
+    )
+    check_config(config_data, schemas, search_paths=[config_dir])
+    xmcd_image = XMCD.load_from_config(config_data)
+    try:
+        xmcd_image.verify().validate()
+    except SPSDKError as exc:
+        logger.info(f"XMCD validation failed:\n {exc}")
+        raise SPSDKAppError("Loading of XMCD from configuration failed.") from exc
     xmcd_data = xmcd_image.export()
     write_file(xmcd_data, output, mode="wb")
 
-    logger.info(f"Created XMCD :\n{xmcd_image.registers.image_info().info()}")
+    logger.info(f"Created XMCD :\n{str(xmcd_image.registers.image_info())}")
     logger.info(f"Created XMCD memory map:\n{xmcd_image.registers.image_info().draw()}")
     click.echo(f"Success. (XMCD: {output} created.)")
 
 
 @xmcd.command(name="parse", no_args_is_help=True)
-@click.option(
-    "-f",
-    "--chip-family",
-    default="rt117x",
-    type=click.Choice(XMCD.get_supported_families(), case_sensitive=False),
-    required=True,
-    help="Select the chip family.",
-)
+@spsdk_family_option(families=XMCD.get_supported_families())
 @click.option(
     "-b",
     "--binary",
-    type=click.Path(exists=True, readable=True),
+    type=click.Path(exists=True, readable=True, resolve_path=True),
     required=True,
     help="Path to binary XMCD image to parse.",
 )
-@click.argument("config-file", type=click.Path())
-def xmcd_parse_command(chip_family: str, binary: str, config_file: str) -> None:
+@spsdk_output_option()
+def xmcd_parse_command(family: str, binary: str, output: str) -> None:
     """Parse XMCD Image into YAML configuration."""
-    xmcd_parse(chip_family, binary, config_file)
+    xmcd_parse(family, binary, output)
 
 
-def xmcd_parse(chip_family: str, binary: str, config_file: str) -> None:
+def xmcd_parse(family: str, binary: str, output: str) -> None:
     """Parse XMCD Image into YAML configuration."""
-    xmcd_image = XMCD(family=chip_family)
-    xmcd_image.parse(load_binary(binary))
-
-    logger.info(f"Parsed XMCD memory map: {xmcd_image.registers.image_info().draw()}")
+    xmcd_image = XMCD.parse(load_binary(binary), family=family)
+    try:
+        xmcd_image.verify().validate()
+    except SPSDKError as exc:
+        logger.info(f"XMCD validation failed:\n {exc}")
+        raise SPSDKAppError("Parsing of XMCD binary failed.") from exc
+    logger.info(f"Parsed XMCD: {xmcd_image.registers.image_info().draw()}")
     config = xmcd_image.create_config()
-    write_file(config, config_file)
-    click.echo(f"Success. (XMCD: {binary} has been parsed and stored into {config_file} .)")
+    write_file(config, output)
+    click.echo(f"Success. (XMCD: {binary} has been parsed and stored into {output} .)")
 
 
 @xmcd.command(name="get-templates", no_args_is_help=True)
-@click.option(
-    "-f",
-    "--chip-family",
-    default="rt117x",
-    type=click.Choice(XMCD.get_supported_families(), case_sensitive=False),
-    required=True,
-    help="Select the chip family.",
-)
-@click.option(
-    "-o",
-    "--overwrite",
-    default=False,
-    type=bool,
-    is_flag=True,
-    help="Allow overwriting existing template file.",
-)
-@click.argument("output_folder", type=click.Path())
-def xmcd_get_templates_command(chip_family: str, overwrite: bool, output_folder: str) -> None:
+@spsdk_family_option(families=XMCD.get_supported_families())
+@spsdk_output_option(directory=True, force=True)
+def xmcd_get_templates_command(family: str, output: str) -> None:
     """Create template of configurations in YAML format for all memory types.
 
     The template files folder name is specified as argument of this command.
     """
-    xmcd_get_templates(chip_family, overwrite, output_folder)
+    xmcd_get_templates(family, output)
 
 
-def xmcd_get_templates(chip_family: str, overwrite: bool, output_folder: str) -> None:
+def xmcd_get_templates(family: str, output: str) -> None:
     """Create template of configurations in YAML format for all memory types."""
-    mem_types = XMCD.get_supported_memory_types(chip_family)
+    mem_types = XMCD.get_supported_memory_types(family)
     for mem_type in mem_types:
-        config_types = XMCD.get_supported_configuration_types(chip_family, mem_type)
+        config_types = XMCD.get_supported_configuration_types(family, mem_type)
         for config_type in config_types:
-            output = os.path.join(output_folder, f"xmcd_{chip_family}_{mem_type}_{config_type}.yml")
-            if not os.path.isfile(output) or overwrite:
-                click.echo(f"Creating {output} template file.")
-                write_file(
-                    XMCD.generate_config_template(chip_family, mem_type, config_type), output
-                )
-            else:
-                click.echo(f"Skip creating {output}, this file already exists.")
+            output_file = os.path.join(
+                output, f"xmcd_{family}_{mem_type.label}_{config_type.label}.yaml"
+            )
+            write_file(
+                XMCD.generate_config_template(
+                    family,
+                    mem_type,
+                    config_type,
+                ),
+                output_file,
+            )
+            click.echo(f"The template file has been created: {get_printable_path(output_file)}.")
 
 
-@main.group(name="utils", no_args_is_help=True)
+@xmcd.command(name="verify", no_args_is_help=True)
+@spsdk_family_option(families=XMCD.get_supported_families())
+@click.option(
+    "-b",
+    "--binary",
+    type=click.Path(exists=True, readable=True, resolve_path=True),
+    required=True,
+    help="Path to binary XMCD image to parse.",
+)
+@click.option(
+    "-p",
+    "--problems",
+    is_flag=True,
+    default=False,
+    help="Show just problems in image.",
+)
+def xmcd_verify_command(family: str, binary: str, problems: bool) -> None:
+    """Verify XMCD Image."""
+    xmcd_verify(family=family, binary=binary, problems=problems)
+
+
+def xmcd_verify(family: str, binary: str, problems: bool) -> None:
+    """Verify XMCD Image."""
+    xmcd_image = XMCD.parse(load_binary(binary), family=family)
+    verifier = xmcd_image.verify()
+    print_verifier_to_console(verifier, problems)
+    if not problems:
+        click.echo(xmcd_image.registers.image_info().draw())
+
+
+@xmcd.command(name="crc-fuses-script", no_args_is_help=True)
+@spsdk_family_option(families=XMCD.get_supported_families())
+@spsdk_revision_option
+@click.option(
+    "-b",
+    "--binary",
+    type=click.Path(exists=True, readable=True, resolve_path=True),
+    required=True,
+    help="Path to binary XMCD image.",
+)
+@spsdk_output_option(required=True)
+def xmcd_crc_fuses_script_command(family: str, revision: str, binary: str, output: str) -> None:
+    """Generate XMCD CRC fuses script.
+
+    Programming the CRC checksum to the fuse enables the integrity check of XMCD block.
+    """
+    xmcd_block = XMCD.parse(load_binary(binary), family=family, revision=revision)
+    fuses_script = xmcd_block.create_crc_hash_fuses_script()
+    write_file(fuses_script, output)
+    click.echo(f"Success. (Created fuses script: {output} )")
+
+
+@bootable_image_group.group(name="wic", no_args_is_help=True, cls=SpsdkClickGroup)
+def wic() -> None:  # pylint: disable=unused-argument
+    """WIC (Whole Image Creator) Yocto Linux image format."""
+
+
+@wic.command(name="update-uboot", no_args_is_help=True)
+@click.option(
+    "-b",
+    "--binary",
+    type=click.Path(exists=True, readable=True, resolve_path=True),
+    required=True,
+    help="Path to binary WIC image.",
+)
+@click.option(
+    "-u",
+    "--uboot",
+    type=click.Path(exists=True, readable=True, resolve_path=True),
+    required=True,
+    help="Path to binary U-Boot image.",
+)
+def replace_uboot_command(binary: str, uboot: str) -> None:
+    """Replace U-Boot binary in WIC file."""
+    address = replace_uboot(binary, uboot)
+    click.echo(f"Replaced u-boot at address {hex(address)}")
+
+
+@main.group(name="utils", no_args_is_help=True, cls=SpsdkClickGroup)
 def utils_group() -> None:
     """Group of utilities."""
 
 
-@utils_group.group(name="binary-image", no_args_is_help=True)
+@utils_group.group(name="binary-image", no_args_is_help=True, cls=SpsdkClickGroup)
 def bin_image_group() -> None:
     """Binary Image utilities."""
 
@@ -1542,7 +2605,7 @@ def bin_image_group() -> None:
     default="zeros",
     help="Pattern of created file ('zeros', 'ones', 'rand', 'inc' or any number value).",
 )
-@click.argument("output", type=click.Path())
+@spsdk_output_option()
 def binary_create_command(size: int, pattern: str, output: str) -> None:
     """Create binary file with pattern.
 
@@ -1559,24 +2622,18 @@ def binary_create(size: int, pattern: str, output: str) -> None:
 
     write_file(data, output, mode="wb")
 
-    logger.info(f"Created file:\n{image.info()}")
+    logger.info(f"Created file:\n{str(image)}")
     logger.info(f"Created file:\n{image.draw()}")
     click.echo(f"Success. (Created binary file: {output} )")
 
 
 @bin_image_group.command(name="merge", no_args_is_help=True)
-@click.option(
-    "-c",
-    "--config",
-    type=click.Path(exists=True, readable=True),
-    required=True,
-    help="Path to configuration file of merge operation.",
-)
-@click.argument("output", type=click.Path())
+@spsdk_config_option(required=True)
+@spsdk_output_option()
 def binary_merge_command(config: str, output: str) -> None:
     """Merge binary images together by description in YAML/JSON configuration.
 
-    The configuration template files could be generated by subcommand 'utils bin-image get-template'.
+    The configuration template files could be generated by subcommand 'utils binary-image get-template'.
     """
     binary_merge(config, output)
 
@@ -1587,14 +2644,18 @@ def binary_merge(config: str, output: str) -> None:
     config_dir = os.path.dirname(config)
     check_config(cfg, BinaryImage.get_validation_schemas(), search_paths=[config_dir])
     image = BinaryImage.load_from_config(cfg, search_paths=[config_dir])
-    image.validate()
+    try:
+        image.validate()
+    except SPSDKError as exc:
+        click.echo(f"Image Validation fail:\n{image.draw()}")
+        raise SPSDKError(f"Image validation failed: {exc}") from exc
     data = image.export()
 
     write_file(data, output, mode="wb")
 
-    logger.info(f"Merged Image:\n{image.info()}")
+    logger.info(f"Merged Image:\n{str(image)}")
     logger.info(f"Merged Image:\n{image.draw()}")
-    click.echo(f"Success. (Merged image: {output} created.)")
+    click.echo(f"Success. (Merged image: {get_printable_path(output)} created.)")
 
 
 @bin_image_group.command(name="extract", no_args_is_help=True)
@@ -1619,13 +2680,9 @@ def binary_merge(config: str, output: str) -> None:
     required=True,
     help="Size of extracted chunk. For '0' it extract rest of the file from given address.",
 )
-@click.argument("output", type=click.Path())
+@spsdk_output_option()
 def binary_extract_command(binary: str, address: str, size: str, output: str) -> None:
-    """Extract chunk from binary file.
-
-    \b
-    OUTPUT - File name of stored chunk.
-    """
+    """Extract chunk from binary file."""
     binary_extract(binary, address, size, output)
 
 
@@ -1642,7 +2699,7 @@ def binary_extract(binary: str, address: str, size: str, output: str) -> None:
         click.echo(f"The required binary chunk is out of [{binary}] file space.")
         return
     write_file(bin_data[start:end], output, mode="wb")
-    click.echo(f"Success. (Extracted chunk: {output} created.)")
+    click.echo(f"Success. (Extracted chunk: {get_printable_path(output)} created.)")
 
 
 @bin_image_group.command(name="convert", no_args_is_help=True)
@@ -1661,13 +2718,9 @@ def binary_extract(binary: str, address: str, size: str, output: str) -> None:
     required=True,
     help="Output format.",
 )
-@click.argument("output", type=click.Path())
+@spsdk_output_option()
 def binary_convert_command(input_file: str, output_format: str, output: str) -> None:
-    """Convert input data file into selected format.
-
-    \b
-    OUTPUT - File name of converted file.
-    """
+    """Convert input data file into selected format."""
     binary_convert(input_file, output_format, output)
 
 
@@ -1676,37 +2729,141 @@ def binary_convert(input_file: str, output_format: str, output: str) -> None:
     image = BinaryImage.load_binary_image(input_file)
     logger.info(image.draw())
     image.save_binary_image(output, file_format=output_format)
-    click.echo(f"Success. (Converted file: {output} created.)")
+    click.echo(f"Success. (Converted file: {get_printable_path(output)} created.)")
 
 
 @bin_image_group.command(name="get-template", no_args_is_help=True)
-@click.option(
-    "-o",
-    "--overwrite",
-    default=False,
-    type=bool,
-    is_flag=True,
-    help="Allow overwriting existing template file.",
-)
-@click.argument("output", type=click.Path())
-def binary_get_template_command(overwrite: bool, output: str) -> None:
+@spsdk_output_option(force=True)
+def binary_get_template_command(output: str) -> None:
     """Create template of configuration in YAML format.
 
     The template file name is specified as argument of this command.
     """
-    binary_get_template(overwrite, output)
+    binary_get_template(output)
 
 
-def binary_get_template(overwrite: bool, output: str) -> None:
+def binary_get_template(output: str) -> None:
     """Create template of configuration in YAML format."""
-    if not os.path.isfile(output) or overwrite:
-        click.echo(f"Creating {output} template file.")
-        write_file(BinaryImage.generate_config_template(), output)
-    else:
-        click.echo(f"Skip creating {output}, this file already exists.")
+    click.echo(f"Creating {get_printable_path(output)} template file.")
+    write_file(BinaryImage.generate_config_template(), output)
 
 
-@utils_group.group(name="convert", no_args_is_help=True)
+@bin_image_group.command(name="align", no_args_is_help=True)
+@click.option(
+    "-i",
+    "--input-file",
+    type=click.Path(file_okay=True, dir_okay=False, resolve_path=True),
+    required=True,
+    help="Binary file name to be aligned.",
+)
+@spsdk_output_option(
+    required=False,
+    help="Aligned file name. If not specified, input file will be updated.",
+)
+@click.option(
+    "-a",
+    "--alignment",
+    default=1,
+    type=INT(),
+    help="Alignment size.",
+)
+@click.option(
+    "-p",
+    "--pattern",
+    type=str,
+    default="zeros",
+    help="Pattern of used padding ('zeros', 'ones', 'rand', 'inc' or any number value).",
+)
+def binary_align_command(input_file: str, output: str, alignment: int, pattern: str) -> None:
+    """Align binary file to provided alignment and padded with specified pattern."""
+    binary_align(input_file, output, alignment, pattern)
+
+
+def binary_align(
+    input_file: str, output: Optional[str] = None, alignment: int = 1, pattern: str = "zeros"
+) -> None:
+    """Align binary file to provided alignment and padded with specified pattern.
+
+    :param input_file: Input file name.
+    :param output: Output file name. If not specified, input file will be updated.
+    :param alignment: Size of alignment block.
+    :param pattern: Padding pattern.
+
+    :raises SPSDKError: Invalid input arguments.
+    """
+    if not input_file or not os.path.isfile(input_file):
+        raise SPSDKError("Binary file alignment: Invalid input file")
+    if alignment <= 0:
+        raise SPSDKError("Binary file alignment: Alignment value must be 1 or greater.")
+    if not output:
+        output = input_file
+    binary = align_block(data=load_binary(input_file), alignment=alignment, padding=pattern)
+    write_file(binary, output, mode="wb")
+    click.echo(
+        f"The {input_file} file has been aligned to {len(binary)} ({hex(len(binary))}) bytes \
+            and stored into {output}"
+    )
+
+
+@bin_image_group.command(name="pad", no_args_is_help=True)
+@click.option(
+    "-i",
+    "--input-file",
+    type=click.Path(file_okay=True, dir_okay=False, resolve_path=True),
+    required=True,
+    help="Binary file name to be padded.",
+)
+@spsdk_output_option(
+    required=False,
+    help="Padded file name. If not specified, input file will be updated.",
+)
+@click.option(
+    "-s",
+    "--size",
+    required=True,
+    type=INT(),
+    help="Result file size.",
+)
+@click.option(
+    "-p",
+    "--pattern",
+    type=str,
+    default="zeros",
+    help="Pattern of used padding ('zeros', 'ones', 'rand', 'inc' or any number value).",
+)
+def binary_pad_command(input_file: str, output: str, size: int, pattern: str) -> None:
+    """Pad binary file to provided final size with specified pattern."""
+    binary_pad(input_file, output, size, pattern)
+
+
+def binary_pad(
+    input_file: str, output: Optional[str] = None, size: int = 1, pattern: str = "zeros"
+) -> None:
+    """Pad binary file to provided final size with specified pattern.
+
+    :param input_file: Input file name.
+    :param output: Output file name. If not specified, input file will be updated.
+    :param size: Final size of file.
+    :param pattern: Padding pattern.
+
+    :raises SPSDKError: Invalid input arguments.
+    """
+    if not input_file or not os.path.isfile(input_file):
+        raise SPSDKError("Binary file alignment: Invalid input file")
+    if not output:
+        output = input_file
+    binary = load_binary(input_file)
+    if len(binary) < size:
+        binary = align_block(data=binary, alignment=size, padding=pattern)
+    write_file(binary, output, mode="wb")
+
+    click.echo(
+        f"The '{input_file}' file has been padded to {len(binary)} ({hex(len(binary))}) byte size and "
+        f"stored into '{output}'"
+    )
+
+
+@utils_group.group(name="convert", no_args_is_help=True, cls=SpsdkClickGroup)
 def convert() -> None:  # pylint: disable=unused-argument
     """Conversion utilities."""
 
@@ -1727,13 +2884,9 @@ def convert() -> None:  # pylint: disable=unused-argument
     default=False,
     help="The resulting binary bytes will be stored in reverse order (for example SBKEK in elftosb requires that).",
 )
-@click.argument("output", type=click.Path())
+@spsdk_output_option()
 def convert_hex2bin_command(input_file: str, reverse: bool, output: str) -> None:
-    """Convert file with hexadecimal string into binary file with optional reverse order of stored bytes.
-
-    \b
-    OUTPUT - File name of converted file.
-    """
+    """Convert file with hexadecimal string into binary file with optional reverse order of stored bytes."""
     convert_hex2bin(input_file, reverse, output)
 
 
@@ -1743,14 +2896,18 @@ def convert_hex2bin(input_file: str, reverse: bool, output: str) -> None:
         value = bytearray.fromhex(load_text(input_file))
     except (SPSDKError, ValueError) as e:
         raise SPSDKAppError(f"Failed loading hexadecimal value from: {input_file}") from e
-    else:
-        if reverse:
-            value.reverse()
-        write_file(value, output, mode="wb")
-        click.echo(f"Success. Converted file: {output}")
+    if reverse:
+        value.reverse()
+    write_file(value, output, mode="wb")
+    click.echo(f"Success. Converted file: {output}")
 
 
-@convert.command(name="bin2hex", no_args_is_help=True, short_help="AAAA", help="BBBBB")
+@convert.command(
+    name="bin2hex",
+    no_args_is_help=True,
+    short_help="Convert binary file to hexadecimal text file.",
+    help="Convert binary file into hexadecimal text file with optional reverse order of stored bytes.",
+)
 @click.option(
     "-i",
     "--input-file",
@@ -1766,13 +2923,9 @@ def convert_hex2bin(input_file: str, reverse: bool, output: str) -> None:
     default=False,
     help="The result binary bytes will be stored in reverse order (for example SBKEK in elftosb this required).",
 )
-@click.argument("output", type=click.Path())
+@spsdk_output_option()
 def convert_bin2hex_command(input_file: str, reverse: bool, output: str) -> None:
-    """Convert binary file into hexadecimal text file with optional reverse order of stored bytes.
-
-    \b
-    OUTPUT - File name of converted file.
-    """
+    """Convert binary file into hexadecimal text file with optional reverse order of stored bytes."""
     convert_bin2hex(input_file, reverse, output)
 
 
@@ -1802,15 +2955,16 @@ def convert_bin2hex(input_file: str, reverse: bool, output: str) -> None:
 @click.option(
     "-t",
     "--type",
-    type=click.Choice(["uint8_t", "uint16_t", "uint32_t", "uint64_t"]),
+    "output_type",
+    type=click.Choice(["uint8_t", "uint16_t", "uint32_t", "uint64_t"], case_sensitive=False),
     default="uint8_t",
     help="The output C array type.",
 )
 @click.option(
     "-e",
     "--endian",
-    type=click.Choice(["big", "little"]),
-    default="big",
+    type=click.Choice(Endianness.values(), case_sensitive=False),
+    default=Endianness.BIG.value,
     help="The binary input file endian.",
 )
 @click.option(
@@ -1832,10 +2986,8 @@ def convert_bin2hex(input_file: str, reverse: bool, output: str) -> None:
     default=4,
     help="The tabulator size for new line.",
 )
-@click.option(
-    "-o",
-    "--output-file",
-    type=click.Path(),
+@spsdk_output_option(
+    required=False,
     help=(
         "Path to output text file with created C array, "
         "if not specified the output will be printed into standard output."
@@ -1844,12 +2996,12 @@ def convert_bin2hex(input_file: str, reverse: bool, output: str) -> None:
 def convert_bin2carr(
     input_file: str,
     name: str,
-    type: str,
+    output_type: str,
     endian: str,
     padding: str,
     count_per_line: int,
     tab: int,
-    output_file: str,
+    output: str,
 ) -> None:
     """Convert binary file into C array string.
 
@@ -1857,7 +3009,7 @@ def convert_bin2carr(
     converted to 16/32 or 64 bit unsigned types with specified endianness.
     """
     raw_binary = load_binary(input_file)
-    width = {"uint8_t": 1, "uint16_t": 2, "uint32_t": 4, "uint64_t": 8}[type]
+    width = {"uint8_t": 1, "uint16_t": 2, "uint32_t": 4, "uint64_t": 8}[output_type]
 
     if len(raw_binary) != align(len(raw_binary), width) and padding is None:
         raise SPSDKAppError("Unaligned binary image, if still to be used, define '-p' padding.")
@@ -1869,14 +3021,14 @@ def convert_bin2carr(
     count = rest_bytes // width
     name = name or os.path.splitext(os.path.basename(input_file))[0]
     index = 0
-    ret = f"const {type} {name}[{count}] = {{\n"
+    ret = f"const {output_type} {name}[{count}] = {{\n"
     while rest_bytes:
         line_cnt = min(count_per_line, rest_bytes // width)
         comment = f"// 0x{index:09_X}"
         ret += " " * tab
-        for i in range(line_cnt):
+        for _ in range(line_cnt):
             data = bytearray(binary[index : index + width])
-            if endian.lower() == "little":
+            if endian.lower() == Endianness.LITTLE:
                 data.reverse()
             ret += "0x" + data.hex() + ", "
             index += width
@@ -1884,10 +3036,74 @@ def convert_bin2carr(
         ret += f" {comment}\n"
     ret += "};\n"
 
-    if output_file:
-        write_file(ret, output_file)
+    if output:
+        write_file(ret, output)
+        click.echo(f"Success. Created C file: {output}")
     else:
         click.echo(ret)
+
+
+@main.group(name="lpcprog", no_args_is_help=True, cls=SpsdkClickGroup)
+def lpcprog_group() -> None:
+    """Group of sub-commands related to lpcprog tool."""
+
+
+@lpcprog_group.command(name="set-crp", no_args_is_help=True)
+@click.option(
+    "-b",
+    "--binary",
+    type=click.Path(exists=True, readable=True, resolve_path=True),
+    required=True,
+    help="Path to binary image to update CRP.",
+)
+@click.option(
+    "-l",
+    "--level",
+    help="level",
+    required=True,
+    type=click.Choice(choices=LPCProgCRPLevels.labels(), case_sensitive=False),
+)
+@spsdk_output_option()
+def lpcprog_update_crp_command(binary: str, level: str, output: str) -> None:
+    """Update CRP value in binary image.
+
+    Code Read Protection is a mechanism that allows the user to enable different levels of
+    security in the system so that access to the on-chip flash and use of the ISP can be
+    restricted. When needed, CRP is invoked by programming a specific pattern in the flash
+    image at offset 0x0000 02FC.
+    """
+    lpcprog_update_crp(binary, level, output)
+
+
+def lpcprog_update_crp(binary: str, crp: str, output: str) -> None:
+    """Update CRP value in binary image."""
+    bin_data = load_binary(binary)
+    crp_level = LPCProgCRPLevels.from_label(crp)
+    new_data = lpcprog_update_crp_value(bin_data, crp_level.tag)
+    write_file(new_data, output, mode="wb")
+    click.echo(f"Success. Updated CRP in binary image: {output}")
+
+
+@lpcprog_group.command(name="make-bootable", no_args_is_help=True)
+@click.option(
+    "-b",
+    "--binary",
+    type=click.Path(exists=True, readable=True, resolve_path=True),
+    required=True,
+    help="Input plain binary application image.",
+)
+@spsdk_output_option()
+def lpcprog_make_bootable_command(binary: str, output: str) -> None:
+    """Make binary image bootable by inserting correct checksum of vector table."""
+    lpcprog_make_bootable(binary, output)
+
+
+def lpcprog_make_bootable(binary: str, output: str) -> None:
+    """Make binary image bootable by inserting correct checksum of vector table."""
+    bin_data = load_binary(binary)
+    new_data = lpcprog_make_image_bootable(bin_data)
+    write_file(new_data, output, mode="wb")
+    click.echo(f"Success. Updated binary image: {output}")
 
 
 @catch_spsdk_error

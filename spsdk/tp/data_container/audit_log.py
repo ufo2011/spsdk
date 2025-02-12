@@ -1,20 +1,21 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2021-2023 NXP
+# Copyright 2021-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 """Module for generating, processing and verifying TP Audit Log."""
 import contextlib
 import os
 import sqlite3
-from typing import Iterator, List, NamedTuple, Optional, Tuple, Union
+from typing import Iterator, NamedTuple, Optional
 
-from spsdk.utils.crypto.backend_openssl import ec, openssl_backend
-
-from ..exceptions import SPSDKTpError
-from .data_container import Container
-from .payload_types import PayloadType
+from spsdk.crypto.hash import get_hash
+from spsdk.crypto.keys import PublicKeyEcc
+from spsdk.tp.data_container.data_container import Container
+from spsdk.tp.data_container.payload_types import PayloadType
+from spsdk.tp.exceptions import SPSDKTpError
+from spsdk.utils.misc import Endianness
 
 DB_VERSION = 2
 
@@ -109,7 +110,7 @@ class AuditLogRecord(NamedTuple):
     """Single record in the Audit log."""
 
     nxp_id_cert: bytes
-    oem_id_certs: List[bytes]
+    oem_id_certs: list[bytes]
     prod_counter: bytes
     start_hash: bytes
     signature: bytes
@@ -151,7 +152,7 @@ class AuditLogRecord(NamedTuple):
     @property
     def prod_counter_int(self) -> int:
         """Return production counter as an integer."""
-        return int.from_bytes(self.prod_counter, byteorder="big")
+        return int.from_bytes(self.prod_counter, byteorder=Endianness.BIG.value)
 
     def as_dict(self) -> dict:
         """Return dictionary suitable for writing into log file."""
@@ -196,17 +197,16 @@ class AuditLogRecord(NamedTuple):
             data_to_hash += oem_cert or bytes()
         data_to_hash += self.prod_counter
         data_to_hash += self.start_hash
-        return openssl_backend.hash(data_to_hash)
+        return get_hash(data_to_hash)
 
-    def is_valid(self, key: Union[ec.EllipticCurvePublicKey, bytes]) -> bool:
+    def is_valid(self, key: PublicKeyEcc) -> bool:
         """Check if record is valid.
 
         :param key: PEM-encoded public key or public key object
         :return: True if signature checks out
         """
         new_hash = self.new_hash()
-        return openssl_backend.ecc_verify(
-            public_key=key,
+        return key.verify_signature(
             signature=self.signature,
             data=new_hash,
         )
@@ -237,7 +237,7 @@ class AuditLogProperties(NamedTuple):
         return AuditLogProperties(data[1], data[2])
 
 
-class AuditLog(List[AuditLogRecord]):
+class AuditLog(list[AuditLogRecord]):
     """Full Audit log, List of AuditLogRecords."""
 
     @staticmethod
@@ -263,8 +263,8 @@ class AuditLog(List[AuditLogRecord]):
 
     @staticmethod
     def records(
-        file_path: str, id_slice: Optional[Tuple[int, int]] = None
-    ) -> Iterator[Tuple[int, AuditLogRecord]]:
+        file_path: str, id_slice: Optional[tuple[int, int]] = None
+    ) -> Iterator[tuple[int, AuditLogRecord]]:
         """Read records from database file.
 
         :param file_path: Path to database file
@@ -273,7 +273,7 @@ class AuditLog(List[AuditLogRecord]):
         """
         command = (SELECT_SLICE_COMMAND, id_slice) if id_slice else (SELECT_COMMAND,)
         with sqlite_cursor(file_path) as cursor:
-            cursor.execute(*command)  # type: ignore
+            cursor.execute(*command)
             for item in cursor:
                 yield item[0], AuditLogRecord.from_tuple(item)
 

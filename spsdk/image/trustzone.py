@@ -1,78 +1,75 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2020-2023 NXP
+# Copyright 2020-2025 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
 """Module provides support for TrustZone configuration data."""
 import logging
-import os
 import struct
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
-from spsdk import SPSDKError
-from spsdk.image import TZ_SCH_FILE
-from spsdk.utils.database import Database
-from spsdk.utils.easy_enum import Enum
-from spsdk.utils.misc import format_value, load_configuration, value_to_int
-from spsdk.utils.schema_validator import ConfigTemplate, ValidationSchemas
+from spsdk.exceptions import SPSDKError
+from spsdk.utils.database import DatabaseManager, get_db, get_families, get_schema_file
+from spsdk.utils.misc import format_value, value_to_int
+from spsdk.utils.schema_validator import CommentedConfig, update_validation_schema_family
+from spsdk.utils.spsdk_enum import SpsdkEnum
 
 logger = logging.getLogger(__name__)
 
 
-class TrustZoneType(Enum):
+class TrustZoneType(SpsdkEnum):
     """Enum defining various types of TrustZone types."""
 
-    ENABLED = (0x00, "TrustZone enabled with default settings")
-    CUSTOM = (0x20, "TrustZone enabled with custom settings")
-    DISABLED = (0x40, "Disabled")
+    ENABLED = (0x0, "ENABLED", "TrustZone enabled with default settings")
+    CUSTOM = (0x1, "CUSTOM", "TrustZone enabled with custom settings")
+    DISABLED = (0x2, "DISABLED", "Disabled")
 
 
 class TrustZone:
     """Provide creation of binary data to set up the TrustZone engine in CM-33."""
 
-    PRESET_DIR = os.path.normpath(
-        os.path.join(os.path.dirname(__file__), "..", "data", "tz_presets")
-    )
-    CONFIG_FILE = os.path.join(PRESET_DIR, "database.yaml")
-
     @classmethod
     def enabled(cls) -> "TrustZone":
-        """Alternate constructor for ENABLED type of TrustZone."""
+        """Alternate constructor for ENABLED type of TrustZone.
+
+        :returns: TrustZone object
+        """
         return cls(tz_type=TrustZoneType.ENABLED)
 
     @classmethod
-    def disabled(cls) -> "TrustZone":
-        """Alternate constructor for DISABLED type of TrustZone."""
+    def disabled(
+        cls,
+    ) -> "TrustZone":
+        """Alternate constructor for DISABLED type of TrustZone.
+
+        :returns: TrustZone object
+        """
         return cls(tz_type=TrustZoneType.DISABLED)
 
     @classmethod
-    def custom(
-        cls, family: str, customizations: dict, revision: Optional[str] = None
-    ) -> "TrustZone":
+    def custom(cls, family: str, customizations: dict, revision: str = "latest") -> "TrustZone":
         """Alternate constructor for CUSTOM type of TrustZone."""
         return cls(
-            tz_type=TrustZoneType.CUSTOM,
             family=family,
             revision=revision,
+            tz_type=TrustZoneType.CUSTOM,
             customizations=customizations,
         )
 
     @classmethod
-    def from_binary(
-        cls, family: str, raw_data: bytes, revision: Optional[str] = None
-    ) -> "TrustZone":
+    def from_binary(cls, family: str, raw_data: bytes, revision: str = "latest") -> "TrustZone":
         """Alternate constructor using existing binary data."""
         return cls(
-            tz_type=TrustZoneType.CUSTOM,
             family=family,
             revision=revision,
+            tz_type=TrustZoneType.CUSTOM,
             raw_data=raw_data,
         )
 
     @classmethod
-    def from_config(cls, config_data: Dict[str, Any]) -> "TrustZone":
+    def from_config(cls, config_data: dict[str, Any]) -> "TrustZone":
         """Alternate constructor using configuration data.
 
         :raises SPSDKError: Invalid configuration file.
@@ -80,7 +77,7 @@ class TrustZone:
         """
         try:
             family = config_data["family"]
-            revision = config_data.get("revision")
+            revision = config_data.get("revision", "latest")
             presets = config_data["trustZonePreset"]
             return cls.custom(family=family, customizations=presets, revision=revision)
         except (TypeError, SPSDKError) as exc:
@@ -88,18 +85,16 @@ class TrustZone:
 
     def __init__(
         self,
+        family: str = "Unknown",
+        revision: str = "latest",
         tz_type: TrustZoneType = TrustZoneType.ENABLED,
-        family: Optional[str] = None,
-        revision: Optional[str] = None,
         customizations: Optional[dict] = None,
         raw_data: Optional[bytes] = None,
     ) -> None:
         """Initialize the trustzone."""
         self.type = tz_type
         self.family = family
-        self.database = self.load_database()
         self.customs = customizations
-        self.revision = revision
 
         if self.type == TrustZoneType.DISABLED and customizations:
             raise SPSDKError("TrustZone was disabled, can't add trust_zone_data")
@@ -108,18 +103,9 @@ class TrustZone:
             self.type = TrustZoneType.CUSTOM
 
         if self.type == TrustZoneType.CUSTOM:
-            if not self.family:
-                raise SPSDKError("Need to provide 'family' parameter")
-            self.family = self.family.lower()
-            if self.family not in self.get_families():
-                raise SPSDKError(f"Chip family '{self.family}' is not supported\n")
-            self.revision = self.sanitize_revision(self.family, self.revision)
-            if self.revision not in self.get_revisions():
-                raise SPSDKError(
-                    f"Revision '{self.revision}' is not supported on family '{self.family}'\n"
-                )
-
-            self.presets: dict = self._load_presets()
+            self.presets: dict = DatabaseManager().db.load_db_cfg_file(
+                get_db(family, revision).get_file_path(DatabaseManager.TZ, "reg_spec")
+            )
             if raw_data:
                 self.customs = self._parse_raw_data(raw_data)
             if self.customs is None:
@@ -132,16 +118,32 @@ class TrustZone:
                 )
 
     @classmethod
-    def get_validation_schemas_family(cls) -> List[Dict[str, Any]]:
+    def get_preset_data_size(cls, family: str, revision: str = "latest") -> int:
+        """Get size of preset data in binary form.
+
+        :param family: Family description.
+        :param revision: Chip revision specification, as default, latest is used.
+        :raises SPSDKValueError: Family or revision is not supported.
+        :return: Size of TZ data.
+        """
+        database = get_db(family, revision)
+        data = DatabaseManager().db.load_db_cfg_file(
+            database.get_file_path(DatabaseManager.TZ, "reg_spec")
+        )
+        return len(data) * 4
+
+    @classmethod
+    def get_validation_schemas_family(cls) -> list[dict[str, Any]]:
         """Create the validation schema just for supported families.
 
         :return: List of validation schemas for TZ supported families.
         """
-        sch_cfg = ValidationSchemas.get_schema_file(TZ_SCH_FILE)
-        return [sch_cfg["tz_family_rev"]]
+        sch_cfg = get_schema_file("general")["family"]
+        update_validation_schema_family(sch_cfg["properties"], cls.get_supported_families())
+        return [sch_cfg]
 
     @classmethod
-    def get_validation_schemas(cls, family: str, revision: str = "latest") -> List[Dict[str, Any]]:
+    def get_validation_schemas(cls, family: str, revision: str = "latest") -> list[dict[str, Any]]:
         """Create the validation schema.
 
         :param family: Family description.
@@ -149,15 +151,14 @@ class TrustZone:
         :raises SPSDKError: Family or revision is not supported.
         :return: List of validation schemas.
         """
-        database = cls.load_database()
-        sch_cfg = ValidationSchemas.get_schema_file(TZ_SCH_FILE)
+        sch_cfg = get_schema_file(DatabaseManager.TZ)
+        sch_family = get_schema_file("general")["family"]
         preset_properties = {}
 
         try:
-            revision_info = database.devices.get_by_name(family).revisions.get(revision)
-            assert revision_info.data_file
-            presets = load_configuration(
-                os.path.join(TrustZone.PRESET_DIR, revision_info.data_file)
+            database = get_db(family, revision)
+            presets = DatabaseManager().db.load_db_cfg_file(
+                database.get_file_path(DatabaseManager.TZ, "reg_spec")
             )
             for key, value in presets.items():
                 preset_properties[key] = {
@@ -170,13 +171,15 @@ class TrustZone:
             if "patternProperties" in sch_cfg["tz"]["properties"]["trustZonePreset"].keys():
                 sch_cfg["tz"]["properties"]["trustZonePreset"].pop("patternProperties")
             sch_cfg["tz"]["properties"]["trustZonePreset"]["properties"] = preset_properties
-
-            return [sch_cfg["tz_family_rev"], sch_cfg["tz"]]
+            update_validation_schema_family(
+                sch_family["properties"], cls.get_supported_families(), family, revision
+            )
+            return [sch_family, sch_cfg["tz"]]
         except (KeyError, SPSDKError) as exc:
             raise SPSDKError(f"Family {family} or revision {revision} is not supported") from exc
 
     @classmethod
-    def generate_config_template(cls, family: str, revision: str = "latest") -> Dict[str, str]:
+    def generate_config_template(cls, family: str, revision: str = "latest") -> dict[str, str]:
         """Generate configuration for selected family.
 
         :param family: Family description.
@@ -184,90 +187,42 @@ class TrustZone:
         :raises SPSDKError: Revision is not supported.
         :return: Dictionary of individual templates (key is name of template, value is template itself).
         """
-        ret: Dict[str, str] = {}
-        database = cls.load_database()
-        if family in cls.get_supported_families():
-            try:
-                revision_info = database.devices.get_by_name(family).revisions.get(revision)
-                revision = revision_info.name
-            except (KeyError, SPSDKError) as exc:
-                raise SPSDKError(f"Revision {revision} is not supported") from exc
+        ret: dict[str, str] = {}
+        schemas = cls.get_validation_schemas(family, revision)
 
-            schemas = cls.get_validation_schemas(family, revision)
-            override = {}
-            override["family"] = family
-            override["revision"] = revision
-
-            yaml_data = ConfigTemplate(
-                f"Trust Zone Configuration template for {family}.",
-                schemas,
-                override,
-            ).export_to_yaml()
-            ret[f"{family}_tz"] = yaml_data
+        yaml_data = CommentedConfig(
+            f"Trust Zone Configuration template for {family}.", schemas
+        ).get_template()
+        ret[f"{family}_tz"] = yaml_data
 
         return ret
 
+    def __repr__(self) -> str:
+        return self.__str__()
+
     def __str__(self) -> str:
-        return f"<TrustZone: type: {self.type} ({TrustZoneType.desc(self.type)})"
+        return f"<TrustZone: type: {self.type} ({self.type.description})"
 
-    @classmethod
-    def load_database(cls) -> Database:
-        """Load data from TZ config file."""
-        return Database(cls.CONFIG_FILE)
-
-    @classmethod
-    def get_supported_families(cls) -> List[str]:
+    @staticmethod
+    def get_supported_families() -> list[str]:
         """Return list of supported families."""
-        return Database.get_devices(cls.CONFIG_FILE).device_names
-
-    def get_families(self) -> List[str]:
-        """Return list of supported chip families."""
-        return self.database.devices.device_names
-
-    def get_revisions(self, family: Optional[str] = None) -> List[str]:
-        """Return a list of revisions for given family."""
-        actual_family = family or self.family
-        assert actual_family
-        revisions = self.database.devices.get_by_name(actual_family).revisions
-        return [revision.name for revision in revisions]
-
-    def get_latest_revision(self, family: Optional[str] = None) -> str:
-        """Return latest revision for given family."""
-        actual_family = family or self.family
-        assert actual_family
-        return self.database.devices.get_by_name(actual_family).revisions.get_latest().name
-
-    def sanitize_revision(self, family: str, revision: Optional[str] = None) -> str:
-        """Sanitize revision.
-
-        if the 'revision' is None return the latest revision
-        if the 'revision' is provided return it as lower-case
-        """
-        if not revision or revision.lower() == "latest":
-            return self.get_latest_revision(family)
-        return revision.lower()
-
-    def _get_preset_file(self) -> str:
-        assert self.family
-        file_name = (
-            self.database.devices.get_by_name(self.family).revisions.get(self.revision).data_file
-        )
-        assert file_name, f"Data file for {self.family} does't exist!"
-        return os.path.join(TrustZone.PRESET_DIR, file_name)
-
-    def _load_presets(self) -> dict:
-        """Load default TrustZone settings for given family and revision."""
-        return load_configuration(self._get_preset_file())
+        return get_families(DatabaseManager.TZ)
 
     def _parse_raw_data(self, raw_data: bytes) -> dict:
         """Parse raw data into 'customizations' format."""
-        if len(self.presets) != len(raw_data) // 4:
+        if len(self.presets) > len(raw_data) // 4:
             raise SPSDKError(
                 "Trustzone binary file has incorrect raw_data length\n"
                 f"Expected: {len(self.presets)}, Got: {len(raw_data) // 4}"
             )
 
-        registers = struct.unpack(f"<{len(raw_data) // 4}L", raw_data)
+        if len(self.presets) != len(raw_data) // 4:
+            logger.warning(
+                "Trustzone binary file has incorrect raw_data length\n"
+                f"Expected: {len(self.presets)}, Got: {len(raw_data) // 4}"
+            )
+
+        registers = struct.unpack(f"<{len(self.presets)}L", raw_data[: len(self.presets) * 4])
         customs = {name: format_value(registers[i], 32) for i, name in enumerate(self.presets)}
         return customs
 
@@ -281,10 +236,12 @@ class TrustZone:
             raise SPSDKError("Preset data not present")
         if self.customs is None:
             raise SPSDKError("Data not present")
-        logger.info(f"{len(self.presets)} registers loaded from defaults")
-        logger.debug(self.presets)
-        logger.info(f"{len(self.customs)} modifications provided")
-        logger.debug(self.customs)
+        modifications = set(self.customs.items()) - set(self.presets.items())
+        logger.info(f"{len(modifications)} modifications provided")
+        if (
+            logger.getEffectiveLevel() <= logging.DEBUG
+        ):  # Do this additional condition to avoid creating of huge strings used for debug
+            logger.debug(str(modifications).replace(", ", "\n"))
         data = self.presets
         data.update(self.customs)
         registers = [value_to_int(item) for item in data.values()]

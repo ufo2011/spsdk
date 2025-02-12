@@ -1,16 +1,20 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# Copyright 2020-2023 NXP
+# Copyright 2020-2024 NXP
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
 """Module with Debug Authentication Challenge (DAC) Packet."""
 
+import logging
 from struct import calcsize, pack, unpack_from
 
-from spsdk.dat.debug_credential import DebugCredential
+from spsdk.dat.debug_credential import DebugCredentialCertificate, ProtocolVersion
 from spsdk.exceptions import SPSDKValueError
+from spsdk.utils.database import DatabaseManager, get_db
+
+logger = logging.getLogger(__name__)
 
 
 class DebugAuthenticationChallenge:
@@ -18,7 +22,7 @@ class DebugAuthenticationChallenge:
 
     def __init__(
         self,
-        version: str,
+        version: ProtocolVersion,
         socc: int,
         uuid: bytes,
         rotid_rkh_revocation: int,
@@ -50,10 +54,13 @@ class DebugAuthenticationChallenge:
         self.cc_vu = cc_vu
         self.challenge = challenge
 
-    def info(self) -> str:
+    def __repr__(self) -> str:
+        return f"DAC v{self.version}, SOCC: 0x{self.socc:08X}"
+
+    def __str__(self) -> str:
         """String representation of DebugCredential."""
         msg = f"Version                : {self.version}\n"
-        msg += f"SOCC                   : {DebugCredential.get_socc_description(self.version, self.socc)}\n"
+        msg += f"SOCC                   : 0x{self.socc:08X}\n"
         msg += f"UUID                   : {self.uuid.hex().upper()}\n"
         msg += f"CC_VU                  : {self.cc_vu}\n"
         msg += f"ROTID_rkh_revocation   : {format(self.rotid_rkh_revocation, '08X')}\n"
@@ -63,15 +70,16 @@ class DebugAuthenticationChallenge:
         msg += f"Challenge              : {self.challenge.hex()}\n"
         return msg
 
-    def validate_against_dc(self, dc: DebugCredential) -> None:
+    def validate_against_dc(self, family: str, dc: DebugCredentialCertificate) -> None:
         """Validate against Debug Credential file.
 
-        :param dc: Debug Credential class to be validate by DAC
+        :param family: Chip family name
+        :param dc: Debug Credential class to be validated by DAC
         :raises SPSDKValueError: In case of invalid configuration detected.
         """
-        if self.version != dc.VERSION and self.socc not in [0x5254049C]:
+        if self.version != dc.version and not DebugCredentialCertificate.dat_based_on_ele(family):
             raise SPSDKValueError(
-                f"DAC Verification failed: Invalid protocol version.\nDAC: {self.version}\nDC:  {dc.VERSION}"
+                f"DAC Verification failed: Invalid protocol version.\nDAC: {self.version}\nDC:  {dc.version}"
             )
         if self.socc != dc.socc:
             raise SPSDKValueError(
@@ -81,18 +89,33 @@ class DebugAuthenticationChallenge:
             raise SPSDKValueError(
                 f"DAC Verification failed: Invalid UUID.\nDAC: {self.uuid.hex()}\nDC:  {dc.uuid.hex()}"
             )
-
-        dc_rotkh = dc.get_rotkh()
-        if not all(
+        dc_rotkh = dc.calculate_hash()
+        if dc_rotkh and not all(
             self.rotid_rkth_hash[x] == dc_rotkh[x] for x in range(len(self.rotid_rkth_hash))
         ):
-            raise SPSDKValueError(
-                f"DAC Verification failed: Invalid RoT Hash. \nDAC: {self.rotid_rkth_hash.hex()}\nDC:  {dc_rotkh.hex()}"
-            )
+            db = get_db(family)
+            rot_not_part_of_dac = db.get_bool(DatabaseManager.DAT, "rot_not_part_of_dac", False)
+            rot_could_be_invalid = db.get_bool(DatabaseManager.DAT, "rot_could_be_invalid", False)
+
+            if rot_not_part_of_dac:
+                # For some devices this is expected because RKTH is not part of the challenge
+                return
+
+            if rot_could_be_invalid:
+                logger.warning(
+                    "The DAC(Debug Authentication Challenge) RKTH doesn't match with DC(Debug Credential)."
+                    "Example: For RW61x devices, this is correct behavior, for LPC55S3x it indicates incorrect DC file,"
+                    "and needs to be fixed."
+                )
+            else:
+                raise SPSDKValueError(
+                    f"DAC Verification failed: Invalid RKTH.\n"
+                    f"DAC: {self.rotid_rkth_hash.hex()}\nDC:  {dc_rotkh.hex()}"
+                )
 
     def export(self) -> bytes:
         """Exports the DebugAuthenticationChallenge into bytes."""
-        data = pack("<2H", *[int(part) for part in self.version.split(".")])
+        data = pack("<2H", *[self.version.major, self.version.minor])
         data += pack("<L", self.socc)
         data += self.uuid
         data += pack("<L", self.rotid_rkh_revocation)
@@ -103,20 +126,52 @@ class DebugAuthenticationChallenge:
         data += self.challenge
         return data
 
+    @staticmethod
+    def get_rot_hash_length(family: str, major_ver: int, minor_ver: int) -> int:
+        """Returns length of Root Of Trust hash length.
+
+        :param family: The chip family name
+        :param major_ver: Major version
+        :param minor_ver: Minor version
+        :return: Length of Root Of Trust hash in bytes
+        """
+        db = get_db(family)
+        based_on_ele = DebugCredentialCertificate.dat_based_on_ele(family)
+
+        # Note: EdgeLock is always 256b SRKH - if P384 these are the first 256b of SHA384(SRKT)
+        if based_on_ele:
+            return 32
+        dat_is_using_sha256_always = db.get_bool(
+            DatabaseManager.DAT, "dat_is_using_sha256_always", False
+        )
+
+        if major_ver == 2 and not dat_is_using_sha256_always:
+            if minor_ver == 1:
+                return 48
+            if minor_ver == 2:
+                return 64
+
+        return 32
+
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0) -> "DebugAuthenticationChallenge":
+    def parse(cls, data: bytes) -> "DebugAuthenticationChallenge":
         """Parse the data into a DebugAuthenticationChallenge.
 
         :param data: Raw data as bytes
-        :param offset: Offset within the input data
         :return: DebugAuthenticationChallenge object
         """
         format_head = "<2HL16sL"
         version_major, version_minor, socc, uuid, rotid_rkh_revocation = unpack_from(
-            format_head, data, offset
+            format_head, data
         )
-        # Note: EdgeLock is always 256b SRKH - if P384 these are the first 256b of SHA384(SRKT)
-        hash_length = 48 if (socc == 4 and version_minor == 1 and version_major == 2) else 32
+        family_ambassador = DebugCredentialCertificate.get_family_ambassador(socc)
+        hash_length = cls.get_rot_hash_length(family_ambassador, version_major, version_minor)
+
+        # Some soc handles version differently in DAC
+        db = get_db(family_ambassador)
+        swapped_version = db.get_bool(DatabaseManager.DAT, "dac_version_is_swapped", False)
+        if swapped_version:
+            version_major, version_minor = version_minor, version_major
 
         format_tail = f"<{hash_length}s3L32s"
         (
@@ -125,9 +180,9 @@ class DebugAuthenticationChallenge:
             cc_soc_default,
             cc_vu,
             challenge,
-        ) = unpack_from(format_tail, data, offset + calcsize(format_head))
+        ) = unpack_from(format_tail, data, calcsize(format_head))
         return cls(
-            version=f"{version_major}.{version_minor}",
+            version=ProtocolVersion.from_version(version_major, version_minor),
             socc=socc,
             uuid=uuid,
             rotid_rkh_revocation=rotid_rkh_revocation,
